@@ -9,6 +9,10 @@ The bleeding-edge, dual-architecture Arch Linux distribution engine purpose-buil
 
 Brings the authentic **[Omarchy](https://omarchy.org)** developer workstation experience—Tokyo Night theming, Neovim (LazyVim), dual-prefix tmux, Starship prompt, `btop`, `eza`, `bat`, `fzf`, `yay`, and `mise`—to Windows with zero desktop baggage and deep hypervisor tuning.
 
+<p align="center">
+  <img src="assets/omarchy-terminal-demo.svg" alt="Omarchy WSL Tokyo Night Terminal" width="100%">
+</p>
+
 ---
 
 ## ⚡ Quickstart (One-Line Install)
@@ -16,7 +20,7 @@ Brings the authentic **[Omarchy](https://omarchy.org)** developer workstation ex
 Run in a standard **PowerShell** prompt (as your normal Windows user, *do not run as Administrator*):
 
 ```powershell
-irm https://raw.githubusercontent.com/chntllh/omarchy-wsl/main/install/install.ps1 | iex
+irm https://raw.githubusercontent.com/chntllh-labs/omarchy-wsl/main/install/install.ps1 | iex
 ```
 
 Once installed, launch it from Windows Terminal, your Start Menu shortcut, or by running:
@@ -81,7 +85,7 @@ Build the compressed, clean `.wsl` distribution package using modern multi-stage
 ### Build Commands
 ```powershell
 # Clone repository
-git clone https://github.com/chntllh/omarchy-wsl.git
+git clone https://github.com/chntllh-labs/omarchy-wsl.git
 cd omarchy-wsl
 
 # Build using multi-stage container pipeline
@@ -115,6 +119,10 @@ bash tests/test_theme_adversarial.sh
 ---
 
 ## 📂 Project Architecture
+
+<p align="center">
+  <img src="assets/architecture-diagram.svg" alt="Omarchy WSL Platform Architecture" width="100%">
+</p>
 
 ```
 omarchy-wsl/

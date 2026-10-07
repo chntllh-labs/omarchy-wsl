@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#16161e"/>
+      <stop offset="100%" stop-color="#1a1b26"/>
+    </linearGradient>
+    <linearGradient id="cardGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#24283b"/>
+      <stop offset="100%" stop-color="#1f2335"/>
+    </linearGradient>
+    <filter id="cardShadow" x="-5%" y="-5%" width="110%" height="115%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="960" height="520" rx="16" fill="url(#bgGrad)" stroke="#292e42" stroke-width="1.5"/>
+
+  <!-- Title -->
+  <text x="480" y="45" fill="#7aa2f7" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="20" font-weight="700" text-anchor="middle" letter-spacing="0.5">
+    Omarchy-WSL Platform Architecture &amp; Lifecycle
+  </text>
+  <text x="480" y="70" fill="#787c99" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="12" text-anchor="middle">
+    Dual-Architecture (ARM64 Snapdragon &amp; x86_64) • WSL 2.4+ / WSL 3.0+ Integration
+  </text>
+
+  <!-- Layer 1: Windows 11 Host -->
+  <g transform="translate(40, 95)" filter="url(#cardShadow)">
+    <rect width="880" height="90" rx="8" fill="url(#cardGrad)" stroke="#414868" stroke-width="1"/>
+    <text x="25" y="28" fill="#7dcfff" font-family="monospace" font-size="12" font-weight="bold">LAYER 1: WINDOWS 11 HOST SUBSYSTEM</text>
+    
+    <!-- Component Boxes -->
+    <rect x="25" y="40" width="190" height="36" rx="6" fill="#13141c" stroke="#2ac3de" stroke-width="1"/>
+    <text x="120" y="63" fill="#c0caf5" font-family="sans-serif" font-size="11" font-weight="600" text-anchor="middle">Windows Terminal</text>
+
+    <rect x="235" y="40" width="190" height="36" rx="6" fill="#13141c" stroke="#2ac3de" stroke-width="1"/>
+    <text x="330" y="63" fill="#c0caf5" font-family="sans-serif" font-size="11" font-weight="600" text-anchor="middle">Host %USERNAME%</text>
+
+    <rect x="445" y="40" width="200" height="36" rx="6" fill="#13141c" stroke="#2ac3de" stroke-width="1"/>
+    <text x="545" y="63" fill="#c0caf5" font-family="sans-serif" font-size="11" font-weight="600" text-anchor="middle">Mirrored Network / DNS</text>
+
+    <rect x="665" y="40" width="190" height="36" rx="6" fill="#13141c" stroke="#2ac3de" stroke-width="1"/>
+    <text x="760" y="63" fill="#c0caf5" font-family="sans-serif" font-size="11" font-weight="600" text-anchor="middle">Hyper-V Micro-VM</text>
+  </g>
+
+  <!-- Virtualization Boundary Divider -->
+  <g transform="translate(480, 205)">
+    <line x1="-430" y1="0" x2="430" y2="0" stroke="#f7768e" stroke-width="1.5" stroke-dasharray="6,4"/>
+    <rect x="-140" y="-12" width="280" height="24" rx="12" fill="#1f2335" stroke="#f7768e" stroke-width="1"/>
+    <text x="0" y="4" fill="#f7768e" font-family="monospace" font-size="10.5" font-weight="bold" text-anchor="middle">HYPERVISOR BOUNDARY (vsock / virtio-fs)</text>
+  </g>
+
+  <!-- Layer 2: Omarchy Linux Guest Engine -->
+  <g transform="translate(40, 235)" filter="url(#cardShadow)">
+    <rect width="880" height="250" rx="8" fill="url(#cardGrad)" stroke="#414868" stroke-width="1"/>
+    <text x="25" y="28" fill="#9ece6a" font-family="monospace" font-size="12" font-weight="bold">LAYER 2: OMARCHY-WSL ARCH LINUX RUNTIME (SYSTEMD PID 1)</text>
+
+    <!-- Pillar 1: Dynamic OOBE -->
+    <rect x="25" y="45" width="260" height="90" rx="6" fill="#13141c" stroke="#9ece6a" stroke-width="1"/>
+    <text x="38" y="68" fill="#9ece6a" font-family="sans-serif" font-size="11" font-weight="bold">1. Dynamic OOBE Engine</text>
+    <text x="38" y="88" fill="#787c99" font-family="monospace" font-size="9.5">• Probes %USERNAME% (interop/DrvFs)</text>
+    <text x="38" y="104" fill="#787c99" font-family="monospace" font-size="9.5">• POSIX diacritics/space sanitizer</text>
+    <text x="38" y="120" fill="#787c99" font-family="monospace" font-size="9.5">• Reconciles UID 1000 + lingering</text>
+
+    <!-- Pillar 2: ALPM Package Engine -->
+    <rect x="310" y="45" width="260" height="90" rx="6" fill="#13141c" stroke="#bb9af7" stroke-width="1"/>
+    <text x="323" y="68" fill="#bb9af7" font-family="sans-serif" font-size="11" font-weight="bold">2. Dual-Arch ALPM Engine</text>
+    <text x="323" y="88" fill="#787c99" font-family="monospace" font-size="9.5">• makepkg concurrency governor</text>
+    <text x="323" y="104" fill="#787c99" font-family="monospace" font-size="9.5">• Snapdragon Oryon 18-core bounds</text>
+    <text x="323" y="120" fill="#787c99" font-family="monospace" font-size="9.5">• Native yay, mise, omarchy-nvim</text>
+
+    <!-- Pillar 3: Theme Bridge -->
+    <rect x="595" y="45" width="260" height="90" rx="6" fill="#13141c" stroke="#7aa2f7" stroke-width="1"/>
+    <text x="608" y="68" fill="#7aa2f7" font-family="sans-serif" font-size="11" font-weight="bold">3. Lossless Theme Bridge</text>
+    <text x="608" y="88" fill="#787c99" font-family="monospace" font-size="9.5">• Surgical JSONC AST tokenizer</text>
+    <text x="608" y="104" fill="#787c99" font-family="monospace" font-size="9.5">• 100% comment/whitespace safe</text>
+    <text x="608" y="120" fill="#787c99" font-family="monospace" font-size="9.5">• Atomic fsync &amp; lock retry loop</text>
+
+    <!-- Row 2 -->
+    <!-- Pillar 4: Hypervisor Storage -->
+    <rect x="25" y="145" width="260" height="85" rx="6" fill="#13141c" stroke="#e0af68" stroke-width="1"/>
+    <text x="38" y="168" fill="#e0af68" font-family="sans-serif" font-size="11" font-weight="bold">4. Hypervisor Storage &amp; I/O</text>
+    <text x="38" y="188" fill="#787c99" font-family="monospace" font-size="9.5">• Paced dirty flusher (ratio: 10)</text>
+    <text x="38" y="204" fill="#787c99" font-family="monospace" font-size="9.5">• case=off metadata latency drop</text>
+    <text x="38" y="220" fill="#787c99" font-family="monospace" font-size="9.5">• Native ext4 VHDX isolation</text>
+
+    <!-- Pillar 5: Cgroups & Memory -->
+    <rect x="310" y="145" width="260" height="85" rx="6" fill="#13141c" stroke="#f7768e" stroke-width="1"/>
+    <text x="323" y="168" fill="#f7768e" font-family="sans-serif" font-size="11" font-weight="bold">5. Cgroup v2 &amp; OOM Shield</text>
+    <text x="323" y="188" fill="#787c99" font-family="monospace" font-size="9.5">• build.slice heavy job isolation</text>
+    <text x="323" y="204" fill="#787c99" font-family="monospace" font-size="9.5">• MemoryOOMGroup=yes (no zombies)</text>
+    <text x="323" y="220" fill="#787c99" font-family="monospace" font-size="9.5">• Interactive shell priority 10x</text>
+
+    <!-- Pillar 6: Zero-Loss Update -->
+    <rect x="595" y="145" width="260" height="85" rx="6" fill="#13141c" stroke="#2ac3de" stroke-width="1"/>
+    <text x="608" y="168" fill="#2ac3de" font-family="sans-serif" font-size="11" font-weight="bold">6. Zero-Loss Rolling Update</text>
+    <text x="608" y="188" fill="#787c99" font-family="monospace" font-size="9.5">• In-distro omarchy-wsl-update</text>
+    <text x="608" y="204" fill="#787c99" font-family="monospace" font-size="9.5">• .omarchynew dotfile protection</text>
+    <text x="608" y="220" fill="#787c99" font-family="monospace" font-size="9.5">• Bare-metal service virtual shims</text>
+  </g>
+</svg>

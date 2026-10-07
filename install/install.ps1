@@ -23,7 +23,7 @@ param(
   [string]$DistroName = "Omarchy",
   [string]$ReleaseTag = "latest",
   [string]$InstallPath = "",
-  [string]$Repo = "omacom-io/omarchy-wsl",
+  [string]$Repo = "chntllh-labs/omarchy-wsl",
   [switch]$NonInteractive,
   [switch]$ForceSideBySide
 )
