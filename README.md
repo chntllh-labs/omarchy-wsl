@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Architecture](https://img.shields.io/badge/Architecture-ARM64%20%7C%20x86__64-orange.svg)](#dual-architecture-alpm-engine)
 [![WSL](https://img.shields.io/badge/WSL-2.4%2B%20%2F%203.0%2B-blueviolet.svg)](#wsl3--hypervisor-optimizations)
-[![Tests](https://img.shields.io/badge/Tests-81%2F81%20Passed-brightgreen.svg)](#adversarial-test-suites)
+[![Tests](https://img.shields.io/badge/Tests-273%2F273%20Passed-brightgreen.svg)](#adversarial-test-suites)
 
 The bleeding-edge, dual-architecture Arch Linux distribution engine purpose-built for the **Windows Subsystem for Linux (WSL2 & WSL 3.0+)**.
 
@@ -61,7 +61,15 @@ Omarchy's theme engine bridges the virtualization boundary to theme your host Wi
 - **Corporate Root CA Sync (`omarchy-ca-sync`):** Automatically extracts Windows Enterprise Root CAs from the Windows Certificate Store into Arch Linux trust anchors (`/etc/ca-certificates/trust-source/anchors/`).
 - **Container Bridge Isolation:** Clamps Docker/Podman MTUs to 1420 for VPN compatibility and isolates default subnet pools to RFC 2544 benchmark space (`198.18.0.0/16`).
 
-### 6. Zero-Data-Loss In-Distro Updates
+### 6. Deep Windows 11 Integration & QoL
+Ten hardened bridges across the Windows/Linux boundary, all built on one interop layer (no Windows `%PATH%`, PowerShell only via `-EncodedCommand`, every call time-bounded). See [docs/WINDOWS-INTEGRATION-QOL.md](docs/WINDOWS-INTEGRATION-QOL.md).
+- **Explorer:** "Open in Omarchy Terminal" context menu, Quick Access pin, `omarchy-sync-dirs` Known-Folder links (OneDrive-aware), DrvFs build guard.
+- **Clipboard:** `omarchy-clip` routes text/PNG through win32yank, UTF-16 `clip.exe`, PowerShell, WSLg or OSC 52 (SSH/tmux); Neovim + tmux snippets.
+- **Credentials:** `omarchy-ssh-agent-bridge` (Windows OpenSSH / 1Password / Bitwarden / Pageant / Gpg4win, keys never leave Windows) and `omarchy-git-credential-bridge` (Windows GCM → `gh` fallback).
+- **Launch & notify:** `omarchy-open` (Follina-safe URL/file/editor launcher, `$BROWSER`) and `omarchy-notify` (Windows toasts, `omarchy-build --notify`).
+- **Runtime:** WSLg audio/mic for systemd services, `omarchy-docker-bridge` (Desktop / Podman / native engine router), `omarchy-watch-bridge` (Windows edits → inotify), `omarchy-power-governor` (battery/thermal-aware `-j`).
+
+### 7. Zero-Data-Loss In-Distro Updates
 Never wipe your `/home` partition to update. Running:
 ```bash
 omarchy-wsl-update
@@ -99,7 +107,7 @@ docker build -t omarchy:dist -f Containerfile .
 
 ## 🧪 Adversarial Test Suites
 
-Omarchy-WSL is validated through 4 automated test harnesses covering 81 gates:
+Omarchy-WSL is validated through 5 automated test harnesses covering 273 gates:
 
 | Test Suite | Coverage | Command | Result |
 | :--- | :--- | :--- | :--- |
@@ -107,6 +115,7 @@ Omarchy-WSL is validated through 4 automated test harnesses covering 81 gates:
 | **Networking Suite** | Mirrored mode, DNS tunneling, CA sync, MTU clamping, proxy rules | `bash tests/test_networking_adversarial.sh` | **20/20 Passed** |
 | **Theme Engine Suite** | JSONC AST tokenization, comment preservation, atomic `fsync` | `bash tests/test_theme_adversarial.sh` | **27/27 Passed** |
 | **Memory & Sysctl Suite** | Hardware scaling formulas, `build.slice` cgroup v2, writeback | `python3 tests/test_memory_governance.py` | **18/18 Passed** |
+| **Windows Integration Suite** | Interop safety, launcher/clipboard/toast injection, SSH agent & GCM bridges, Docker routing, inotify replay, power governor | `bash tests/test_windows_integration.sh` | **192/192 Passed** |
 
 Run all tests:
 ```bash
@@ -114,6 +123,7 @@ PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py"
 bash tests/test_oobe_adversarial.sh
 bash tests/test_networking_adversarial.sh
 bash tests/test_theme_adversarial.sh
+bash tests/test_windows_integration.sh
 ```
 
 ---
@@ -127,23 +137,32 @@ bash tests/test_theme_adversarial.sh
 ```
 omarchy-wsl/
 ├── bin/
-│   ├── omarchy-build          # Memory-bounded cgroup v2 compiler runner
+│   ├── omarchy-build          # Memory-, power- & DrvFs-aware cgroup v2 compiler runner
 │   ├── omarchy-ca-sync        # Windows Enterprise Root CA extractor
+│   ├── omarchy-clip           # Cross-OS clipboard router (text, PNG, OSC 52)
+│   ├── omarchy-docker-bridge  # Docker Desktop / Podman / native engine router
 │   ├── omarchy-dns-sync       # DNS tunneling & systemd-resolved bridge
 │   ├── omarchy-mirror-sync    # Ping-less pacman mirror benchmark CLI
 │   ├── omarchy-netdoctor      # Full network audit and auto-repair utility
+│   ├── omarchy-notify         # Windows toast notification bridge
+│   ├── omarchy-open           # Hardened URL / file / editor launcher
+│   ├── omarchy-power-governor # Battery & thermal-aware build concurrency
 │   ├── omarchy-proxy-sync     # WinINet proxy environment synchronizer
+│   ├── omarchy-sync-dirs      # Windows Known-Folder symlinks (~/win)
 │   ├── omarchy-theme-sync     # Cross-OS theme propagation CLI
+│   ├── omarchy-watch-bridge   # Windows edits -> Linux inotify replay
 │   └── omarchy-wsl-update     # In-distro zero-data-loss rolling updater
 ├── docs/                      # Comprehensive architectural specifications
 │   ├── DUAL-ARCH-PACKAGE-ENGINE-SPEC.md
 │   ├── OOBE-SPECIFICATION.md
 │   ├── THEME-ENGINE.md
+│   ├── WINDOWS-INTEGRATION-QOL.md
 │   ├── WSL-NETWORKING-AND-DNS-ADVERSARIAL-REVIEW.md
 │   └── storage-io-architecture.md
 ├── install/
 │   └── install.ps1            # Production PowerShell one-command installer
 ├── lib/
+│   ├── omarchy-wsl-interop.sh # Shared hardened Windows interop layer
 │   ├── omarchy_theme/         # Lossless JSONC AST engine & terminal adapters
 │   └── omarchy-wsl-migration-gate # Upstream migration virtualization shims
 ├── scripts/
@@ -151,8 +170,12 @@ omarchy-wsl/
 │   ├── makepkg-governor.sh    # Hardware-topology-aware compiler governor
 │   └── strip-rootfs.sh        # Zero-leak rootfs sanitization engine
 ├── tools/
-│   └── generate-wslconfig.ps1 # Adaptive host .wslconfig generator
+│   ├── generate-wslconfig.ps1 # Adaptive host .wslconfig generator
+│   ├── generate-notify-icons.py # Reproducible Tokyo Night toast icons
+│   └── register-explorer-context-menu.{ps1,reg} # Explorer verb + Quick Access
 ├── wsl/
+│   ├── bin/                   # SSH agent & Git credential bridges
+│   ├── etc/, environment.d/   # WSLg audio (PulseAudio, ALSA) integration
 │   ├── oobe.sh                # Dynamic first-boot provisioning engine
 │   ├── pacman-init.sh         # Offline pacman keyring initializer
 │   ├── wsl.conf               # Neutral base virtualization configuration
