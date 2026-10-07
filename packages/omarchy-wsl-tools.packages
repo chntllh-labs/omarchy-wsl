@@ -22,3 +22,9 @@ tree-sitter-cli
 unzip
 zip
 zoxide
+
+# Windows integration & QoL (docs/WINDOWS-INTEGRATION-QOL.md)
+socat
+wl-clipboard
+libpulse
+alsa-plugins

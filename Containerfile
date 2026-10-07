@@ -116,6 +116,34 @@ COPY wsl/oobe.sh /usr/lib/omarchy-wsl/oobe.sh
 RUN chmod 0755 /usr/lib/omarchy-wsl/*.sh && \
     systemctl enable omarchy-pacman-init.service
 
+# 4b. Windows Integration & QoL tooling (docs/WINDOWS-INTEGRATION-QOL.md)
+#     User-facing commands land in /usr/bin; interop bridges live in the curated
+#     /usr/lib/omarchy-wsl/bin shim directory (on PATH via profile.d), never in
+#     a Windows %PATH% append.
+COPY lib/omarchy-wsl-interop.sh /usr/lib/omarchy-wsl/interop.sh
+COPY wsl/lib/drvfs-guard.sh /usr/lib/omarchy-wsl/drvfs-guard.sh
+COPY bin/omarchy-open bin/omarchy-clip bin/omarchy-notify bin/omarchy-sync-dirs \
+     bin/omarchy-docker-bridge bin/omarchy-watch-bridge bin/omarchy-power-governor \
+     bin/omarchy-build /usr/bin/
+COPY wsl/bin/omarchy-ssh-agent-bridge wsl/bin/omarchy-git-credential-bridge /usr/lib/omarchy-wsl/bin/
+COPY wsl/profile.d/10-omarchy-wsl-path.sh wsl/profile.d/20-omarchy-browser.sh \
+     wsl/profile.d/20-omarchy-wslg-audio.sh wsl/profile.d/30-omarchy-ssh-agent.sh \
+     wsl/profile.d/40-omarchy-drvfs-guard.sh wsl/profile.d/50-omarchy-docker.sh /etc/profile.d/
+COPY wsl/etc/pulse/client.conf.d/wslg.conf /etc/pulse/client.conf.d/wslg.conf
+COPY wsl/etc/alsa/conf.d/99-omarchy-wslg-pulse.conf /etc/alsa/conf.d/99-omarchy-wslg-pulse.conf
+COPY wsl/environment.d/50-omarchy-wslg.conf /usr/lib/environment.d/50-omarchy-wslg.conf
+COPY wsl/tmpfiles.d/user/omarchy-wslg.conf /usr/share/user-tmpfiles.d/omarchy-wslg.conf
+COPY wsl/systemd/user/omarchy-ssh-agent-bridge.service /usr/lib/systemd/user/omarchy-ssh-agent-bridge.service
+COPY wsl/share/nvim/omarchy-clipboard.lua /usr/share/omarchy/nvim/omarchy-clipboard.lua
+COPY wsl/share/tmux/omarchy-clipboard.conf /usr/share/omarchy/tmux/omarchy-clipboard.conf
+COPY assets/notify/ /usr/share/omarchy/notify/
+COPY docs/WINDOWS-INTEGRATION-QOL.md /usr/share/doc/omarchy-wsl/WINDOWS-INTEGRATION-QOL.md
+RUN chmod 0755 /usr/bin/omarchy-open /usr/bin/omarchy-clip /usr/bin/omarchy-notify \
+               /usr/bin/omarchy-sync-dirs /usr/bin/omarchy-docker-bridge /usr/bin/omarchy-watch-bridge \
+               /usr/bin/omarchy-power-governor /usr/bin/omarchy-build \
+               /usr/lib/omarchy-wsl/bin/omarchy-ssh-agent-bridge /usr/lib/omarchy-wsl/bin/omarchy-git-credential-bridge && \
+    chmod 0644 /usr/lib/omarchy-wsl/interop.sh /usr/lib/omarchy-wsl/drvfs-guard.sh /etc/profile.d/*.sh
+
 # 5. Mask problematic services that conflict with WSL2 virtualization
 RUN systemctl mask systemd-resolved.service \
                    systemd-networkd.service \
