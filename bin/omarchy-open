@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Zero-Dependency URL, File & Editor Launcher
+# /usr/bin/omarchy-open
+# ==============================================================================
+# A hardened replacement for wslview / xdg-open on WSL. Opens URLs in the
+# Windows default browser, files in their Windows default handler, directories
+# in Explorer, and projects in VS Code / Cursor / Windsurf (Remote-WSL).
+#
+# Hardening (vs. wslview / "cmd.exe /c start"):
+# 1. No cmd.exe: URLs never pass through a shell that interprets & | ^ %.
+# 2. Scheme allowlist: ms-msdt:, search-ms:, ms-officecmd:, file: and other
+#    protocol-handler attack surface (CVE-2022-30190 "Follina") is refused.
+# 3. Executable file types (.exe .bat .ps1 .lnk .hta .msi ...) are refused
+#    unless --force: ShellExecute would *run* them, not "open" them.
+# 4. No Windows %PATH% dependency: binaries are resolved by absolute path.
+# ==============================================================================
+
+set -euo pipefail
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_is_wsl >/dev/null || { echo "omarchy-open: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-open"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-open [options] <url|file|directory>...
+
+Options:
+  -e, --editor[=NAME]   Open in a Windows editor via Remote-WSL
+                        (NAME: auto|code|code-insiders|cursor|windsurf; default: $OMARCHY_EDITOR or auto)
+  -r, --reveal          Reveal the file in Windows Explorer instead of opening it
+  --force               Allow opening executable/script file types
+  --allow-scheme S      Additionally allow URL scheme S for this invocation
+  --print               Print the Windows command that would run (dry run)
+  --default-browser     Print the ProgId of the Windows default browser
+  -h, --help            Show this help
+
+Environment:
+  OMARCHY_OPEN_SCHEMES  Space-separated scheme allowlist (default: "http https mailto")
+  OMARCHY_EDITOR        Default editor for --editor
+
+Examples:
+  omarchy-open https://omarchy.org
+  omarchy-open ./report.pdf
+  omarchy-open --reveal ~/win/Downloads/setup.zip
+  omarchy-open --editor=cursor ~/src/app
+  export BROWSER=omarchy-open     # used by gh, npm, python -m webbrowser ...
+EOF
+}
+
+MODE="open"
+EDITOR_NAME="${OMARCHY_EDITOR:-auto}"
+FORCE=0
+PRINT_ONLY=0
+EXTRA_SCHEMES=()
+TARGETS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -e|--editor) MODE="editor"; shift ;;
+    --editor=*) MODE="editor"; EDITOR_NAME="${1#*=}"; shift ;;
+    -r|--reveal) MODE="reveal"; shift ;;
+    --force) FORCE=1; shift ;;
+    --allow-scheme) EXTRA_SCHEMES+=("${2:?--allow-scheme requires a value}"); shift 2 ;;
+    --print) PRINT_ONLY=1; shift ;;
+    --default-browser) MODE="default-browser"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; TARGETS+=("$@"); break ;;
+    -*) omw_err "Unknown option: $1"; usage >&2; exit 2 ;;
+    *) TARGETS+=("$1"); shift ;;
+  esac
+done
+
+# Extensions ShellExecute will execute (or mount/install) rather than display.
+DANGEROUS_EXTENSIONS=" exe com scr pif bat cmd ps1 psm1 psd1 ps1xml vbs vbe js jse wsf wsh wsc hta
+  msi msp mst msix msixbundle appx appxbundle appinstaller application appref-ms
+  cpl msc lnk url scf reg inf jar chm gadget diagcab settingcontent-ms library-ms
+  searchconnector-ms iso img vhd vhdx sys dll ocx "
+
+# -----------------------------------------------------------------------------
+# Launch primitive: print (dry run) or execute a Windows binary.
+# -----------------------------------------------------------------------------
+run_windows() {
+  if (( PRINT_ONLY )); then
+    printf '%q ' "$@"
+    printf '\n'
+    return 0
+  fi
+  # explorer.exe exits 1 even on success; never trust its status.
+  timeout 15 "$@" >/dev/null 2>&1 </dev/null || true
+}
+
+require_exe() {
+  omw_find_exe "$1" || omw_die "$1 not found under $(omw_mount_root). Is DrvFs automount enabled?"
+}
+
+# -----------------------------------------------------------------------------
+# URLs
+# -----------------------------------------------------------------------------
+is_windows_path() {
+  [[ "$1" =~ ^[A-Za-z]:([\\/]|$) || "$1" =~ ^\\\\ ]]
+}
+
+is_url() {
+  is_windows_path "$1" && return 1
+  [[ "$1" =~ ^[A-Za-z][A-Za-z0-9+.-]*: && ! -e "$1" ]] || [[ "$1" =~ ^www\. && ! -e "$1" ]]
+}
+
+scheme_allowed() {
+  local scheme="${1,,}" allowed
+  allowed=" ${OMARCHY_OPEN_SCHEMES:-http https mailto} ${EXTRA_SCHEMES[*]:-} "
+  [[ "${allowed,,}" == *" ${scheme} "* ]]
+}
+
+# Percent-encode the characters that could change how Windows tokenizes the
+# command line. Everything else (including UTF-8) passes through unchanged.
+encode_url() {
+  local url="$1"
+  url="${url// /%20}"
+  url="${url//\"/%22}"
+  url="${url//</%3C}"
+  url="${url//>/%3E}"
+  url="${url//^/%5E}"
+  url="${url//|/%7C}"
+  url="${url//\`/%60}"
+  url="${url//\\/%5C}"
+  printf '%s' "$url"
+}
+
+open_url() {
+  local url="$1" scheme
+  [[ "$url" =~ ^www\. ]] && url="https://${url}"
+  if [[ "$url" =~ [[:cntrl:]] ]]; then
+    omw_die "Refusing URL containing control characters."
+  fi
+  (( ${#url} <= 8192 )) || omw_die "Refusing URL longer than 8192 bytes."
+  scheme="${url%%:*}"
+  if ! scheme_allowed "$scheme"; then
+    omw_die "Refusing URL scheme '${scheme}:' (allowed: ${OMARCHY_OPEN_SCHEMES:-http https mailto}). Use --allow-scheme ${scheme} if you trust it."
+  fi
+  if [[ "${scheme,,}" =~ ^https?$ && ! "$url" =~ ^[A-Za-z]+://[^/[:space:]]+ ]]; then
+    omw_die "Malformed URL: $url"
+  fi
+  # url.dll!FileProtocolHandler hands the URL straight to ShellExecute: no
+  # cmd.exe parsing, no PowerShell startup cost (~40 ms vs ~600 ms).
+  run_windows "$(require_exe rundll32.exe)" url.dll,FileProtocolHandler "$(encode_url "$url")"
+}
+
+# -----------------------------------------------------------------------------
+# Files & directories
+# -----------------------------------------------------------------------------
+is_dangerous() {
+  local base="${1##*/}" ext
+  [[ "$base" == *.* ]] || return 1
+  ext="${base##*.}"
+  [[ "$DANGEROUS_EXTENSIONS" == *" ${ext,,} "* ]]
+}
+
+# Characters explorer.exe parses safely as a single path argument. Commas are
+# switch separators for explorer.exe, so anything outside this set goes through
+# PowerShell Start-Process -LiteralPath instead.
+explorer_safe() {
+  [[ "$1" =~ ^[][A-Za-z0-9\ ._~+@#=\(\)\\:\$\{\}-]+$ ]]
+}
+
+ps_start_literal() {
+  local winpath="$1" script
+  script="\$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(omw_b64 "$winpath")'));Start-Process -LiteralPath \$p"
+  if (( PRINT_ONLY )); then
+    printf 'powershell.exe Start-Process -LiteralPath %q\n' "$winpath"
+    return 0
+  fi
+  omw_ps_run "$script" >/dev/null || omw_die "Windows failed to open: $winpath"
+}
+
+open_path() {
+  local target="$1" abs winpath
+  [[ -e "$target" ]] || omw_die "No such file or directory: $target"
+  abs=$(realpath -- "$target")
+  if [[ -f "$abs" ]] && is_dangerous "$abs" && (( ! FORCE )); then
+    omw_die "Refusing to open executable file type '${abs##*.}' (Windows would run it). Use --force to override, or --reveal to show it in Explorer."
+  fi
+  winpath=$(omw_unix_to_win "$abs")
+  if explorer_safe "$winpath"; then
+    run_windows "$(require_exe explorer.exe)" "$winpath"
+  else
+    ps_start_literal "$winpath"
+  fi
+}
+
+reveal_path() {
+  local target="$1" abs winpath script
+  [[ -e "$target" ]] || omw_die "No such file or directory: $target"
+  abs=$(realpath -- "$target")
+  winpath=$(omw_unix_to_win "$abs")
+  if (( PRINT_ONLY )); then
+    printf 'explorer.exe /select,%q\n' "$winpath"
+    return 0
+  fi
+  script="\$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(omw_b64 "$winpath")'));Start-Process explorer.exe -ArgumentList ('/select,\"'+\$p+'\"')"
+  omw_ps_run "$script" >/dev/null || omw_die "Explorer failed to reveal: $winpath"
+}
+
+# -----------------------------------------------------------------------------
+# Editors (Remote-WSL aware)
+# -----------------------------------------------------------------------------
+find_editor_cli() {
+  local name="$1" profile="" root
+  root=$(omw_mount_root)
+  # Inside a VS Code / Cursor integrated terminal the remote CLI is already on
+  # PATH and talks to the running window over VSCODE_IPC_HOOK_CLI.
+  if [[ -n "${VSCODE_IPC_HOOK_CLI:-}" ]] && omw_have "$name"; then
+    command -v "$name"
+    return 0
+  fi
+  local up
+  if up=$(omw_win_env USERPROFILE 2>/dev/null); then
+    profile=$(omw_win_to_unix "$up" 2>/dev/null || true)
+  fi
+  local -a candidates=()
+  case "$name" in
+    code)
+      candidates=("$profile/AppData/Local/Programs/Microsoft VS Code/bin/code"
+                  "$root/c/Program Files/Microsoft VS Code/bin/code") ;;
+    code-insiders)
+      candidates=("$profile/AppData/Local/Programs/Microsoft VS Code Insiders/bin/code-insiders"
+                  "$root/c/Program Files/Microsoft VS Code Insiders/bin/code-insiders") ;;
+    cursor)
+      candidates=("$profile/AppData/Local/Programs/cursor/resources/app/bin/cursor"
+                  "$profile/AppData/Local/Programs/Cursor/resources/app/bin/cursor") ;;
+    windsurf)
+      candidates=("$profile/AppData/Local/Programs/Windsurf/bin/windsurf") ;;
+    *) return 1 ;;
+  esac
+  local c
+  for c in "${candidates[@]}"; do
+    [[ -n "$c" && -f "$c" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+open_editor() {
+  local target="$1" cli name abs
+  abs=$(realpath -m -- "$target")
+  local -a order=("$EDITOR_NAME")
+  [[ "$EDITOR_NAME" == "auto" ]] && order=(code cursor windsurf code-insiders)
+  for name in "${order[@]}"; do
+    if cli=$(find_editor_cli "$name"); then
+      if (( PRINT_ONLY )); then
+        printf '%q %q\n' "$cli" "$abs"
+        return 0
+      fi
+      # The Windows-side launcher scripts detect WSL_DISTRO_NAME themselves and
+      # attach a Remote-WSL window; the Linux path is passed verbatim.
+      exec bash "$cli" "$abs"
+    fi
+  done
+  omw_die "No editor found for '${EDITOR_NAME}'. Install VS Code/Cursor on Windows or set OMARCHY_EDITOR."
+}
+
+default_browser() {
+  local reg out
+  reg=$(require_exe reg.exe)
+  out=$(cd "$(omw_system_root)" && timeout 5 "$reg" query \
+    'HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice' /v ProgId 2>/dev/null | tr -d '\r') || true
+  local progid
+  progid=$(awk '/ProgId/ {print $NF}' <<<"$out")
+  [[ -n "$progid" ]] || omw_die "Could not read the default browser association."
+  echo "$progid"
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+if (( ! PRINT_ONLY )); then
+  omw_require_interop
+fi
+
+if [[ "$MODE" == "default-browser" ]]; then
+  default_browser
+  exit 0
+fi
+
+[[ ${#TARGETS[@]} -gt 0 ]] || { usage >&2; exit 2; }
+
+for t in "${TARGETS[@]}"; do
+  case "$MODE" in
+    editor) open_editor "$t" ;;
+    reveal) reveal_path "$t" ;;
+    open)
+      if is_windows_path "$t"; then
+        open_path "$(omw_win_to_unix "$t" || omw_die "Cannot translate Windows path: $t")"
+      elif [[ "${t,,}" == file://* ]]; then
+        # file:// URIs are opened as paths so the executable-type guard applies.
+        t="${t#[Ff][Ii][Ll][Ee]://}"
+        t="${t#localhost}"
+        open_path "$(printf '%b' "${t//%/\\x}")"
+      elif is_url "$t"; then
+        open_url "$t"
+      else
+        open_path "$t"
+      fi
+      ;;
+  esac
+done

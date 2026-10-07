@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Windows Toast Notification Bridge
+# /usr/bin/omarchy-notify
+# ==============================================================================
+# Raises native Windows 11 Action Center toasts (Tokyo Night icons, Windows
+# sound events) from WSL, e.g. when a long build or an agent task finishes.
+#
+# Delivery chain:
+#   1. WinRT ToastNotificationManager via Windows PowerShell 5.1
+#      (PowerShell 7 cannot load WinRT types without extra assemblies)
+#   2. Terminal escapes: OSC 777;notify (WezTerm, Ghostty, foot, Windows
+#      Terminal >= 1.26 with compatibility.allowOSC777) + OSC 9 + BEL
+#      (Windows Terminal bellStyle "taskbar" flashes the taskbar button)
+#
+# --wrap also drives the Windows Terminal taskbar progress indicator
+# (OSC 9;4, supported since WT 1.6) while the command runs.
+#
+# Injection safety: title/body travel to PowerShell as base64 and are XML-
+# escaped inside PowerShell. Nothing user-controlled is ever spliced into
+# script text — this also neutralises PowerShell's curly-quote (U+2018/U+2019)
+# string delimiters that defeat naive single-quote escaping.
+# ==============================================================================
+
+set -uo pipefail
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_is_wsl >/dev/null || { echo "omarchy-notify: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-notify"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-notify [options] <title> [body]
+       omarchy-notify [options] --wrap -- <command> [args...]
+
+Options:
+  -l, --level LEVEL     info|success|warning|error (icon + default sound; default: info)
+  -s, --sound SOUND     default|im|mail|reminder|sms|alarm|call|none
+  --app-id ID           AppUserModelID (default: Omarchy.WSL, auto-registered in HKCU)
+  --wrap                Run a command; notify with its exit status and duration
+  --min-seconds N       With --wrap: only notify if it ran >= N seconds (default: 10)
+  --osc                 Use terminal escape sequences instead of a Windows toast
+  --sync                Wait for the toast to be delivered (default: fire-and-forget)
+  --print-script        Print the generated PowerShell script and exit
+  -h, --help            Show this help
+
+Environment:
+  OMARCHY_NOTIFY_APP_ID, OMARCHY_NOTIFY_MIN_SECONDS, OMARCHY_NOTIFY_SOUND=none
+
+Examples:
+  omarchy-notify -l success "Build finished" "cargo build --release (2m13s)"
+  omarchy-notify --wrap -- omarchy-build cargo build --release
+  claude -p "..." ; omarchy-notify "Agent task complete"
+EOF
+}
+
+LEVEL="info"
+SOUND=""
+APP_ID="${OMARCHY_NOTIFY_APP_ID:-Omarchy.WSL}"
+WRAP=0
+MIN_SECONDS="${OMARCHY_NOTIFY_MIN_SECONDS:-10}"
+FORCE_OSC=0
+SYNC=0
+PRINT_SCRIPT=0
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -l|--level) LEVEL="${2:-}"; shift 2 ;;
+    -s|--sound) SOUND="${2:-}"; shift 2 ;;
+    --app-id) APP_ID="${2:-}"; shift 2 ;;
+    --wrap) WRAP=1; shift ;;
+    --min-seconds) MIN_SECONDS="${2:-}"; shift 2 ;;
+    --osc) FORCE_OSC=1; shift ;;
+    --sync) SYNC=1; shift ;;
+    --print-script) PRINT_SCRIPT=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; POSITIONAL+=("$@"); break ;;
+    -*) omw_err "Unknown option: $1"; usage >&2; exit 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+case "$LEVEL" in info|success|warning|error) ;; *) omw_die "Invalid level: $LEVEL" ;; esac
+[[ "$MIN_SECONDS" =~ ^[0-9]+$ ]] || omw_die "--min-seconds must be an integer"
+# The AUMID is embedded (base64) and used as a registry key name.
+[[ "$APP_ID" =~ ^[A-Za-z0-9._!{}\\-]{1,128}$ ]] || omw_die "Invalid --app-id"
+
+if [[ -z "$SOUND" ]]; then
+  SOUND="${OMARCHY_NOTIFY_SOUND:-}"
+fi
+if [[ -z "$SOUND" ]]; then
+  case "$LEVEL" in
+    error) SOUND="reminder" ;;
+    warning) SOUND="im" ;;
+    *) SOUND="default" ;;
+  esac
+fi
+
+# Map to ms-winsoundevent values (custom files need a packaged app identity).
+case "$SOUND" in
+  default) AUDIO_XML='<audio src="ms-winsoundevent:Notification.Default"/>' ;;
+  im) AUDIO_XML='<audio src="ms-winsoundevent:Notification.IM"/>' ;;
+  mail) AUDIO_XML='<audio src="ms-winsoundevent:Notification.Mail"/>' ;;
+  reminder) AUDIO_XML='<audio src="ms-winsoundevent:Notification.Reminder"/>' ;;
+  sms) AUDIO_XML='<audio src="ms-winsoundevent:Notification.SMS"/>' ;;
+  alarm) AUDIO_XML='<audio src="ms-winsoundevent:Notification.Looping.Alarm"/>' ;;
+  call) AUDIO_XML='<audio src="ms-winsoundevent:Notification.Looping.Call"/>' ;;
+  none|silent) AUDIO_XML='<audio silent="true"/>' ;;
+  *) omw_die "Invalid sound: $SOUND" ;;
+esac
+
+# -----------------------------------------------------------------------------
+# Icons: toasts only load images from local Windows paths (file:///C:/...),
+# not \\wsl.localhost UNC paths, so icons are mirrored to %LOCALAPPDATA%.
+# -----------------------------------------------------------------------------
+icon_source_dir() {
+  local d
+  for d in "${OMARCHY_NOTIFY_ICON_DIR:-}" "${_self%/*}/../assets/notify" /usr/share/omarchy/notify; do
+    [[ -n "$d" && -r "$d/omarchy-${LEVEL}.png" ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+# Prints the Windows path of the mirrored icon (empty if unavailable).
+ensure_icon() {
+  local src_dir lad lad_unix dest_dir
+  src_dir=$(icon_source_dir) || return 0
+  lad=$(omw_win_env LOCALAPPDATA 2>/dev/null) || return 0
+  lad_unix=$(omw_win_to_unix "$lad" 2>/dev/null) || return 0
+  dest_dir="${lad_unix}/Omarchy/notify"
+  if [[ ! -f "$dest_dir/omarchy-${LEVEL}.png" ]] || ! cmp -s "$src_dir/omarchy-${LEVEL}.png" "$dest_dir/omarchy-${LEVEL}.png"; then
+    mkdir -p "$dest_dir" 2>/dev/null && cp -f "$src_dir"/omarchy-*.png "$dest_dir"/ 2>/dev/null || return 0
+  fi
+  printf '%s\\Omarchy\\notify\\omarchy-%s.png' "$lad" "$LEVEL"
+}
+
+clamp() {
+  local s="$1" max="$2"
+  # Drop C0 controls except tab/newline; XML 1.0 rejects them outright.
+  s=$(printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037\177')
+  if (( ${#s} > max )); then
+    s="${s:0:max-1}…"
+  fi
+  printf '%s' "$s"
+}
+
+build_ps_script() {
+  local title="$1" body="$2" icon="$3"
+  cat <<EOF
+\$d=[Text.Encoding]::UTF8
+\$title=\$d.GetString([Convert]::FromBase64String('$(omw_b64 "$title")'))
+\$body=\$d.GetString([Convert]::FromBase64String('$(omw_b64 "$body")'))
+\$icon=\$d.GetString([Convert]::FromBase64String('$(omw_b64 "$icon")'))
+\$app=\$d.GetString([Convert]::FromBase64String('$(omw_b64 "$APP_ID")'))
+\$audio=\$d.GetString([Convert]::FromBase64String('$(omw_b64 "$AUDIO_XML")'))
+\$k="HKCU:\\Software\\Classes\\AppUserModelId\\\$app"
+if(\$app -like 'Omarchy*' -and -not (Test-Path \$k)){
+  New-Item -Path \$k -Force | Out-Null
+  New-ItemProperty -Path \$k -Name DisplayName -Value 'Omarchy' -PropertyType String -Force | Out-Null
+  if(\$icon){New-ItemProperty -Path \$k -Name IconUri -Value \$icon -PropertyType String -Force | Out-Null}
+}
+[void][Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]
+[void][Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime]
+\$e=[Security.SecurityElement]
+\$img=''
+if(\$icon -and (Test-Path -LiteralPath \$icon)){\$img='<image placement="appLogoOverride" hint-crop="circle" src="'+\$e::Escape('file:///'+(\$icon -replace '\\\\','/'))+'"/>'}
+\$bodyXml=''
+if(\$body){\$bodyXml='<text>'+\$e::Escape(\$body)+'</text>'}
+\$xml='<toast><visual><binding template="ToastGeneric"><text>'+\$e::Escape(\$title)+'</text>'+\$bodyXml+\$img+'</binding></visual>'+\$audio+'</toast>'
+\$doc=New-Object Windows.Data.Xml.Dom.XmlDocument
+\$doc.LoadXml(\$xml)
+\$toast=New-Object Windows.UI.Notifications.ToastNotification \$doc
+\$toast.Group='omarchy'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(\$app).Show(\$toast)
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Terminal escape fallback
+# -----------------------------------------------------------------------------
+tty_target() {
+  if [[ -n "${SSH_TTY:-}" && -w "${SSH_TTY}" ]]; then echo "$SSH_TTY"; return 0; fi
+  if { : >/dev/tty; } 2>/dev/null; then echo /dev/tty; return 0; fi
+  return 1
+}
+
+wrap_passthrough() {
+  local seq="$1"
+  if [[ -n "${TMUX:-}" ]]; then
+    # shellcheck disable=SC1003  # '\e\\' is ST (ESC backslash), not a quote escape
+    printf '\ePtmux;%s\e\\' "${seq//$'\e'/$'\e\e'}"
+  else
+    printf '%s' "$seq"
+  fi
+}
+
+notify_osc() {
+  local title="$1" body="$2" tty
+  tty=$(tty_target) || return 1
+  # OSC 777 separates fields with ';' — strip it from the payload.
+  local t="${title//;/,}" b="${body//;/,}"
+  t="${t//$'\n'/ }"; b="${b//$'\n'/ }"
+  {
+    wrap_passthrough $'\e]777;notify;'"${t}"';'"${b}"$'\e\\'
+    wrap_passthrough $'\e]9;'"${t}${b:+: ${b}}"$'\e\\'
+    printf '\a'
+  } >"$tty" 2>/dev/null
+}
+
+progress() {
+  # OSC 9;4;<state>;<pct>  state: 0 clear, 1 normal, 2 error, 3 indeterminate
+  [[ -n "${WT_SESSION:-}" ]] || return 0
+  local tty; tty=$(tty_target) || return 0
+  wrap_passthrough $'\e]9;4;'"$1"';'"${2:-0}"$'\e\\' >"$tty" 2>/dev/null || true
+}
+
+# -----------------------------------------------------------------------------
+# Delivery
+# -----------------------------------------------------------------------------
+deliver() {
+  local title body icon script
+  title=$(clamp "$1" 128)
+  body=$(clamp "${2:-}" 1024)
+  [[ -n "$title" ]] || omw_die "A title is required."
+
+  if (( PRINT_SCRIPT )); then
+    build_ps_script "$title" "$body" 'C:\Users\example\AppData\Local\Omarchy\notify\omarchy-info.png'
+    return 0
+  fi
+
+  if (( ! FORCE_OSC )) && omw_is_wsl && omw_interop_enabled && omw_powershell >/dev/null 2>&1; then
+    icon=$(ensure_icon)
+    script=$(build_ps_script "$title" "$body" "$icon")
+    if (( SYNC )); then
+      if omw_ps_run "$script" >/dev/null; then
+        return 0
+      fi
+      omw_warn "Toast delivery failed; falling back to terminal escapes."
+    else
+      # Fire-and-forget: PowerShell start-up (~0.5 s) must not delay the shell.
+      ( OMW_TIMEOUT=20 omw_ps_run "$script" >/dev/null 2>&1 & )
+      return 0
+    fi
+  fi
+  notify_osc "$title" "$body" || omw_warn "No toast backend and no terminal available."
+}
+
+human_duration() {
+  local s="$1"
+  if (( s >= 3600 )); then printf '%dh%02dm' $((s / 3600)) $((s % 3600 / 60))
+  elif (( s >= 60 )); then printf '%dm%02ds' $((s / 60)) $((s % 60))
+  else printf '%ds' "$s"; fi
+}
+
+if (( WRAP )); then
+  [[ ${#POSITIONAL[@]} -gt 0 ]] || { usage >&2; exit 2; }
+  start=$(date +%s)
+  progress 3
+  "${POSITIONAL[@]}"
+  rc=$?
+  elapsed=$(( $(date +%s) - start ))
+  progress 0
+  if (( elapsed >= MIN_SECONDS )); then
+    cmd_label="${POSITIONAL[*]}"
+    (( ${#cmd_label} > 80 )) && cmd_label="${cmd_label:0:79}…"
+    if (( rc == 0 )); then
+      LEVEL="success"
+      deliver "✔ Finished in $(human_duration "$elapsed")" "${cmd_label}"$'\n'"${PWD/#$HOME/\~}"
+    else
+      LEVEL="error"
+      [[ "$SOUND" == "default" ]] && AUDIO_XML='<audio src="ms-winsoundevent:Notification.Reminder"/>'
+      deliver "✘ Failed (exit ${rc}) after $(human_duration "$elapsed")" "${cmd_label}"$'\n'"${PWD/#$HOME/\~}"
+    fi
+  fi
+  exit "$rc"
+fi
+
+[[ ${#POSITIONAL[@]} -ge 1 ]] || { usage >&2; exit 2; }
+deliver "${POSITIONAL[0]}" "${POSITIONAL[1]:-}"
