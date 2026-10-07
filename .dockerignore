@@ -1,0 +1,14 @@
+**/.git
+**/.gitignore
+**/.ssh
+**/.gnupg
+**/.claude
+**/.hermes
+**/*.wsl
+**/*.tar*
+**/*.log
+dist/
+build-cache/
+.tmp/
+*.key
+*.pem

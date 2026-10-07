@@ -1,0 +1,45 @@
+# %USERPROFILE%\.wslconfig
+#
+# World-Class WSL2 / WSL 3.0.1 Host Performance Profile
+# Designed for high-core architectures (Snapdragon Oryon 18c, AMD Ryzen, Intel Core Ultra)
+# and high-throughput NVMe SSD storage.
+#
+# Place this file in C:\Users\<YourUser>\.wslconfig and run:
+#   wsl --shutdown
+
+[wsl2]
+# Core Compute & Memory Sizing
+# Tune memory to 50-75% of physical RAM; allocate all performance cores
+processors = 18
+memory = 48GB
+swap = 8GB
+
+# High-Performance Mirrored Networking Stack
+networkingMode = mirrored
+dnsTunneling = true
+autoProxy = true
+
+# Host Interop & VM Lifecycle
+localhostForwarding = true
+guiApplications = true
+nestedVirtualization = true
+vmIdleTimeout = 60000
+
+# Storage Transport
+# virtiofs is supported in modern WSL (WSL 2.4+) but requires fixed-drive sanity.
+# If automount fails silently on secondary drives, remove or set to false to fallback to 9P.
+virtiofs = true
+
+[experimental]
+# Automatic gradual memory reclamation when Linux is idle
+autoMemoryReclaim = gradual
+
+# Virtual disk discard/trim reporting to host Hyper-V
+pageReporting = true
+
+# CRITICAL SAFETY DIRECTIVE: sparseVhd
+# DO NOT enable sparseVhd=true on mission-critical distros!
+# Microsoft gated sparseVhd behind --allow-unsafe in WSL 2.5.6+ due to severe ext4
+# superblock and journal corruption from NTFS sparse hole-punching races.
+# Keep false; use periodic offline 'Optimize-VHD -Mode Full' or 'fstrim -v /'.
+sparseVhd = false
