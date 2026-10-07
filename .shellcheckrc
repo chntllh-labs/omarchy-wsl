@@ -1,0 +1,2 @@
+# PowerShell snippets are deliberately single-quoted so bash never expands them.
+disable=SC2016
