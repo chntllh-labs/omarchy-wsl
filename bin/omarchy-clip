@@ -1,0 +1,324 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Cross-OS Clipboard Router (Text, Images, OSC 52)
+# /usr/bin/omarchy-clip
+# ==============================================================================
+# One clipboard command for Neovim, tmux, shells, and scripts, routed to the
+# most reliable backend for the current session:
+#
+#   win32yank.exe   fastest text path (~15 ms), CRLF-aware        [WSL + interop]
+#   clip.exe        text copy, fed UTF-16LE+BOM (no mojibake)      [WSL + interop]
+#   PowerShell 5.1  text paste fallback; PNG image copy/paste      [WSL + interop]
+#   wl-clipboard    WSLg Wayland clipboard (bounded by timeouts)   [WSLg]
+#   tmux / OSC 52   copy over SSH, mosh-less remote shells, tmux   [any terminal]
+#
+# Every backend call is wrapped in a timeout: wl-paste and Windows clipboard
+# locks are known to hang, and a hung clipboard must never freeze Neovim.
+# ==============================================================================
+
+set -euo pipefail
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_is_wsl >/dev/null || { echo "omarchy-clip: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-clip"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-clip <command> [options]
+
+Commands:
+  copy  [-t MIME]       Copy stdin to the clipboard (MIME: text/plain | image/png)
+  paste [-t MIME]       Write the clipboard to stdout (CR stripped from text)
+  osc52                 Copy stdin via an OSC 52 escape (works over SSH)
+  backend [copy|paste]  Print the backend that would be used
+  types                 List clipboard content types (best effort)
+
+Options:
+  -t, --type MIME       Content type (default: text/plain)
+  --crlf                copy: convert LF to CRLF; paste: keep CR characters
+  -h, --help            Show this help
+
+Environment:
+  OMARCHY_CLIP_BACKEND  auto|win32yank|windows|wayland|tmux|osc52 (default: auto)
+  OMARCHY_OSC52_MAX     Max base64 bytes per OSC 52 sequence (default: 100000)
+
+Integration:
+  Neovim:  see /usr/share/omarchy/nvim/omarchy-clipboard.lua
+  tmux:    set -s copy-command 'omarchy-clip copy'
+  Images:  omarchy-clip paste -t image/png > shot.png
+EOF
+}
+
+CMD="${1:-}"
+[[ -n "$CMD" ]] || { usage >&2; exit 2; }
+shift
+
+MIME="text/plain"
+CRLF=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|--type) MIME="${2:?--type requires a value}"; shift 2 ;;
+    --type=*) MIME="${1#*=}"; shift ;;
+    --crlf) CRLF=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    copy|paste) BACKEND_OP="$1"; shift ;;
+    *) omw_err "Unknown argument: $1"; exit 2 ;;
+  esac
+done
+
+case "$MIME" in
+  text|text/plain|text/plain\;charset=utf-8|UTF8_STRING) MIME="text/plain" ;;
+  image|png|image/png) MIME="image/png" ;;
+  *) omw_die "Unsupported MIME type '$MIME' (use text/plain or image/png)." ;;
+esac
+
+# -----------------------------------------------------------------------------
+# Backend discovery
+# -----------------------------------------------------------------------------
+windows_ok() { omw_is_wsl && omw_interop_enabled; }
+
+win32yank_path() {
+  local p
+  if p=$(command -v win32yank.exe 2>/dev/null); then echo "$p"; return 0; fi
+  local profile up
+  up=$(omw_win_env USERPROFILE 2>/dev/null) || return 1
+  profile=$(omw_win_to_unix "$up" 2>/dev/null) || return 1
+  for p in "$profile/AppData/Local/Microsoft/WinGet/Links/win32yank.exe" \
+           "$profile/scoop/shims/win32yank.exe" \
+           "$profile/AppData/Local/omarchy/bin/win32yank.exe"; do
+    [[ -x "$p" ]] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+wayland_ok() {
+  omw_have wl-copy && omw_have wl-paste || return 1
+  local display="${WAYLAND_DISPLAY:-}"
+  [[ -n "$display" ]] || return 1
+  [[ "$display" == /* ]] && [[ -S "$display" ]] && return 0
+  [[ -S "${XDG_RUNTIME_DIR:-/nonexistent}/$display" || -S "/mnt/wslg/runtime-dir/$display" ]]
+}
+
+in_ssh() { [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]]; }
+
+select_backend() {
+  local op="$1" forced="${OMARCHY_CLIP_BACKEND:-auto}"
+  if [[ "$forced" != "auto" ]]; then
+    echo "$forced"
+    return 0
+  fi
+  # A remote shell must write to the *local* clipboard: OSC 52 travels back
+  # over the SSH pty to the terminal emulator (Windows Terminal, WezTerm, ...).
+  if in_ssh && ! windows_ok; then
+    if [[ "$op" == "copy" ]]; then
+      [[ -n "${TMUX:-}" ]] && echo tmux || echo osc52
+      return 0
+    fi
+    wayland_ok && { echo wayland; return 0; }
+    echo none
+    return 0
+  fi
+  if windows_ok; then
+    if [[ "$MIME" == "text/plain" ]] && win32yank_path >/dev/null 2>&1; then
+      echo win32yank
+    else
+      echo windows
+    fi
+    return 0
+  fi
+  wayland_ok && { echo wayland; return 0; }
+  if [[ "$op" == "copy" ]]; then
+    [[ -n "${TMUX:-}" ]] && echo tmux || echo osc52
+    return 0
+  fi
+  echo none
+}
+
+# -----------------------------------------------------------------------------
+# OSC 52 / tmux
+# -----------------------------------------------------------------------------
+osc52_target() {
+  if [[ -n "${OMARCHY_CLIP_TTY:-}" ]]; then echo "$OMARCHY_CLIP_TTY"; return; fi
+  if [[ -n "${SSH_TTY:-}" && -w "${SSH_TTY}" ]]; then echo "$SSH_TTY"; return; fi
+  if { : >/dev/tty; } 2>/dev/null; then echo /dev/tty; return; fi
+  echo /dev/stdout
+}
+
+osc52_copy() {
+  local payload max="${OMARCHY_OSC52_MAX:-100000}" seq
+  [[ "$MIME" == "text/plain" ]] || omw_die "OSC 52 carries text only."
+  payload=$(base64 -w0)
+  if (( ${#payload} > max )); then
+    omw_die "Selection is ${#payload} base64 bytes; OSC 52 limit is ${max} (OMARCHY_OSC52_MAX). Refusing to truncate silently."
+  fi
+  seq=$'\e]52;c;'"${payload}"$'\a'
+  if [[ -n "${TMUX:-}" ]]; then
+    # tmux >= 3.3 requires `set -g allow-passthrough on` for DCS passthrough.
+    seq=$'\ePtmux;'"${seq//$'\e'/$'\e\e'}"$'\e\\'
+  elif [[ "${TERM:-}" == screen* ]]; then
+    seq=$'\eP'"${seq}"$'\e\\'
+  fi
+  printf '%s' "$seq" >"$(osc52_target)"
+}
+
+tmux_copy() {
+  [[ "$MIME" == "text/plain" ]] || omw_die "tmux buffers carry text only."
+  # load-buffer -w (tmux >= 3.2) stores the buffer and forwards it to the outer
+  # terminal via OSC 52 when `set-clipboard` is on/external.
+  if tmux load-buffer -w - 2>/dev/null; then
+    return 0
+  fi
+  osc52_copy
+}
+
+# -----------------------------------------------------------------------------
+# Windows backends
+# -----------------------------------------------------------------------------
+to_crlf() {
+  if (( CRLF )); then
+    # perl is a hard dependency of git on Arch; it converts exactly the LFs
+    # present (no CR is invented on an unterminated final line).
+    perl -pe 's/\r?\n/\r\n/'
+  else
+    cat
+  fi
+}
+
+strip_cr() {
+  if (( CRLF )); then cat; else tr -d '\r'; fi
+}
+
+windows_copy_text() {
+  local clip
+  clip=$(omw_find_exe clip.exe) || omw_die "clip.exe not found."
+  # clip.exe decodes stdin with the console ANSI codepage unless it sees a
+  # UTF-16LE BOM; feeding UTF-8 directly produces mojibake for non-ASCII text.
+  {
+    printf '\xff\xfe'
+    to_crlf | iconv -f UTF-8 -t UTF-16LE
+  } | (cd "$(omw_system_root)" && timeout 10 "$clip")
+}
+
+windows_paste_text() {
+  omw_ps_run 'Add-Type -AssemblyName System.Windows.Forms;$t=[System.Windows.Forms.Clipboard]::GetText();if($t){[Console]::Out.Write($t)}' | strip_cr
+  return "${PIPESTATUS[0]}"
+}
+
+windows_copy_image() {
+  local script
+  script='Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$b=[Console]::In.ReadToEnd().Trim()
+$bytes=[Convert]::FromBase64String($b)
+$ms=New-Object IO.MemoryStream(,$bytes)
+$img=[System.Drawing.Image]::FromStream($ms)
+$do=New-Object System.Windows.Forms.DataObject
+$do.SetImage($img)
+$do.SetData("PNG",$false,(New-Object IO.MemoryStream(,$bytes)))
+[System.Windows.Forms.Clipboard]::SetDataObject($do,$true)'
+  base64 -w0 | omw_ps_run --stdin "$script" >/dev/null
+}
+
+windows_paste_image() {
+  local script out
+  # Prefer the lossless "PNG" clipboard format (browsers, Snipping Tool),
+  # then a copied image *file* from Explorer, then the CF_DIB bitmap.
+  script='Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+$d=[System.Windows.Forms.Clipboard]::GetDataObject()
+$bytes=$null
+if($d -and $d.GetDataPresent("PNG")){$s=$d.GetData("PNG");if($s -is [IO.Stream]){$m=New-Object IO.MemoryStream;$s.CopyTo($m);$bytes=$m.ToArray()}}
+if(-not $bytes){$f=[System.Windows.Forms.Clipboard]::GetFileDropList();if($f.Count -gt 0 -and $f[0] -match "\.(png|jpe?g|gif|bmp|webp)$"){$i=[System.Drawing.Image]::FromFile($f[0]);$m=New-Object IO.MemoryStream;$i.Save($m,[System.Drawing.Imaging.ImageFormat]::Png);$bytes=$m.ToArray()}}
+if(-not $bytes){$i=[System.Windows.Forms.Clipboard]::GetImage();if($i){$m=New-Object IO.MemoryStream;$i.Save($m,[System.Drawing.Imaging.ImageFormat]::Png);$bytes=$m.ToArray()}}
+if(-not $bytes){exit 3}
+[Console]::Out.Write([Convert]::ToBase64String($bytes))'
+  out=$(omw_ps_run "$script") || { omw_err "Clipboard does not contain an image."; return 3; }
+  printf '%s' "$out" | base64 -d
+}
+
+win32yank_copy() {
+  local y; y=$(win32yank_path)
+  if (( CRLF )); then
+    timeout 10 "$y" -i --crlf
+  else
+    timeout 10 "$y" -i
+  fi
+}
+
+win32yank_paste() {
+  local y; y=$(win32yank_path)
+  if (( CRLF )); then
+    timeout 10 "$y" -o
+  else
+    timeout 10 "$y" -o --lf
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Wayland (WSLg) backend
+# -----------------------------------------------------------------------------
+wayland_copy() {
+  # wl-copy forks a server that owns the selection; detach stdio so callers
+  # such as Neovim do not wait on an inherited pipe.
+  if [[ "$MIME" == "image/png" ]]; then
+    wl-copy --type image/png
+  else
+    to_crlf | wl-copy --type text/plain
+  fi
+}
+
+wayland_paste() {
+  if [[ "$MIME" == "image/png" ]]; then
+    timeout 3 wl-paste --no-newline --type image/png
+  else
+    timeout 3 wl-paste --no-newline --type text/plain | strip_cr
+    return "${PIPESTATUS[0]}"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Dispatch
+# -----------------------------------------------------------------------------
+do_copy() {
+  local backend; backend=$(select_backend copy)
+  case "$backend" in
+    win32yank) win32yank_copy ;;
+    windows) if [[ "$MIME" == "image/png" ]]; then windows_copy_image; else windows_copy_text; fi ;;
+    wayland) wayland_copy ;;
+    tmux) tmux_copy ;;
+    osc52) osc52_copy ;;
+    *) omw_die "No clipboard backend available for copy." ;;
+  esac
+}
+
+do_paste() {
+  local backend; backend=$(select_backend paste)
+  case "$backend" in
+    win32yank) win32yank_paste ;;
+    windows) if [[ "$MIME" == "image/png" ]]; then windows_paste_image; else windows_paste_text; fi ;;
+    wayland) wayland_paste ;;
+    tmux) tmux save-buffer - ;;
+    osc52|none) omw_die "Paste is unavailable here: terminals refuse OSC 52 reads (clipboard exfiltration risk). Use your terminal's paste shortcut." ;;
+    *) omw_die "Unknown backend: $backend" ;;
+  esac
+}
+
+case "$CMD" in
+  copy) do_copy ;;
+  paste) do_paste ;;
+  osc52) osc52_copy ;;
+  backend) select_backend "${BACKEND_OP:-copy}" ;;
+  types)
+    if wayland_ok; then
+      timeout 3 wl-paste --list-types
+    elif windows_ok; then
+      omw_ps_run 'Add-Type -AssemblyName System.Windows.Forms;$d=[System.Windows.Forms.Clipboard]::GetDataObject();if($d){$d.GetFormats()}'
+    else
+      omw_die "No clipboard backend available."
+    fi
+    ;;
+  -h|--help|help) usage ;;
+  *) omw_err "Unknown command: $CMD"; usage >&2; exit 2 ;;
+esac
