@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Windows SSH Agent & GPG Agent Bridge
+# /usr/lib/omarchy-wsl/bin/omarchy-ssh-agent-bridge
+# ==============================================================================
+# Exposes the Windows-side SSH agent (Windows OpenSSH, 1Password, Bitwarden,
+# KeePassXC, or Pageant) inside WSL2 as a Unix socket, so private keys never
+# leave the Windows vault and Windows Hello / 1Password approval prompts keep
+# working:
+#
+#   ssh (Linux) -> $XDG_RUNTIME_DIR/ssh-agent.sock -> socat -> npiperelay.exe
+#               -> \\.\pipe\openssh-ssh-agent (Windows agent / vault)
+#
+# WSL2 has no native AF_UNIX <-> named-pipe bridge (AF_UNIX interop is a WSL1
+# feature), so a relay process is required. npiperelay is a tiny Go binary that
+# speaks stdio on the Linux side and named pipes on the Windows side; socat
+# forks one relay per connection.
+#
+# Optional: bridges Gpg4win's gpg-agent (Assuan socket + nonce) for YubiKey /
+# smartcard signing via `gpg-start` / `gpg-run`.
+# ==============================================================================
+
+set -euo pipefail
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" "${_self%/*}/../../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_is_wsl >/dev/null || { echo "omarchy-ssh-agent-bridge: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-ssh-agent-bridge"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-ssh-agent-bridge <command> [options]
+
+Commands:
+  start         Start the SSH agent relay in the background (idempotent)
+  run           Run the SSH agent relay in the foreground (systemd)
+  stop          Stop the background relay
+  status        Show relay state and the identities the agent offers
+  env           Print `export SSH_AUTH_SOCK=...` when the bridge is live
+  enable        Autostart at login (systemd user unit, or profile.d fallback)
+  disable       Remove autostart
+  doctor        Diagnose npiperelay, socat, the Windows agent, and services
+  gpg-start     Bridge Gpg4win gpg-agent into the Linux gpg agent socket
+  gpg-run       Same, in the foreground
+
+Options:
+  --pipe NAME   Windows pipe (default: openssh-ssh-agent; env OMARCHY_SSH_AGENT_PIPE)
+  --pageant     Use the Pageant pipe from %USERPROFILE%\.ssh\pageant.conf
+  --socket PATH Linux socket (default: $XDG_RUNTIME_DIR/ssh-agent.sock)
+  -q, --quiet   Suppress informational output
+
+Install npiperelay on Windows (keep it on the Windows filesystem):
+  winget install albertony.npiperelay
+EOF
+}
+
+CMD="${1:-}"
+[[ -n "$CMD" ]] || { usage >&2; exit 2; }
+shift
+
+PIPE="${OMARCHY_SSH_AGENT_PIPE:-openssh-ssh-agent}"
+USE_PAGEANT=0
+SOCKET="${OMARCHY_SSH_AGENT_SOCK:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pipe) PIPE="${2:?--pipe requires a value}"; shift 2 ;;
+    --pageant) USE_PAGEANT=1; shift ;;
+    --socket) SOCKET="${2:?--socket requires a value}"; shift 2 ;;
+    -q|--quiet) OMW_QUIET=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) omw_err "Unknown option: $1"; exit 2 ;;
+  esac
+done
+
+RUN_DIR=$(omw_runtime_dir)
+if [[ -z "$SOCKET" ]]; then
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" && -w "${XDG_RUNTIME_DIR}" ]]; then
+    SOCKET="${XDG_RUNTIME_DIR}/ssh-agent.sock"
+  else
+    SOCKET="${RUN_DIR}/ssh-agent.sock"
+  fi
+fi
+PIDFILE="${RUN_DIR}/ssh-agent-bridge.pid"
+LOGFILE="${RUN_DIR}/ssh-agent-bridge.log"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
+CONF_FILE="${CONF_DIR}/ssh-agent-bridge.conf"
+
+# Pipe names are interpolated into a relay wrapper; constrain them.
+validate_pipe() {
+  [[ "$1" =~ ^[A-Za-z0-9._@{}-]+$ ]] || omw_die "Invalid pipe name: '$1'"
+}
+
+# -----------------------------------------------------------------------------
+# Discovery
+# -----------------------------------------------------------------------------
+win_profile() { omw_win_profile; }
+find_npiperelay() { omw_find_npiperelay; }
+
+# Pageant (PuTTY >= 0.75) writes its pipe path with `--openssh-config FILE`:
+#   IdentityAgent "\\.\pipe\pageant.<user>.<sha256>"
+pageant_pipe() {
+  local profile conf line
+  profile=$(win_profile) || return 1
+  conf="${OMARCHY_PAGEANT_CONF:-$profile/.ssh/pageant.conf}"
+  [[ -r "$conf" ]] || { omw_err "Pageant config not found at $conf (run: pageant --openssh-config %USERPROFILE%\\.ssh\\pageant.conf)"; return 1; }
+  line=$(tr -d '\r' <"$conf" | grep -i '^[[:space:]]*IdentityAgent' | head -n 1)
+  [[ "$line" =~ pipe[\\/]+([A-Za-z0-9._@{}-]+) ]] || return 1
+  echo "${BASH_REMATCH[1]}"
+}
+
+# -----------------------------------------------------------------------------
+# Socket state
+# -----------------------------------------------------------------------------
+# Exit codes of `ssh-add -l`: 0 keys listed, 1 agent reachable but empty or
+# failing, 2 cannot connect.
+agent_rc() {
+  local rc=0
+  SSH_AUTH_SOCK="$1" timeout 8 ssh-add -l >/dev/null 2>&1 || rc=$?
+  echo "$rc"
+}
+
+bridge_pid() {
+  local pid
+  [[ -r "$PIDFILE" ]] || return 1
+  pid=$(<"$PIDFILE")
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  grep -qa 'socat' "/proc/$pid/cmdline" 2>/dev/null || return 1
+  echo "$pid"
+}
+
+# Refuse to replace a live socket that this tool does not own (for example an
+# SSH-forwarded agent or gcr-ssh-agent bound to the same path).
+prepare_socket() {
+  local sock="$1"
+  mkdir -p "$(dirname "$sock")"
+  if [[ -S "$sock" ]]; then
+    if bridge_pid >/dev/null; then
+      return 1  # ours, already running
+    fi
+    if [[ "$(agent_rc "$sock")" != "2" ]]; then
+      omw_die "A different live agent already listens on $sock; refusing to replace it (use --socket)."
+    fi
+    rm -f -- "$sock"
+  elif [[ -e "$sock" ]]; then
+    omw_die "$sock exists and is not a socket; refusing to touch it."
+  fi
+  return 0
+}
+
+write_relay_wrapper() { omw_write_exec_wrapper "$@"; }
+
+socat_args() {
+  local sock="$1" wrapper="$2"
+  # umask=177 -> socket mode 0600; only this user may talk to the agent.
+  echo "UNIX-LISTEN:${sock},fork,umask=177"
+  echo "EXEC:${wrapper},nofork"
+}
+
+resolve_ssh_relay() {
+  local relay pipe="$PIPE"
+  omw_require_interop
+  omw_have socat || omw_die "socat is not installed (pacman -S socat)."
+  relay=$(find_npiperelay) || omw_die "npiperelay.exe not found. Install on Windows: winget install albertony.npiperelay"
+  if (( USE_PAGEANT )); then
+    pipe=$(pageant_pipe) || omw_die "Could not read the Pageant pipe name."
+  fi
+  validate_pipe "$pipe"
+  write_relay_wrapper "${RUN_DIR}/ssh-agent-relay.sh" "$relay" -ei -s "//./pipe/${pipe}"
+  echo "$pipe"
+}
+
+# -----------------------------------------------------------------------------
+# Commands
+# -----------------------------------------------------------------------------
+cmd_start() {
+  local pipe pid
+  if pid=$(bridge_pid); then
+    omw_log "Bridge already running (pid $pid) on $SOCKET"
+    return 0
+  fi
+  exec 9>"${RUN_DIR}/ssh-agent-bridge.lock"
+  flock -n 9 || { omw_log "Another start is in progress."; return 0; }
+  pipe=$(resolve_ssh_relay)
+  prepare_socket "$SOCKET" || return 0
+  local -a args
+  mapfile -t args < <(socat_args "$SOCKET" "${RUN_DIR}/ssh-agent-relay.sh")
+  # Not a process-group leader when backgrounded from a script, so setsid does
+  # not fork again and $! is socat's own pid.
+  setsid socat "${args[@]}" </dev/null >>"$LOGFILE" 2>&1 &
+  echo $! >"$PIDFILE"
+  disown 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -S "$SOCKET" ]] && break
+    sleep 0.1
+  done
+  [[ -S "$SOCKET" ]] || omw_die "socat failed to create $SOCKET (see $LOGFILE)."
+  omw_log "Bridging $SOCKET -> \\\\.\\pipe\\${pipe}"
+  omw_log "Use it with: export SSH_AUTH_SOCK=$SOCKET"
+}
+
+cmd_run() {
+  local pipe
+  pipe=$(resolve_ssh_relay)
+  if ! prepare_socket "$SOCKET"; then
+    omw_die "A background bridge already owns $SOCKET; stop it first."
+  fi
+  local -a args
+  mapfile -t args < <(socat_args "$SOCKET" "${RUN_DIR}/ssh-agent-relay.sh")
+  omw_log "Bridging $SOCKET -> \\\\.\\pipe\\${pipe} (foreground)"
+  exec socat "${args[@]}"
+}
+
+cmd_stop() {
+  local pid
+  if pid=$(bridge_pid); then
+    kill "$pid" 2>/dev/null || true
+    omw_log "Stopped bridge (pid $pid)."
+  fi
+  rm -f -- "$PIDFILE"
+  if [[ -S "$SOCKET" && "$(agent_rc "$SOCKET")" == "2" ]]; then
+    rm -f -- "$SOCKET"
+  fi
+}
+
+cmd_status() {
+  local pid rc
+  if pid=$(bridge_pid); then
+    echo "bridge:  running (pid $pid)"
+  else
+    echo "bridge:  stopped"
+  fi
+  echo "socket:  $SOCKET"
+  if [[ -S "$SOCKET" ]]; then
+    rc=$(agent_rc "$SOCKET")
+    case "$rc" in
+      0) echo "agent:   reachable"; SSH_AUTH_SOCK="$SOCKET" timeout 8 ssh-add -l 2>/dev/null | sed 's/^/         /' ;;
+      1) echo "agent:   reachable, no identities (or Windows agent not running)" ;;
+      *) echo "agent:   unreachable" ;;
+    esac
+  else
+    echo "agent:   no socket"
+  fi
+}
+
+cmd_env() {
+  if [[ -S "$SOCKET" ]] && bridge_pid >/dev/null; then
+    printf 'export SSH_AUTH_SOCK=%q\n' "$SOCKET"
+  fi
+}
+
+cmd_enable() {
+  mkdir -p "$CONF_DIR"
+  printf 'OMARCHY_SSH_AGENT_BRIDGE=1\nOMARCHY_SSH_AGENT_PIPE=%q\n' "$PIPE" >"$CONF_FILE"
+  if systemctl --user is-active basic.target >/dev/null 2>&1 \
+     && systemctl --user cat omarchy-ssh-agent-bridge.service >/dev/null 2>&1; then
+    systemctl --user enable --now omarchy-ssh-agent-bridge.service
+    omw_log "Enabled systemd user unit omarchy-ssh-agent-bridge.service"
+  else
+    omw_log "Autostart enabled via /etc/profile.d/30-omarchy-ssh-agent.sh at next login."
+  fi
+}
+
+cmd_disable() {
+  rm -f -- "$CONF_FILE"
+  systemctl --user disable --now omarchy-ssh-agent-bridge.service >/dev/null 2>&1 || true
+  omw_log "Autostart disabled."
+}
+
+cmd_doctor() {
+  local relay ok=1
+  echo "== Omarchy SSH agent bridge doctor =="
+  if omw_is_wsl; then echo "[ok]   running under WSL"; else echo "[fail] not WSL"; ok=0; fi
+  if omw_interop_enabled; then echo "[ok]   WSL interop enabled"; else echo "[fail] WSL interop disabled (wsl --update; see docs: binfmt WSLInterop)"; ok=0; fi
+  if omw_have socat; then echo "[ok]   socat installed"; else echo "[fail] socat missing: sudo pacman -S socat"; ok=0; fi
+  if omw_have ssh-add; then echo "[ok]   ssh-add installed"; else echo "[fail] openssh missing"; ok=0; fi
+  if relay=$(find_npiperelay 2>/dev/null); then
+    echo "[ok]   npiperelay: $relay"
+    [[ "$relay" == "$(omw_mount_root)"/* ]] || echo "[warn] npiperelay is not on a Windows drive; interop is slower and less reliable from the Linux filesystem"
+  else
+    echo "[fail] npiperelay.exe not found (winget install albertony.npiperelay)"; ok=0
+  fi
+  if (( ok )); then
+    omw_ps_run '$p=[System.IO.Directory]::GetFiles("\\.\pipe\")
+foreach($n in @("openssh-ssh-agent")){ if($p -contains "\\.\pipe\$n"){"[ok]   pipe \\.\pipe\$n present"}else{"[warn] pipe \\.\pipe\$n absent"} }
+$pg=$p | Where-Object { $_ -like "*pageant*" } | Select-Object -First 1; if($pg){"[info] Pageant pipe: $pg"}
+$s=Get-Service ssh-agent -ErrorAction SilentlyContinue
+if($s){"[info] Windows OpenSSH agent service: "+$s.Status+" / "+$s.StartType}
+if(Get-Process 1Password -ErrorAction SilentlyContinue){"[info] 1Password is running (its agent owns the openssh-ssh-agent pipe; disable the OpenSSH Authentication Agent service)"}
+if(Get-Process Bitwarden -ErrorAction SilentlyContinue){"[info] Bitwarden is running"}
+if(Get-Process KeePassXC -ErrorAction SilentlyContinue){"[info] KeePassXC is running"}' || echo "[warn] PowerShell probe failed"
+  fi
+  cmd_status
+}
+
+# -----------------------------------------------------------------------------
+# GPG (Gpg4win) bridge
+# -----------------------------------------------------------------------------
+find_win_gpgconf() {
+  local root; root=$(omw_mount_root)
+  omw_find_exe gpgconf.exe \
+    "$root/c/Program Files (x86)/GnuPG/bin/gpgconf.exe" \
+    "$root/c/Program Files/GnuPG/bin/gpgconf.exe" \
+    "$root/c/Program Files (x86)/Gpg4win/bin/gpgconf.exe"
+}
+
+gpg_setup() {
+  local relay gpgconf win_sock linux_sock
+  omw_require_interop
+  omw_have socat || omw_die "socat is not installed."
+  omw_have gpgconf || omw_die "gnupg is not installed in Linux."
+  relay=$(find_npiperelay) || omw_die "npiperelay.exe not found."
+  gpgconf=$(find_win_gpgconf) || omw_die "Gpg4win gpgconf.exe not found."
+  # Ask Windows where its agent socket lives (Gpg4win 4.x uses %LOCALAPPDATA%\gnupg).
+  win_sock=$(cd "$(omw_system_root)" && timeout 10 "$gpgconf" --list-dirs agent-socket | tr -d '\r')
+  [[ -n "$win_sock" ]] || omw_die "Windows gpgconf did not report an agent socket."
+  win_sock="${win_sock//\\//}"
+  linux_sock=$(gpgconf --list-dirs agent-socket)
+  if ! grep -qs '^[[:space:]]*no-autostart' "${GNUPGHOME:-$HOME/.gnupg}/gpg.conf"; then
+    omw_warn "Add 'no-autostart' to ~/.gnupg/gpg.conf or a local gpg-agent will steal the socket."
+  fi
+  gpgconf --kill gpg-agent 2>/dev/null || true
+  rm -f -- "$linux_sock"
+  mkdir -p "$(dirname "$linux_sock")" && chmod 0700 "$(dirname "$linux_sock")"
+  # -a: Assuan mode (read the port + nonce file Gpg4win writes instead of a pipe)
+  write_relay_wrapper "${RUN_DIR}/gpg-agent-relay.sh" "$relay" -ei -ep -s -a "$win_sock"
+  echo "$linux_sock"
+}
+
+cmd_gpg() {
+  local linux_sock foreground="$1"
+  linux_sock=$(gpg_setup)
+  local -a args
+  mapfile -t args < <(socat_args "$linux_sock" "${RUN_DIR}/gpg-agent-relay.sh")
+  if [[ "$foreground" == 1 ]]; then
+    exec socat "${args[@]}"
+  fi
+  setsid socat "${args[@]}" </dev/null >>"${RUN_DIR}/gpg-agent-bridge.log" 2>&1 &
+  echo $! >"${RUN_DIR}/gpg-agent-bridge.pid"
+  disown 2>/dev/null || true
+  omw_log "Bridging $linux_sock -> Gpg4win gpg-agent"
+}
+
+case "$CMD" in
+  start) cmd_start ;;
+  run) cmd_run ;;
+  stop) cmd_stop ;;
+  status) cmd_status ;;
+  env) cmd_env ;;
+  enable) cmd_enable ;;
+  disable) cmd_disable ;;
+  doctor) cmd_doctor ;;
+  gpg-start) cmd_gpg 0 ;;
+  gpg-run) cmd_gpg 1 ;;
+  -h|--help|help) usage ;;
+  *) omw_err "Unknown command: $CMD"; usage >&2; exit 2 ;;
+esac

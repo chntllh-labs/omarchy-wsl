@@ -1,0 +1,16 @@
+# /usr/lib/systemd/user/omarchy-ssh-agent-bridge.service
+# Bridges the Windows SSH agent (OpenSSH / 1Password / Bitwarden / KeePassXC)
+# to %t/ssh-agent.sock. Opt-in: omarchy-ssh-agent-bridge enable
+[Unit]
+Description=Omarchy: bridge Windows SSH agent to %t/ssh-agent.sock
+Documentation=file:///usr/share/doc/omarchy-wsl/WINDOWS-INTEGRATION-QOL.md
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/omarchy-wsl/bin/omarchy-ssh-agent-bridge run
+ExecStopPost=/bin/rm -f %t/ssh-agent.sock
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
