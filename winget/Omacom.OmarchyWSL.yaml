@@ -1,0 +1,55 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.version.1.6.0.schema.json
+PackageIdentifier: Omacom.OmarchyWSL
+PackageVersion: 4.0.0
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.6.0
+---
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: Omacom.OmarchyWSL
+PackageVersion: 4.0.0
+PackageLocale: en-US
+Publisher: Omacom / Basecamp Community
+PublisherUrl: https://omarchy.org
+PublisherSupportUrl: https://github.com/omacom-io/omarchy-wsl/issues
+Author: Omarchy WSL Maintainers
+PackageName: Omarchy WSL
+PackageUrl: https://github.com/omacom-io/omarchy-wsl
+License: MIT
+LicenseUrl: https://github.com/omacom-io/omarchy-wsl/blob/main/LICENSE
+ShortDescription: The bleeding-edge Arch Linux / Omarchy distribution for Windows Subsystem for Linux (WSL).
+Description: |
+  Omarchy-WSL delivers a tailored Arch Linux environment for developers on Windows.
+  Features include dual-architecture native support (x86_64 and Qualcomm ARM64),
+  Tokyo Night theming, preconfigured Neovim toolchains, systemd integration,
+  and zero-data-loss in-place rolling updates.
+Moniker: omarchy
+Tags:
+  - archlinux
+  - wsl
+  - wsl2
+  - developer-tools
+  - neovim
+  - terminal
+ReleaseNotesUrl: https://github.com/omacom-io/omarchy-wsl/releases/tag/v4.0.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0
+---
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+PackageIdentifier: Omacom.OmarchyWSL
+PackageVersion: 4.0.0
+InstallerType: wsl
+InstallModes:
+  - silent
+  - interactive
+Commands:
+  - omarchy
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/omacom-io/omarchy-wsl/releases/download/v4.0.0/Omarchy-x86_64.wsl
+    InstallerSha256: D3ADBEEFD3ADBEEFD3ADBEEFD3ADBEEFD3ADBEEFD3ADBEEFD3ADBEEFD3ADBEEF
+  - Architecture: arm64
+    InstallerUrl: https://github.com/omacom-io/omarchy-wsl/releases/download/v4.0.0/Omarchy-arm64.wsl
+    InstallerSha256: BAADBEEFBAADBEEFBAADBEEFBAADBEEFBAADBEEFBAADBEEFBAADBEEFBAADBEEF
+ManifestType: installer
+ManifestVersion: 1.6.0

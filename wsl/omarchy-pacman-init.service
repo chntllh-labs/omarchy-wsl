@@ -1,0 +1,15 @@
+[Unit]
+Description=Initialize Pacman Keyring for Omarchy WSL (Offline-Safe)
+Documentation=man:pacman-key(8)
+ConditionPathExists=!/etc/pacman.d/gnupg/trustdb.gpg
+Before=multi-user.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/omarchy-wsl/pacman-init.sh
+TimeoutSec=60
+
+[Install]
+WantedBy=multi-user.target

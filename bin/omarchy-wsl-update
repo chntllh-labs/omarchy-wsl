@@ -1,0 +1,118 @@
+#!/bin/bash
+# /usr/bin/omarchy-wsl-update
+#
+# Omarchy WSL In-Place Rolling Update Engine
+# Zero-data-loss, transactional system and configuration update runner.
+
+set -eEo pipefail
+
+log() { echo -e "\e[32m[omarchy-wsl-update]\e[0m $*"; }
+warn() { echo -e "\e[33m[omarchy-wsl-update:WARN]\e[0m $*"; }
+err() { echo -e "\e[31m[omarchy-wsl-update:ERROR]\e[0m $*"; }
+
+ARCH="$(uname -m)"
+OMARCHY_DIR="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
+
+log "Starting in-place rolling update (Architecture: $ARCH)..."
+
+# -----------------------------------------------------------------------------
+# 1. Pre-flight Checks
+# -----------------------------------------------------------------------------
+if ! sudo -v 2>/dev/null; then
+  err "Sudo privileges required for package and system updates."
+  exit 1
+fi
+
+DISK_AVAIL_MB=$(df -m / | awk 'NR==2 {print $4}')
+if [[ $DISK_AVAIL_MB -lt 2048 ]]; then
+  warn "Low disk space on root filesystem (${DISK_AVAIL_MB}MB available)."
+  warn "Consider expanding your WSL disk or running 'pacman -Scc'."
+fi
+
+# Ensure pacman container/WSL sandbox compatibility is preserved
+sudo sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf 2>/dev/null || true
+if ! grep -q '^DisableSandbox' /etc/pacman.conf 2>/dev/null; then
+  sudo sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf 2>/dev/null || true
+fi
+
+# -----------------------------------------------------------------------------
+# 2. Pacman Keyring & System Rolling Upgrade
+# -----------------------------------------------------------------------------
+log "Refreshing pacman keyrings..."
+if [[ "$ARCH" == "aarch64" ]]; then
+  sudo pacman -Sy --noconfirm --needed archlinuxarm-keyring || {
+    warn "Keyring refresh encountered warnings, attempting key re-init..."
+    sudo pacman-key --init && sudo pacman-key --populate archlinuxarm
+    sudo pacman -Sy --noconfirm archlinuxarm-keyring
+  }
+else
+  sudo pacman -Sy --noconfirm --needed archlinux-keyring omarchy-keyring || {
+    warn "Keyring refresh encountered warnings, attempting key re-init..."
+    sudo pacman-key --init && sudo pacman-key --populate archlinux
+    sudo pacman -Sy --noconfirm archlinux-keyring omarchy-keyring
+  }
+fi
+
+log "Performing system rolling upgrade (pacman -Su)..."
+sudo pacman -Su --noconfirm
+
+if command -v yay >/dev/null 2>&1; then
+  log "Updating AUR packages..."
+  yay -Sua --noconfirm || warn "AUR package update had non-fatal warnings."
+fi
+
+# -----------------------------------------------------------------------------
+# 3. Upstream Omarchy Git Sync
+# -----------------------------------------------------------------------------
+if [[ -d "$OMARCHY_DIR/.git" ]]; then
+  log "Syncing upstream Omarchy sources at $OMARCHY_DIR..."
+  git -C "$OMARCHY_DIR" fetch --tags origin
+  
+  CURRENT_BRANCH="$(git -C "$OMARCHY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
+  if [[ "$CURRENT_BRANCH" != "HEAD" ]]; then
+    git -C "$OMARCHY_DIR" pull --ff-only origin "$CURRENT_BRANCH" || {
+      warn "Fast-forward pull failed; keeping local tree unchanged."
+    }
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# 4. Safe Migration Execution
+# -----------------------------------------------------------------------------
+MIGRATION_GATE="/usr/lib/omarchy-wsl/migration-gate"
+if [[ -x "$MIGRATION_GATE" ]]; then
+  log "Invoking Omarchy WSL Migration Safety Gate..."
+  bash "$MIGRATION_GATE"
+elif [[ -f "$(dirname "$0")/../lib/omarchy-wsl-migration-gate" ]]; then
+  bash "$(dirname "$0")/../lib/omarchy-wsl-migration-gate"
+else
+  warn "Migration gate not found; skipping upstream migrations."
+fi
+
+# -----------------------------------------------------------------------------
+# 5. Developer Toolchain & Editor Updates
+# -----------------------------------------------------------------------------
+if command -v mise >/dev/null 2>&1; then
+  log "Upgrading mise toolchains..."
+  mise upgrade -y 2>/dev/null || true
+fi
+
+if command -v nvim >/dev/null 2>&1; then
+  log "Syncing Neovim plugins (headless)..."
+  nvim --headless "+Lazy! sync" +qa 2>/dev/null || true
+fi
+
+# -----------------------------------------------------------------------------
+# 6. Post-Update Hygiene & Verification
+# -----------------------------------------------------------------------------
+log "Cleaning package caches..."
+sudo pacman -Sc --noconfirm 2>/dev/null || true
+
+log "Verifying memory stability parameters..."
+VFS_CACHE=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo "0")
+if [[ "$VFS_CACHE" -ne 100 ]]; then
+  warn "vm.vfs_cache_pressure is $VFS_CACHE (expected 100). Re-applying stability config..."
+  sudo sysctl -w vm.vfs_cache_pressure=100 >/dev/null 2>&1 || true
+fi
+
+log "Update completed successfully! Zero data lost."

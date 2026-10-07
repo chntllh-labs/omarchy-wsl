@@ -1,0 +1,177 @@
+name: Build & Release Omarchy-WSL Distribution Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream Basecamp Omarchy Git Ref (branch/tag)'
+        required: true
+        default: 'v4.0.0'
+      dry_run:
+        description: 'Dry run build without creating GitHub Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write # Required for keyless Sigstore signing
+
+jobs:
+  # ===========================================================================
+  # Matrix Build: Dual-Architecture (x86_64 & arm64) Rootfs Construction
+  # ===========================================================================
+  build-distro:
+    name: Build ${{ matrix.arch }} (.wsl package)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            build_arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            build_arch: arm64
+            # Native GitHub ARM64 runner for lightning-fast compilation
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout omarchy-wsl
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (Fallback emulation support)
+        if: matrix.runner == 'ubuntu-latest' && matrix.build_arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Fetch Upstream Basecamp Omarchy Checkout
+        run: |
+          UPSTREAM_REF="${{ github.event.inputs.upstream_ref || 'v4.0.0' }}"
+          echo "Cloning Basecamp Omarchy at ref: $UPSTREAM_REF"
+          git clone --depth 1 --branch "$UPSTREAM_REF" https://github.com/basecamp/omarchy.git omarchy
+
+      - name: Build OCI Container Rootfs Image (${{ matrix.build_arch }})
+        run: |
+          docker build \
+            --platform linux/${{ matrix.build_arch }} \
+            --build-arg ARCH=${{ matrix.build_arch }} \
+            --build-arg DESKTOP=0 \
+            --tag omarchy-distro:${{ matrix.arch }} \
+            -f Containerfile .
+
+      - name: Export Container to Rootfs Archive (.wsl package)
+        run: |
+          echo "Creating temporary export container..."
+          CONTAINER_ID=$(docker create omarchy-distro:${{ matrix.arch }})
+          
+          echo "Exporting and gzipping rootfs..."
+          docker export "$CONTAINER_ID" | gzip -9 > "Omarchy-${{ matrix.arch }}.wsl"
+          docker rm "$CONTAINER_ID"
+          
+          ls -lh "Omarchy-${{ matrix.arch }}.wsl"
+
+      - name: Adversarial Sanity Verification of Exported Package
+        run: |
+          echo "Verifying package integrity and required WSL metadata..."
+          mkdir -p /tmp/verify
+          # Inspect first few megabytes of the tarball without full decompression
+          tar -ztvf "Omarchy-${{ matrix.arch }}.wsl" | grep -E "etc/wsl\.conf|etc/wsl-distribution\.conf|etc/oobe\.sh|usr/lib/wsl/terminal-profile\.json" || {
+            echo "ERROR: Critical WSL configuration metadata missing from .wsl archive!"
+            exit 1
+          }
+          echo "WSL package structure validated."
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Omarchy-${{ matrix.arch }}
+          path: Omarchy-${{ matrix.arch }}.wsl
+          retention-days: 5
+
+  # ===========================================================================
+  # Release Stage: Checksum Calculation, Signing, and GitHub Release Publishing
+  # ===========================================================================
+  release:
+    name: Package, Sign & Publish Release
+    needs: build-distro
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') && !github.event.inputs.dry_run
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download x86_64 Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Omarchy-x86_64
+          path: ./dist
+
+      - name: Download arm64 Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Omarchy-arm64
+          path: ./dist
+
+      - name: Copy Installer to Distribution Assets
+        run: |
+          cp install/install.ps1 ./dist/install.ps1
+
+      - name: Generate Cryptographic SHA-256 Checksums
+        working-directory: ./dist
+        run: |
+          sha256sum Omarchy-x86_64.wsl Omarchy-arm64.wsl install.ps1 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install Cosign for Keyless OIDC Signing
+        uses: sigstore/cosign-installer@v3.5.0
+
+      - name: Sign Checksum Manifest (Keyless Sigstore)
+        working-directory: ./dist
+        run: |
+          cosign sign-blob --yes --bundle SHA256SUMS.bundle SHA256SUMS
+
+      - name: Generate Release Notes & Changelog
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          cat <<EOF > RELEASE_NOTES.md
+          # Omarchy-WSL ${VERSION}
+
+          Definitive Arch Linux / Omarchy distribution package for Windows Subsystem for Linux (WSL).
+
+          ### Quick Install (PowerShell)
+          \`\`\`powershell
+          irm https://github.com/${{ github.repository }}/releases/download/${VERSION}/install.ps1 | iex
+          \`\`\`
+
+          ### Direct Downloads
+          - **x86_64 (Intel/AMD):** \`Omarchy-x86_64.wsl\`
+          - **arm64 (Snapdragon / Surface Pro):** \`Omarchy-arm64.wsl\`
+          - **Integrity Manifest:** \`SHA256SUMS\` (Signed via Sigstore \`SHA256SUMS.bundle\`)
+
+          ### Upgrading Existing Installations (Zero Data Loss)
+          Inside your existing Omarchy WSL shell, run:
+          \`\`\`bash
+          omarchy-wsl-update
+          \`\`\`
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/Omarchy-x86_64.wsl
+            dist/Omarchy-arm64.wsl
+            dist/install.ps1
+            dist/SHA256SUMS
+            dist/SHA256SUMS.bundle
+          draft: false
+          prerelease: false

@@ -1,0 +1,24 @@
+# Omarchy-WSL Tools & Runtimes Manifest
+# Essential developer toolchains and terminal enhancements
+
+bat
+btop
+eza
+fastfetch
+fd
+fzf
+gum
+jq
+lazygit
+neovim
+nodejs
+npm
+python
+python-pip
+ripgrep
+starship
+tmux
+tree-sitter-cli
+unzip
+zip
+zoxide

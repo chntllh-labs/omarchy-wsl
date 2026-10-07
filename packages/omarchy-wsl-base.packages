@@ -1,0 +1,46 @@
+# Omarchy-WSL Base Package Manifest
+# Optimized for minimal rootfs footprint (<800MB compressed) in WSL2/WSLg
+# Excludes redundant host kernels, firmware, display managers, and bare-metal hardware drivers.
+
+base
+base-devel
+bash-completion
+binutils
+ca-certificates
+curl
+diffutils
+e2fsprogs
+file
+filesystem
+findutils
+gawk
+gcc
+git
+glibc
+grep
+gzip
+inetutils
+iproute2
+iputils
+less
+licenses
+man-db
+nano
+ncurses
+openssh
+pacman
+pacman-contrib
+pciutils
+procps-ng
+psmisc
+sed
+shadow
+sudo
+systemd
+systemd-sysvcompat
+tar
+util-linux
+wget
+which
+xz
+zstd

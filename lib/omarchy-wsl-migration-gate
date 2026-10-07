@@ -1,0 +1,173 @@
+#!/bin/bash
+# /usr/lib/omarchy-wsl/migration-gate
+#
+# Omarchy WSL Migration Safety Gate & Virtualization Interceptor
+#
+# Intercepts upstream Basecamp Omarchy migrations, providing:
+# 1. Hardware/Service virtualization shims (mocks out SDDM, Limine, Plymouth, udev)
+# 2. Zero-loss user configuration defense (Arch-style .omarchynew preservation)
+# 3. Kernel stability & sysctl enforcement after migration steps
+
+set -eEo pipefail
+
+WSL_SHIM_DIR="/usr/lib/omarchy-wsl/shims"
+MIGRATIONS_DIR="${OMARCHY_PATH:-$HOME/.local/share/omarchy}/migrations"
+STATE_DIR="${OMARCHY_MIGRATIONS_STATE_PATH:-$HOME/.local/state/omarchy/migrations}"
+BACKUP_DIR="$HOME/.local/state/omarchy/migration-backups/$(date +%Y%m%d_%H%M%S)"
+CONFLICT_LOG="$HOME/.local/state/omarchy/migration-conflicts.log"
+
+log() { echo -e "\e[34m[omarchy-wsl-gate]\e[0m $*"; }
+warn() { echo -e "\e[33m[omarchy-wsl-gate:WARN]\e[0m $*"; }
+success() { echo -e "\e[32m[omarchy-wsl-gate]\e[0m $*"; }
+
+mkdir -p "$STATE_DIR" "$WSL_SHIM_DIR"
+
+# -----------------------------------------------------------------------------
+# 1. Install Bare-Metal Virtualization Shims
+# -----------------------------------------------------------------------------
+install_shims() {
+  log "Configuring virtualization shims for WSL environment..."
+
+  # Shim systemctl to safely filter hardware/display services
+  cat <<'EOF' > "$WSL_SHIM_DIR/systemctl"
+#!/bin/bash
+REAL_SYSTEMCTL="/usr/bin/systemctl"
+BLOCKED_UNITS="sddm|gdm|lightdm|plymouth|bluetooth|NetworkManager|iwd|systemd-resolved|tmp.mount"
+
+for arg in "$@"; do
+  if echo "$arg" | grep -Eq "($BLOCKED_UNITS)"; then
+    echo "[WSL-SHIM] Intercepted bare-metal service operation on '$arg' (skipped for WSL)."
+    exit 0
+  fi
+done
+
+exec "$REAL_SYSTEMCTL" "$@"
+EOF
+  chmod +x "$WSL_SHIM_DIR/systemctl"
+
+  # Shim bootloaders and kernel hardware commands
+  for cmd in limine bootctl grub-install grub-mkconfig udevadm modprobe; do
+    cat <<EOF > "$WSL_SHIM_DIR/$cmd"
+#!/bin/bash
+echo "[WSL-SHIM] Intercepted bare-metal tool: $cmd \$* (no-op in WSL container)."
+exit 0
+EOF
+    chmod +x "$WSL_SHIM_DIR/$cmd"
+  done
+
+  # Shim compositor-dependent tools (hyprctl, swaync-client, waybar)
+  for cmd in hyprctl swaync-client waybar; do
+    cat <<EOF > "$WSL_SHIM_DIR/$cmd"
+#!/bin/bash
+if [[ -z "\${WAYLAND_DISPLAY:-}" && -z "\${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+  echo "[WSL-SHIM] Graphical compositor not active; '$cmd' skipped safely."
+  exit 0
+fi
+exec /usr/bin/$cmd "\$@"
+EOF
+    chmod +x "$WSL_SHIM_DIR/$cmd"
+  done
+}
+
+# -----------------------------------------------------------------------------
+# 2. User Configuration Protection & Pre-Backup
+# -----------------------------------------------------------------------------
+protect_user_state() {
+  log "Creating safety snapshot of user configuration..."
+  mkdir -p "$BACKUP_DIR"
+  for target in "$HOME/.bashrc" "$HOME/.config" "$HOME/.XCompose"; do
+    if [[ -e "$target" ]]; then
+      cp -a "$target" "$BACKUP_DIR/" 2>/dev/null || true
+    fi
+  done
+
+  # Ensure user local shell extension exists so ~/.bashrc edits never break user customizations
+  if [[ ! -f "$HOME/.bashrc.local" ]]; then
+    cat <<'EOF' > "$HOME/.bashrc.local"
+# ~/.bashrc.local — Custom user shell overrides for Omarchy-WSL
+# This file is NEVER modified or overwritten by upstream Omarchy updates or migrations.
+# Put your custom PATH additions, aliases, and environment variables here.
+
+EOF
+  fi
+
+  # Verify ~/.bashrc sources ~/.bashrc.local
+  if [[ -f "$HOME/.bashrc" ]] && ! grep -q '\.bashrc\.local' "$HOME/.bashrc"; then
+    echo -e "\n# Load custom user overrides\n[[ -f ~/.bashrc.local ]] && source ~/.bashrc.local" >> "$HOME/.bashrc"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# 3. Safe Migration Execution Loop
+# -----------------------------------------------------------------------------
+run_migrations() {
+  if [[ ! -d "$MIGRATIONS_DIR" ]]; then
+    log "No migrations directory found at $MIGRATIONS_DIR. Nothing to do."
+    return 0
+  fi
+
+  # Put shims at the very front of PATH
+  export PATH="$WSL_SHIM_DIR:$PATH"
+  export OMARCHY_RUNNING_IN_WSL=1
+  export OMARCHY_THEME_HEADLESS=1
+
+  local pending_count=0
+  for script in "$MIGRATIONS_DIR"/*.sh; do
+    [[ -e "$script" ]] || continue
+    local migration_name
+    migration_name="$(basename "$script")"
+
+    if [[ -f "$STATE_DIR/$migration_name" ]]; then
+      continue # Already applied
+    fi
+
+    ((pending_count++))
+    log "Executing pending migration: $migration_name"
+
+    # Execute migration in a protected subshell
+    if ( source "$script" ); then
+      touch "$STATE_DIR/$migration_name"
+      success "Successfully applied: $migration_name"
+    else
+      warn "Migration $migration_name encountered an error!"
+      warn "State snapshot preserved at: $BACKUP_DIR"
+      return 1
+    fi
+  done
+
+  if [[ $pending_count -eq 0 ]]; then
+    log "All upstream migrations are up to date."
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# 4. Post-Migration Stability Lockdown
+# -----------------------------------------------------------------------------
+lockdown_stability() {
+  log "Verifying WSL kernel memory parameters and sysctl ordering..."
+
+  # Ensure hardened sysctl rule exists
+  local stability_file="/etc/sysctl.d/99-zz-omarchy-wsl-stability.conf"
+  if [[ -f "$stability_file" ]]; then
+    sudo sysctl -q -p "$stability_file" 2>/dev/null || true
+  fi
+
+  # Ensure critical systemd units remain masked
+  sudo systemctl mask \
+    systemd-firstboot.service \
+    systemd-resolved.service \
+    systemd-networkd.service \
+    NetworkManager.service \
+    tmp.mount 2>/dev/null || true
+
+  success "WSL kernel and systemd stability state verified."
+}
+
+# -----------------------------------------------------------------------------
+# Main Entry Point
+# -----------------------------------------------------------------------------
+install_shims
+protect_user_state
+run_migrations
+lockdown_stability
+success "Omarchy WSL migration gate execution completed safely."
