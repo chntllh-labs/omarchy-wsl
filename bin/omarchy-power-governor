@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Power- & Thermal-Aware Build Concurrency Governor
+# /usr/bin/omarchy-power-governor
+# ==============================================================================
+# Scales compiler parallelism to the host's power situation so a laptop on
+# battery (Snapdragon X / X2, Intel/AMD ultrabooks) is not drained by -j18
+# builds, and a thermally limited machine is not pushed into deeper throttling.
+#
+# Signals (best available wins, results cached for OMARCHY_POWER_CACHE_TTL s):
+#   1. /sys/class/power_supply  — WSL2 battery/AC passthrough. Built in on
+#      arm64 kernels; a module (ACPI_BATTERY/ACPI_AC =m) on x86 6.6+ kernels,
+#      so it is frequently absent on x86.
+#   2. Windows host via PowerShell 5.1 (no admin required):
+#      SystemInformation.PowerStatus     AC line + battery % (0..1 float)
+#      PowerManager.EnergySaverStatus    Energy Saver (Disabled/Off/On)
+#      Power-mode overlay                Best efficiency / Balanced / Best perf
+#      Win32_PerfFormattedData_Counters_ProcessorInformation.PercentPerformanceLimit
+#      Win32_PerfFormattedData_Counters_ThermalZoneInformation.PercentPassiveLimit
+#      (WMI property names are locale-independent, unlike Get-Counter paths.)
+#
+# Policy: AC -> 100%; battery -> 50%; battery <= 20% or Energy Saver -> 25%;
+# "best power efficiency" mode caps at the battery level; a performance/passive
+# limit below 80% scales the result proportionally. Never below 1 job.
+# ==============================================================================
+
+set -euo pipefail
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_is_wsl >/dev/null || { echo "omarchy-power-governor: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-power-governor"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-power-governor <command>
+
+Commands:
+  status [--json]   Show power source, battery, energy saver, power mode, thermal limit
+  jobs <N>          Print the governed job count for a base parallelism of N
+  factor            Print the scaling percentage (100 = unrestricted)
+  refresh           Discard the cached host query
+
+Configuration (~/.config/omarchy/power-governor.conf or environment):
+  OMARCHY_POWER_GOVERNOR=auto|off|ac|battery   (default: auto)
+  OMARCHY_POWER_BATTERY_PCT=50                 scale on battery
+  OMARCHY_POWER_LOW_PCT=25                     scale on low battery / Energy Saver
+  OMARCHY_POWER_LOW_THRESHOLD=20               "low battery" percentage
+  OMARCHY_POWER_THERMAL_FLOOR=80               scale when perf limit drops below this
+  OMARCHY_POWER_CACHE_TTL=60                   seconds to cache the Windows query
+EOF
+}
+
+CONF_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/power-governor.conf"
+# Config is parsed, never sourced: only whitelisted integer/enum keys.
+if [[ -r "$CONF_FILE" ]]; then
+  while IFS='=' read -r key value; do
+    value="${value//[\"\' ]/}"
+    case "$key" in
+      OMARCHY_POWER_GOVERNOR) [[ "$value" =~ ^(auto|off|ac|battery)$ ]] && : "${OMARCHY_POWER_GOVERNOR:=$value}" ;;
+      OMARCHY_POWER_BATTERY_PCT|OMARCHY_POWER_LOW_PCT|OMARCHY_POWER_LOW_THRESHOLD|OMARCHY_POWER_THERMAL_FLOOR|OMARCHY_POWER_CACHE_TTL)
+        [[ "$value" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "${!key:-$value}" ;;
+    esac
+  done <"$CONF_FILE"
+fi
+
+MODE="${OMARCHY_POWER_GOVERNOR:-auto}"
+BATTERY_PCT="${OMARCHY_POWER_BATTERY_PCT:-50}"
+LOW_PCT="${OMARCHY_POWER_LOW_PCT:-25}"
+LOW_THRESHOLD="${OMARCHY_POWER_LOW_THRESHOLD:-20}"
+THERMAL_FLOOR="${OMARCHY_POWER_THERMAL_FLOOR:-80}"
+CACHE_TTL="${OMARCHY_POWER_CACHE_TTL:-60}"
+SUPPLY_DIR="${OMW_POWER_SUPPLY_DIR:-/sys/class/power_supply}"
+
+OVERLAY_EFFICIENCY="961cc777-2547-4f9d-8174-7d86181b8a7a"
+OVERLAY_BETTER_PERF="3af9b8d9-7c97-431d-ad78-34a8bfea439f"
+OVERLAY_BEST_PERF="ded574b5-45a0-4f42-8737-46345c09c238"
+
+# Gathered state
+SOURCE="unknown"     # ac | battery | unknown
+SIGNAL="none"        # sysfs | windows | forced | none
+BATTERY=""           # 0-100
+SAVER="Unknown"      # Disabled | Off | On | Unknown
+OVERLAY=""           # GUID of the active power-mode overlay
+PERF_LIMIT=""        # % Performance Limit (100 = unthrottled)
+PASSIVE_LIMIT=""     # % Passive Limit of the hottest thermal zone
+
+# -----------------------------------------------------------------------------
+# Signal 1: sysfs passthrough
+# -----------------------------------------------------------------------------
+read_sysfs() {
+  local d type online=0 mains=0 bat_status="" found=0
+  [[ -d "$SUPPLY_DIR" ]] || return 1
+  for d in "$SUPPLY_DIR"/*; do
+    [[ -r "$d/type" ]] || continue
+    type=$(<"$d/type")
+    case "$type" in
+      Mains|USB|USB_PD|USB_C)
+        mains=1
+        [[ "$(cat "$d/online" 2>/dev/null)" == "1" ]] && online=1
+        found=1
+        ;;
+      Battery)
+        [[ "$(cat "$d/present" 2>/dev/null || echo 1)" == "1" ]] || continue
+        BATTERY=$(cat "$d/capacity" 2>/dev/null || true)
+        [[ "$BATTERY" =~ ^[0-9]+$ ]] || BATTERY=""
+        bat_status=$(cat "$d/status" 2>/dev/null || true)
+        found=1
+        ;;
+    esac
+  done
+  (( found )) || return 1
+  if (( online )); then
+    SOURCE="ac"
+  elif [[ "$bat_status" == "Discharging" ]]; then
+    SOURCE="battery"
+  elif (( mains )); then
+    SOURCE="battery"
+  elif [[ "$bat_status" =~ ^(Charging|Full|Not\ charging)$ ]]; then
+    SOURCE="ac"
+  else
+    return 1
+  fi
+  SIGNAL="sysfs"
+}
+
+# -----------------------------------------------------------------------------
+# Signal 2: Windows host query (one PowerShell process, cached)
+# -----------------------------------------------------------------------------
+read -r -d '' WINDOWS_QUERY <<'PS' || true
+$o=[ordered]@{}
+try{Add-Type -AssemblyName System.Windows.Forms;$p=[System.Windows.Forms.SystemInformation]::PowerStatus;$o.line=[string]$p.PowerLineStatus;$o.pct=[int][math]::Round($p.BatteryLifePercent*100);$o.chg=([string]$p.BatteryChargeStatus) -replace ",\s*","|"}catch{}
+try{[void][Windows.System.Power.PowerManager,Windows.System.Power,ContentType=WindowsRuntime];$o.saver=[string][Windows.System.Power.PowerManager]::EnergySaverStatus}catch{}
+try{$r=Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Power\User\PowerSchemes" -ErrorAction Stop;$o.overlay_ac=[string]$r.ActiveOverlayAcPowerScheme;$o.overlay_dc=[string]$r.ActiveOverlayDcPowerScheme}catch{}
+try{$c=Get-CimInstance Win32_PerfFormattedData_Counters_ProcessorInformation -Filter "Name='_Total'" -ErrorAction Stop;$o.perf_limit=[string]$c.PercentPerformanceLimit}catch{}
+try{$z=Get-CimInstance Win32_PerfFormattedData_Counters_ThermalZoneInformation -ErrorAction Stop|Sort-Object PercentPassiveLimit|Select-Object -First 1;if($z){$o.passive=[string]$z.PercentPassiveLimit}}catch{}
+foreach($k in $o.Keys){[Console]::Out.WriteLine($k+"="+$o[$k])}
+PS
+
+windows_query() {
+  local raw
+  if raw=$(omw_cache_get power-state "$CACHE_TTL"); then
+    printf '%s\n' "$raw"
+    return 0
+  fi
+  omw_is_wsl && omw_interop_enabled || return 1
+  raw=$(OMW_TIMEOUT=8 omw_ps_run "$WINDOWS_QUERY") || return 1
+  [[ -n "$raw" ]] || return 1
+  omw_cache_put power-state "$raw"
+  printf '%s\n' "$raw"
+}
+
+read_windows() {
+  local raw key value line="" pct="" chg="" ov_ac="" ov_dc=""
+  raw=$(windows_query) || return 1
+  while IFS='=' read -r key value; do
+    case "$key" in
+      line) [[ "$value" =~ ^(Online|Offline|Unknown)$ ]] && line="$value" ;;
+      pct) [[ "$value" =~ ^[0-9]+$ ]] && pct="$value" ;;
+      chg) [[ "$value" =~ ^[A-Za-z|]+$ ]] && chg="$value" ;;
+      saver) [[ "$value" =~ ^(Disabled|Off|On)$ ]] && SAVER="$value" ;;
+      overlay_ac) [[ "$value" =~ ^[0-9a-fA-F-]{36}$ ]] && ov_ac="${value,,}" ;;
+      overlay_dc) [[ "$value" =~ ^[0-9a-fA-F-]{36}$ ]] && ov_dc="${value,,}" ;;
+      perf_limit) [[ "$value" =~ ^[0-9]+$ ]] && PERF_LIMIT="$value" ;;
+      passive) [[ "$value" =~ ^[0-9]+$ ]] && PASSIVE_LIMIT="$value" ;;
+    esac
+  done <<<"$raw"
+  if [[ "$SIGNAL" != "sysfs" ]]; then
+    if [[ "$chg" == *NoSystemBattery* ]]; then
+      SOURCE="ac"
+    elif [[ "$line" == "Offline" ]]; then
+      SOURCE="battery"
+    elif [[ "$line" == "Online" ]]; then
+      SOURCE="ac"
+    fi
+    if [[ "$chg" != *NoSystemBattery* && -n "$pct" ]] && (( pct <= 100 )); then
+      BATTERY="$pct"
+    fi
+    [[ "$SOURCE" != "unknown" ]] && SIGNAL="windows"
+  fi
+  if [[ "$SOURCE" == "battery" ]]; then OVERLAY="$ov_dc"; else OVERLAY="$ov_ac"; fi
+  return 0
+}
+
+gather() {
+  case "$MODE" in
+    ac|battery) SOURCE="$MODE"; SIGNAL="forced"; return 0 ;;
+    off) SIGNAL="disabled"; return 0 ;;
+  esac
+  read_sysfs || true
+  # Even with sysfs, the Windows query adds Energy Saver / mode / thermal data.
+  if [[ -z "${OMARCHY_POWER_NO_WINDOWS:-}" ]]; then
+    read_windows || true
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Policy
+# -----------------------------------------------------------------------------
+REASONS=()
+FACTOR=100
+# Sets FACTOR and REASONS (no subshell, so REASONS survives).
+compute_factor() {
+  local factor=100 limit=""
+  REASONS=()
+  if [[ "$MODE" == "off" ]]; then
+    FACTOR=100
+    return
+  fi
+  if [[ "$SOURCE" == "battery" ]]; then
+    factor=$BATTERY_PCT
+    REASONS+=("on battery")
+    if [[ -n "$BATTERY" ]] && (( BATTERY <= LOW_THRESHOLD )); then
+      factor=$LOW_PCT
+      REASONS+=("battery ${BATTERY}% <= ${LOW_THRESHOLD}%")
+    fi
+  fi
+  if [[ "$SAVER" == "On" ]] && (( factor > LOW_PCT )); then
+    factor=$LOW_PCT
+    REASONS+=("Energy Saver on")
+  fi
+  if [[ "$OVERLAY" == "$OVERLAY_EFFICIENCY" ]] && (( factor > BATTERY_PCT )); then
+    factor=$BATTERY_PCT
+    REASONS+=("power mode: best efficiency")
+  fi
+  for limit in "$PERF_LIMIT" "$PASSIVE_LIMIT"; do
+    if [[ -n "$limit" ]] && (( limit > 0 && limit < THERMAL_FLOOR )); then
+      factor=$(( factor * limit / 100 ))
+      REASONS+=("thermal/firmware limit ${limit}%")
+    fi
+  done
+  (( factor < 1 )) && factor=1
+  (( factor > 100 )) && factor=100
+  FACTOR=$factor
+}
+
+overlay_name() {
+  case "$1" in
+    "$OVERLAY_EFFICIENCY") echo "best power efficiency" ;;
+    "$OVERLAY_BETTER_PERF") echo "better performance" ;;
+    "$OVERLAY_BEST_PERF") echo "best performance" ;;
+    00000000-0000-0000-0000-000000000000) echo "balanced" ;;
+    "") echo "unknown" ;;
+    *) echo "custom ($1)" ;;
+  esac
+}
+
+cmd_jobs() {
+  local base="${1:-}" factor jobs
+  [[ "$base" =~ ^[0-9]+$ && "$base" -ge 1 ]] || omw_die "jobs requires a positive integer"
+  gather
+  compute_factor
+  factor=$FACTOR
+  jobs=$(( base * factor / 100 ))
+  (( jobs < 1 )) && jobs=1
+  echo "$jobs"
+}
+
+cmd_status() {
+  local json=0 factor
+  [[ "${1:-}" == "--json" ]] && json=1
+  gather
+  compute_factor
+  factor=$FACTOR
+  if (( json )); then
+    printf '{"mode":"%s","signal":"%s","source":"%s","battery":%s,"energy_saver":"%s","power_mode":"%s","perf_limit":%s,"passive_limit":%s,"factor":%s,"reasons":[' \
+      "$MODE" "$SIGNAL" "$SOURCE" "${BATTERY:-null}" "$SAVER" "$(overlay_name "$OVERLAY")" \
+      "${PERF_LIMIT:-null}" "${PASSIVE_LIMIT:-null}" "$factor"
+    local i
+    for i in "${!REASONS[@]}"; do
+      (( i > 0 )) && printf ','
+      printf '"%s"' "${REASONS[$i]}"
+    done
+    printf ']}\n'
+    return 0
+  fi
+  echo "mode:           $MODE"
+  echo "signal:         $SIGNAL"
+  echo "power source:   $SOURCE"
+  echo "battery:        ${BATTERY:-n/a}${BATTERY:+%}"
+  echo "energy saver:   $SAVER"
+  echo "power mode:     $(overlay_name "$OVERLAY")"
+  echo "perf limit:     ${PERF_LIMIT:-n/a}${PERF_LIMIT:+%}"
+  echo "passive limit:  ${PASSIVE_LIMIT:-n/a}${PASSIVE_LIMIT:+%}"
+  echo "build factor:   ${factor}%${REASONS[0]:+  (${REASONS[*]})}"
+  echo "example:        -j$(nproc 2>/dev/null || echo 8) -> -j$(( $(nproc 2>/dev/null || echo 8) * factor / 100 > 0 ? $(nproc 2>/dev/null || echo 8) * factor / 100 : 1 ))"
+}
+
+CMD="${1:-}"
+[[ -n "$CMD" ]] || { usage >&2; exit 2; }
+shift
+case "$CMD" in
+  status) cmd_status "${1:-}" ;;
+  jobs) cmd_jobs "${1:-}" ;;
+  factor) gather; compute_factor; echo "$FACTOR" ;;
+  refresh) rm -f -- "$(omw_runtime_dir)/cache-power-state"; omw_log "Cache cleared." ;;
+  -h|--help|help) usage ;;
+  *) omw_err "Unknown command: $CMD"; usage >&2; exit 2 ;;
+esac

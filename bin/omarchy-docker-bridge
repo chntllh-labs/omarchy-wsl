@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Docker / Podman Engine Router
+# /usr/bin/omarchy-docker-bridge
+# ==============================================================================
+# Detects every container engine reachable from this distro and routes the
+# Docker API to the one you choose through a single stable socket:
+#
+#   $XDG_RUNTIME_DIR/omarchy/docker.sock  ->  (atomic symlink)  ->  engine
+#   export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/omarchy/docker.sock
+#
+# Engines:
+#   desktop         Docker Desktop WSL integration (/mnt/wsl/docker-desktop/...)
+#                   or, without integration, \\.\pipe\docker_engine via npiperelay
+#   docker          native rootful dockerd inside Omarchy (/run/docker.sock)
+#   docker-rootless native rootless dockerd ($XDG_RUNTIME_DIR/docker.sock)
+#   podman          native rootless Podman ($XDG_RUNTIME_DIR/podman/podman.sock)
+#   podman-machine  Podman Desktop machine (/mnt/wsl/podman-sockets/<machine>/)
+#                   or \\.\pipe\podman-machine-default via npiperelay
+#
+# Switching engines re-points the symlink, so every open shell follows without
+# re-exporting anything. /var/run/docker.sock is never touched unless you ask
+# for `install-system`, and a real socket there (Docker Desktop, dockerd) is
+# never replaced.
+# ==============================================================================
+
+set -euo pipefail
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_is_wsl >/dev/null || { echo "omarchy-docker-bridge: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-docker-bridge"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-docker-bridge <command> [args]
+
+Commands:
+  status                 List engines, their health, and the active route
+  use <engine>           Route to: auto|desktop|docker|docker-rootless|podman|podman-machine
+  env                    Print DOCKER_HOST (and Testcontainers hints) for eval
+  relay <engine>         Start an npiperelay relay for desktop|podman-machine pipes
+  install-system [--dry-run]
+                         Also expose the route at /run/docker.sock (sudo, tmpfiles.d)
+  off                    Remove the route and the saved preference
+  -h, --help             Show this help
+
+Config: ~/.config/omarchy/docker-bridge.conf  (OMARCHY_DOCKER_ENGINE=<engine>)
+EOF
+}
+
+RUN_DIR=$(omw_runtime_dir)
+ROUTE="${RUN_DIR}/docker.sock"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
+CONF_FILE="${CONF_DIR}/docker-bridge.conf"
+XDG_RT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+WSL_SHARED="${OMARCHY_WSL_SHARED_DIR:-/mnt/wsl}"
+SYSTEM_DOCKER_SOCK="${OMARCHY_SYSTEM_DOCKER_SOCK:-/run/docker.sock}"
+PODMAN_MACHINE="${OMARCHY_PODMAN_MACHINE:-podman-machine-default}"
+ENGINES=(desktop docker docker-rootless podman podman-machine)
+
+[[ "$PODMAN_MACHINE" =~ ^[A-Za-z0-9._-]+$ ]] || omw_die "Invalid OMARCHY_PODMAN_MACHINE"
+
+# -----------------------------------------------------------------------------
+# Engine discovery
+# -----------------------------------------------------------------------------
+# Candidate sockets per engine, best first.
+engine_candidates() {
+  case "$1" in
+    desktop)
+      echo "${WSL_SHARED}/docker-desktop/shared-sockets/guest-services/docker.sock"
+      echo "${WSL_SHARED}/docker-desktop/shared-sockets/guest-services/docker.proxy.sock"
+      echo "${RUN_DIR}/relay-desktop.sock"
+      ;;
+    docker) echo "$SYSTEM_DOCKER_SOCK" ;;
+    docker-rootless) echo "${XDG_RT}/docker.sock" ;;
+    podman) echo "${XDG_RT}/podman/podman.sock" ;;
+    podman-machine)
+      echo "${WSL_SHARED}/podman-sockets/${PODMAN_MACHINE}/podman-user.sock"
+      echo "${WSL_SHARED}/podman-sockets/${PODMAN_MACHINE}/podman-root.sock"
+      echo "${RUN_DIR}/relay-podman-machine.sock"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# Docker Desktop integration also materialises /var/run/docker.sock; do not
+# misreport that as a native dockerd.
+system_sock_is_desktop() {
+  [[ -d "${WSL_SHARED}/docker-desktop" ]] && [[ -L /usr/bin/docker ]] \
+    && [[ "$(readlink /usr/bin/docker)" == *docker-desktop* ]]
+}
+
+# Health check through the Docker API (podman's compat API answers too).
+ping_socket() {
+  local sock="$1"
+  [[ -S "$sock" ]] || return 1
+  if [[ ! -w "$sock" ]]; then
+    return 2
+  fi
+  omw_have curl || return 0
+  [[ "$(timeout 3 curl -fsS --unix-socket "$sock" http://localhost/_ping 2>/dev/null)" == "OK" ]]
+}
+
+# engine_socket <engine> -> first healthy socket path
+engine_socket() {
+  local engine="$1" sock rc
+  if [[ "$engine" == "docker" ]] && system_sock_is_desktop; then
+    return 1
+  fi
+  while IFS= read -r sock; do
+    rc=0
+    ping_socket "$sock" || rc=$?
+    if (( rc == 0 )); then
+      echo "$sock"
+      return 0
+    fi
+  done < <(engine_candidates "$engine")
+  return 1
+}
+
+engine_state() {
+  local engine="$1" sock rc
+  if [[ "$engine" == "docker" ]] && system_sock_is_desktop; then
+    echo "managed-by-desktop"
+    return
+  fi
+  while IFS= read -r sock; do
+    rc=0
+    ping_socket "$sock" || rc=$?
+    case "$rc" in
+      0) echo "healthy  $sock"; return ;;
+      2) echo "no-permission  $sock"; return ;;
+    esac
+  done < <(engine_candidates "$engine")
+  echo "unavailable"
+}
+
+configured_engine() {
+  local engine="auto"
+  if [[ -r "$CONF_FILE" ]]; then
+    engine=$(sed -n 's/^OMARCHY_DOCKER_ENGINE=//p' "$CONF_FILE" | tail -n 1 | tr -d '"'"'"' ')
+  fi
+  echo "${OMARCHY_DOCKER_ENGINE:-${engine:-auto}}"
+}
+
+resolve_engine() {
+  local want="$1" e
+  if [[ "$want" == "auto" ]]; then
+    for e in "${ENGINES[@]}"; do
+      if engine_socket "$e" >/dev/null; then
+        echo "$e"
+        return 0
+      fi
+    done
+    return 1
+  fi
+  echo "$want"
+}
+
+valid_engine() {
+  local e
+  [[ "$1" == "auto" ]] && return 0
+  for e in "${ENGINES[@]}"; do [[ "$1" == "$e" ]] && return 0; done
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# Routing
+# -----------------------------------------------------------------------------
+point_route() {
+  local target="$1" tmp="${ROUTE}.tmp.$$"
+  ln -s -- "$target" "$tmp"
+  mv -fT -- "$tmp" "$ROUTE"
+}
+
+try_start_native() {
+  case "$1" in
+    podman)
+      omw_have podman || return 1
+      systemctl --user start podman.socket >/dev/null 2>&1 || return 1
+      ;;
+    docker-rootless)
+      systemctl --user start docker.socket docker.service >/dev/null 2>&1 || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  sleep 0.3
+}
+
+cmd_use() {
+  local want="${1:-}" engine sock
+  [[ -n "$want" ]] || omw_die "use requires an engine: auto|desktop|docker|docker-rootless|podman|podman-machine"
+  valid_engine "$want" || omw_die "Unknown engine: $want"
+  engine=$(resolve_engine "$want") || omw_die "No healthy container engine found. Run: omarchy-docker-bridge status"
+  if ! sock=$(engine_socket "$engine"); then
+    sock=""
+    if try_start_native "$engine"; then
+      sock=$(engine_socket "$engine" || true)
+    fi
+  fi
+  [[ -n "${sock:-}" ]] || omw_die "Engine '$engine' is not reachable. For Windows pipes try: omarchy-docker-bridge relay $engine"
+  point_route "$sock"
+  mkdir -p "$CONF_DIR"
+  printf 'OMARCHY_DOCKER_ENGINE=%s\n' "$want" >"$CONF_FILE"
+  omw_log "Routing Docker API -> $engine ($sock)"
+  omw_log "Shells started from now on export DOCKER_HOST=unix://$ROUTE (or run: eval \"\$(omarchy-docker-bridge env)\")"
+}
+
+cmd_env() {
+  local want engine sock
+  want=$(configured_engine)
+  # Only refresh the route when the user opted in (config file present) or
+  # asked for an engine explicitly; otherwise leave DOCKER_HOST alone so
+  # `docker context` keeps working.
+  [[ -r "$CONF_FILE" || -n "${OMARCHY_DOCKER_ENGINE:-}" ]] || return 0
+  engine=$(resolve_engine "$want" 2>/dev/null) || return 0
+  sock=$(engine_socket "$engine" 2>/dev/null) || return 0
+  if [[ "$(readlink "$ROUTE" 2>/dev/null)" != "$sock" ]]; then
+    point_route "$sock"
+  fi
+  printf 'export DOCKER_HOST=%q\n' "unix://${ROUTE}"
+  case "$engine" in
+    podman|podman-machine)
+      # Ryuk needs a privileged Docker socket that rootless Podman cannot offer.
+      echo 'export TESTCONTAINERS_RYUK_DISABLED=true'
+      ;;
+  esac
+}
+
+cmd_status() {
+  local e current
+  current=$(readlink "$ROUTE" 2>/dev/null || true)
+  printf '%-16s %s\n' "ENGINE" "STATE"
+  for e in "${ENGINES[@]}"; do
+    printf '%-16s %s\n' "$e" "$(engine_state "$e")"
+  done
+  echo
+  echo "preference: $(configured_engine)"
+  echo "route:      $ROUTE -> ${current:-<none>}"
+  echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
+}
+
+cmd_relay() {
+  local engine="${1:-}" relay pipe sock wrapper
+  case "$engine" in
+    desktop) pipe="docker_engine" ;;
+    podman-machine) pipe="$PODMAN_MACHINE" ;;
+    *) omw_die "relay supports: desktop | podman-machine" ;;
+  esac
+  omw_require_interop
+  omw_have socat || omw_die "socat is not installed (pacman -S socat)."
+  relay=$(omw_find_npiperelay) || omw_die "npiperelay.exe not found (winget install albertony.npiperelay)."
+  sock="${RUN_DIR}/relay-${engine}.sock"
+  wrapper="${RUN_DIR}/relay-${engine}.sh"
+  if ping_socket "$sock"; then
+    omw_log "Relay already healthy at $sock"
+    return 0
+  fi
+  rm -f -- "$sock"
+  omw_write_exec_wrapper "$wrapper" "$relay" -ep -s "//./pipe/${pipe}"
+  setsid socat "UNIX-LISTEN:${sock},fork,umask=177" "EXEC:${wrapper},nofork" </dev/null >>"${RUN_DIR}/relay-${engine}.log" 2>&1 &
+  echo $! >"${RUN_DIR}/relay-${engine}.pid"
+  disown 2>/dev/null || true
+  omw_log "Relaying $sock -> \\\\.\\pipe\\${pipe}; now run: omarchy-docker-bridge use $engine"
+}
+
+cmd_install_system() {
+  local dry=0 conf="/etc/tmpfiles.d/omarchy-docker-sock.conf" line
+  [[ "${1:-}" == "--dry-run" ]] && dry=1
+  if [[ -S "$SYSTEM_DOCKER_SOCK" && ! -L "$SYSTEM_DOCKER_SOCK" ]]; then
+    omw_die "$SYSTEM_DOCKER_SOCK is a live socket owned by another engine; refusing to replace it."
+  fi
+  if [[ -L "$SYSTEM_DOCKER_SOCK" && "$(readlink "$SYSTEM_DOCKER_SOCK")" != "$ROUTE" ]]; then
+    omw_die "$SYSTEM_DOCKER_SOCK already links to $(readlink "$SYSTEM_DOCKER_SOCK"); refusing to replace it."
+  fi
+  line="L ${SYSTEM_DOCKER_SOCK} - - - - ${ROUTE}"
+  if (( dry )); then
+    echo "write $conf: $line"
+    echo "sudo systemd-tmpfiles --create $conf"
+    return 0
+  fi
+  printf '# Managed by omarchy-docker-bridge\n%s\n' "$line" | sudo tee "$conf" >/dev/null
+  sudo systemd-tmpfiles --create "$conf"
+  omw_log "$SYSTEM_DOCKER_SOCK -> $ROUTE"
+}
+
+cmd_off() {
+  rm -f -- "$ROUTE" "$CONF_FILE"
+  omw_log "Route removed. Open a new shell (or unset DOCKER_HOST)."
+}
+
+CMD="${1:-}"
+[[ -n "$CMD" ]] || { usage >&2; exit 2; }
+shift
+case "$CMD" in
+  status) cmd_status ;;
+  use) cmd_use "${1:-}" ;;
+  env) cmd_env ;;
+  relay) cmd_relay "${1:-}" ;;
+  install-system) cmd_install_system "${1:-}" ;;
+  off) cmd_off ;;
+  -h|--help|help) usage ;;
+  *) omw_err "Unknown command: $CMD"; usage >&2; exit 2 ;;
+esac

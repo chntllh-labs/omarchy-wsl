@@ -12,6 +12,8 @@
 # 3. High-core low-memory compilation crashes (computes safe -j thread limits).
 # 4. Partial zombie OOM failure states (enforces atomic MemoryOOMGroup=yes).
 # 5. Sacrifices builds first during acute memory pressure (OOMScoreAdjust=500).
+# 6. Battery drain & thermal throttling on laptops (omarchy-power-governor).
+# 7. Accidental builds on Windows drives (DrvFs/9P) — refused unless allowed.
 # ==============================================================================
 
 set -euo pipefail
@@ -24,6 +26,10 @@ Options:
   -j, --jobs <N>       Explicitly set maximum parallel compilation jobs
   --slice <name>       Custom systemd slice (default: build.slice)
   --no-cgroup          Bypass cgroup isolation; apply nice/oom_score_adj directly
+  --no-power           Ignore battery/thermal state (skip omarchy-power-governor)
+  --notify             Raise a Windows toast when the build finishes (omarchy-notify)
+  --allow-drvfs        Permit building inside a Windows drive (/mnt/<drive>)
+  --dry-run            Print the computed parallelism and command, then exit
   -h, --help           Display this help message
 
 Examples:
@@ -38,6 +44,11 @@ EOF
 CUSTOM_JOBS=""
 TARGET_SLICE="build.slice"
 BYPASS_CGROUP=0
+NO_POWER=0
+NOTIFY=0
+ALLOW_DRVFS=0
+DRY_RUN=0
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,6 +62,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-cgroup)
       BYPASS_CGROUP=1
+      shift
+      ;;
+    --no-power)
+      NO_POWER=1
+      shift
+      ;;
+    --notify)
+      NOTIFY=1
+      shift
+      ;;
+    --allow-drvfs)
+      ALLOW_DRVFS=1
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=1
       shift
       ;;
     -h|--help)
@@ -97,6 +124,62 @@ else
   else
     JOBS="$MAX_SAFE_BY_RAM"
   fi
+fi
+
+# Sibling tools first (repo checkout), then PATH (installed system).
+find_tool() {
+  if [[ -x "${SELF_DIR}/$1" ]]; then
+    echo "${SELF_DIR}/$1"
+  else
+    command -v "$1" 2>/dev/null
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# 1b. Power & Thermal Governance (battery, Energy Saver, throttling)
+# -----------------------------------------------------------------------------
+# An explicit -j is always honoured; only the computed default is governed.
+POWER_NOTE=""
+if [[ -z "$CUSTOM_JOBS" && $NO_POWER -eq 0 && "${OMARCHY_POWER_GOVERNOR:-auto}" != "off" ]]; then
+  if GOVERNOR=$(find_tool omarchy-power-governor); then
+    GOVERNED=$(timeout 10 "$GOVERNOR" jobs "$JOBS" 2>/dev/null || true)
+    if [[ "$GOVERNED" =~ ^[0-9]+$ ]] && (( GOVERNED >= 1 && GOVERNED < JOBS )); then
+      POWER_NOTE="power governor: -j${JOBS} -> -j${GOVERNED}"
+      JOBS="$GOVERNED"
+    fi
+  fi
+fi
+
+# -----------------------------------------------------------------------------
+# 1c. DrvFs Boundary: builds on /mnt/<drive> are slow and break file watchers
+# -----------------------------------------------------------------------------
+if (( ALLOW_DRVFS == 0 )) && [[ "${OMARCHY_DRVFS_GUARD:-block}" == "block" ]]; then
+  case "$(stat -f -c %T . 2>/dev/null)" in
+    v9fs|9p|drvfs)
+      echo "[omarchy-build] Refusing to build on a Windows drive ($PWD)." >&2
+      echo "[omarchy-build] Move the project to ~/src (ext4), or pass --allow-drvfs." >&2
+      exit 2
+      ;;
+  esac
+fi
+
+if (( NOTIFY == 1 )); then
+  if NOTIFIER=$(find_tool omarchy-notify); then
+    set -- "$NOTIFIER" --wrap --min-seconds "${OMARCHY_NOTIFY_MIN_SECONDS:-0}" -- "$@"
+  else
+    echo "[omarchy-build] --notify requested but omarchy-notify is not installed." >&2
+  fi
+fi
+
+[[ -n "$POWER_NOTE" && -t 2 ]] && echo "[omarchy-build] ${POWER_NOTE}" >&2
+
+if (( DRY_RUN == 1 )); then
+  echo "jobs=${JOBS}"
+  [[ -n "$POWER_NOTE" ]] && echo "note=${POWER_NOTE}"
+  printf 'command='
+  printf '%q ' "$@"
+  printf '\n'
+  exit 0
 fi
 
 export CARGO_BUILD_JOBS="$JOBS"

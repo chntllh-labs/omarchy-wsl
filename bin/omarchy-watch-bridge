@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Windows -> Linux File-Watcher Bridge
+# /usr/bin/omarchy-watch-bridge
+# ==============================================================================
+# Problem: edits made by Windows programs (VS Code without Remote-WSL, Visual
+# Studio, JetBrains on Windows, Explorer) to files under /mnt/<drive> raise no
+# Linux inotify events (microsoft/WSL#4739). Vite, Next.js, webpack, nodemon,
+# cargo-watch and watchexec never hot-reload.
+#
+# Best fix: keep the project on ext4 (~/src) and open it from Windows through
+# \\wsl.localhost\<distro>\... — those writes are performed by WSL's own 9P
+# file server inside Linux, so they go through the Linux VFS and fire inotify.
+#
+# When the project must stay on a Windows drive, this bridge runs a .NET
+# FileSystemWatcher (ReadDirectoryChangesW) on the Windows side and replays
+# each change as a Linux-side metadata touch:
+#   * touch -c -r f f   -> IN_ATTRIB (libuv/chokidar/Node fs.watch, notify-rs)
+#     with the mtime preserved, so tools comparing mtimes see Windows' value;
+#   * open-for-append   -> IN_CLOSE_WRITE (inotifywait, entr) without writing.
+# Deletions and buffer overflows touch the parent/root directory so watchers
+# rescan. Echoes of our own touches are suppressed per path.
+# ==============================================================================
+
+set -euo pipefail
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_is_wsl >/dev/null || { echo "omarchy-watch-bridge: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-watch-bridge"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-watch-bridge <command> [options]
+
+Commands:
+  check [DIR]           Diagnose watcher reliability for DIR (default: .)
+  run [DIR]             Forward Windows-side changes under DIR to Linux inotify
+  env                   Print polling fallbacks for common dev servers
+
+Options (run):
+  --exclude PATTERN     Skip paths containing PATTERN (repeatable; defaults:
+                        node_modules .git target dist .next .turbo .cache)
+  --suppress-ms N       Ignore repeat events for a path within N ms (default: 750)
+  --events-from FILE    Read "Type<TAB>WindowsPath" events from FILE ('-' = stdin)
+                        instead of starting the Windows watcher (testing/replay)
+  -v, --verbose         Log every replayed event
+EOF
+}
+
+CMD="${1:-}"
+[[ -n "$CMD" ]] || { usage >&2; exit 2; }
+shift
+
+TARGET_DIR="."
+EXCLUDES=(node_modules .git target dist .next .turbo .cache __pycache__)
+SUPPRESS_MS=750
+EVENTS_FROM=""
+VERBOSE=0
+CUSTOM_EXCLUDES=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --exclude)
+      (( CUSTOM_EXCLUDES )) || { EXCLUDES=(); CUSTOM_EXCLUDES=1; }
+      EXCLUDES+=("${2:?--exclude requires a value}"); shift 2 ;;
+    --suppress-ms) SUPPRESS_MS="${2:?}"; shift 2 ;;
+    --events-from) EVENTS_FROM="${2:?}"; shift 2 ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) omw_err "Unknown option: $1"; exit 2 ;;
+    *) TARGET_DIR="$1"; shift ;;
+  esac
+done
+[[ "$SUPPRESS_MS" =~ ^[0-9]+$ ]] || omw_die "--suppress-ms must be an integer"
+
+# -----------------------------------------------------------------------------
+# check / env
+# -----------------------------------------------------------------------------
+cmd_env() {
+  cat <<'EOF'
+# Polling fallbacks (CPU cost grows with tree size; prefer ~/src on ext4).
+export CHOKIDAR_USEPOLLING=1          # chokidar (Vite < 5 deps, Storybook, many CLIs)
+export CHOKIDAR_INTERVAL=500
+export WATCHPACK_POLLING=true         # webpack / Next.js (webpack mode only)
+export TSC_WATCHFILE=DynamicPriorityPolling
+export TSC_WATCHDIRECTORY=DynamicPriorityPolling
+# Config-file / flag based:
+#   Vite:        server: { watch: { usePolling: true, interval: 300 } }
+#   Next.js:     watchOptions: { pollIntervalMs: 500 }   (Turbopack + webpack)
+#   cargo-watch: cargo watch --poll -x run
+#   watchexec:   watchexec --poll 500ms -- cargo test   (default poll is 30s)
+#   nodemon:     nodemon -L
+#   VS Code:     "remote.WSL.fileWatcher.polling": true
+EOF
+}
+
+cmd_check() {
+  local dir abs watches
+  dir="$TARGET_DIR"
+  abs=$(realpath -m -- "$dir")
+  watches=$(cat /proc/sys/fs/inotify/max_user_watches 2>/dev/null || echo "?")
+  echo "path:              $abs"
+  if omw_is_drvfs "$abs"; then
+    echo "filesystem:        Windows drive (DrvFs/9P)  -> Windows edits are INVISIBLE to inotify"
+    echo
+    echo "Recommended:  move the project to ext4 and open it from Windows via UNC:"
+    echo "    mv \"$abs\" ~/src/   &&   code --remote wsl+$(omw_distro_name) ~/src/${abs##*/}"
+    echo "    (Windows path: $(omw_unix_to_win "$HOME/src/${abs##*/}"))"
+    echo "Alternative:  omarchy-watch-bridge run \"$abs\""
+    echo "Last resort:  eval \"\$(omarchy-watch-bridge env)\""
+  else
+    printf '%s\n' 'filesystem:        Linux (native inotify)    -> edits via \\wsl.localhost fire events'
+  fi
+  echo "max_user_watches:  $watches"
+  if [[ "$watches" =~ ^[0-9]+$ ]] && (( watches < 524288 )); then
+    echo "hint:              large monorepos may need fs.inotify.max_user_watches=524288"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# run
+# -----------------------------------------------------------------------------
+windows_watcher_script() {
+  local winroot="$1" excl
+  excl=$(printf '%s\n' "${EXCLUDES[@]+"${EXCLUDES[@]}"}")
+  cat <<EOF
+\$root=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(omw_b64 "$winroot")'))
+\$ex=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(omw_b64 "$excl")')).Split([char]10)|Where-Object{\$_}
+\$w=New-Object IO.FileSystemWatcher \$root
+\$w.IncludeSubdirectories=\$true
+\$w.InternalBufferSize=65536
+\$w.NotifyFilter=[IO.NotifyFilters]'FileName,DirectoryName,LastWrite,Size'
+foreach(\$n in 'Changed','Created','Deleted','Renamed','Error'){Register-ObjectEvent -InputObject \$w -EventName \$n -SourceIdentifier "omw\$n"|Out-Null}
+\$w.EnableRaisingEvents=\$true
+[Console]::Out.WriteLine("Ready\`t"+\$root);[Console]::Out.Flush()
+while(\$true){
+  \$ev=Wait-Event -Timeout 5
+  if(-not \$ev){continue}
+  \$a=\$ev.SourceEventArgs
+  Remove-Event -EventIdentifier \$ev.EventIdentifier
+  if(\$ev.SourceIdentifier -eq 'omwError'){[Console]::Out.WriteLine("Overflow\`t"+\$root);[Console]::Out.Flush();continue}
+  \$p=\$a.FullPath
+  \$skip=\$false
+  foreach(\$x in \$ex){if(\$p -like "*\\\$x\\*" -or \$p -like "*\\\$x"){\$skip=\$true;break}}
+  if(\$skip){continue}
+  [Console]::Out.WriteLine([string]\$a.ChangeType+"\`t"+\$p)
+  if(\$a.ChangeType -eq 'Renamed'){[Console]::Out.WriteLine("Deleted\`t"+\$a.OldFullPath)}
+  [Console]::Out.Flush()
+}
+EOF
+}
+
+excluded() {
+  local p="$1" x
+  for x in "${EXCLUDES[@]+"${EXCLUDES[@]}"}"; do
+    [[ "$p" == *"/$x/"* || "$p" == *"/$x" ]] && return 0
+  done
+  return 1
+}
+
+now_ms() {
+  local t="${EPOCHREALTIME/[.,]/}"
+  echo $(( t / 1000 ))
+}
+
+declare -A LAST_TOUCH=()
+
+# replay <linux-path>: synthesise inotify events without changing content/mtime
+replay() {
+  local f="$1" now
+  now=$(now_ms)
+  if [[ -n "${LAST_TOUCH[$f]:-}" ]] && (( now - LAST_TOUCH[$f] < SUPPRESS_MS )); then
+    return 0
+  fi
+  LAST_TOUCH[$f]=$now
+  if [[ -f "$f" ]]; then
+    touch -c -r "$f" -- "$f" 2>/dev/null || true
+    { : >>"$f"; } 2>/dev/null || true
+  elif [[ -d "$f" ]]; then
+    touch -c -r "$f" -- "$f" 2>/dev/null || true
+  fi
+  (( VERBOSE )) && omw_log "replayed $f"
+  return 0
+}
+
+handle_event() {
+  local type="$1" winpath="$2" path parent
+  path=$(omw_win_to_unix "$winpath" 2>/dev/null) || return 0
+  [[ "$path" == "$ROOT_UNIX" || "$path" == "$ROOT_UNIX"/* ]] || return 0
+  excluded "$path" && return 0
+  case "$type" in
+    Changed|Created|Renamed) replay "$path" ;;
+    Deleted)
+      parent="${path%/*}"
+      [[ -d "$parent" ]] && replay "$parent"
+      ;;
+    Overflow)
+      omw_warn "Windows watcher buffer overflowed; forcing a rescan of $ROOT_UNIX"
+      LAST_TOUCH=()
+      replay "$ROOT_UNIX"
+      ;;
+    Ready) omw_log "Watching $winpath (Windows) -> $ROOT_UNIX (Linux inotify)" ;;
+  esac
+}
+
+cmd_run() {
+  local winroot type winpath
+  ROOT_UNIX=$(realpath -- "$TARGET_DIR") || omw_die "No such directory: $TARGET_DIR"
+  [[ -d "$ROOT_UNIX" ]] || omw_die "Not a directory: $ROOT_UNIX"
+  if [[ -z "$EVENTS_FROM" ]]; then
+    if ! omw_is_drvfs "$ROOT_UNIX"; then
+      omw_log "$ROOT_UNIX is on the Linux filesystem; inotify already works natively. Nothing to bridge."
+      return 0
+    fi
+    omw_require_interop
+  fi
+  winroot=$(omw_unix_to_win "$ROOT_UNIX")
+  local src
+  if [[ -n "$EVENTS_FROM" ]]; then
+    src="$EVENTS_FROM"
+    [[ "$src" == "-" ]] && src=/dev/stdin
+    while IFS=$'\t' read -r type winpath; do
+      [[ -n "$type" ]] && handle_event "$type" "$winpath"
+    done <"$src"
+    return 0
+  fi
+  # No timeout: the watcher lives as long as this process.
+  while IFS=$'\t' read -r type winpath; do
+    [[ -n "$type" ]] && handle_event "$type" "$winpath"
+  done < <(OMW_TIMEOUT=0 omw_ps_run "$(windows_watcher_script "$winroot")")
+  omw_warn "Windows watcher exited."
+  return 1
+}
+
+case "$CMD" in
+  check) cmd_check ;;
+  run) cmd_run ;;
+  env) cmd_env ;;
+  -h|--help|help) usage ;;
+  *) omw_err "Unknown command: $CMD"; usage >&2; exit 2 ;;
+esac
