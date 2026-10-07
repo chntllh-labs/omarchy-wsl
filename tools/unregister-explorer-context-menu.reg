@@ -1,0 +1,9 @@
+Windows Registry Editor Version 5.00
+
+; Omarchy WSL: remove the "Open in Omarchy Terminal" Explorer context menu.
+
+[-HKEY_CURRENT_USER\Software\Classes\Directory\Background\shell\OmarchyTerminal]
+
+[-HKEY_CURRENT_USER\Software\Classes\Directory\shell\OmarchyTerminal]
+
+[-HKEY_CURRENT_USER\Software\Classes\Drive\shell\OmarchyTerminal]

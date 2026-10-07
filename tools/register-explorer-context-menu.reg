@@ -1,0 +1,33 @@
+Windows Registry Editor Version 5.00
+
+; ==============================================================================
+; Omarchy WSL: "Open in Omarchy Terminal" Explorer context menu (per-user, HKCU)
+; ==============================================================================
+; Static variant of tools/register-explorer-context-menu.ps1 for environments
+; where scripts are blocked. Requires Windows Terminal (wt.exe App Execution
+; Alias) and a Windows Terminal profile named "Omarchy".
+;
+; "%V." instead of "%V": a drive root would otherwise become "C:\" whose \"
+; escapes the closing quote (microsoft/terminal#4571). Windows strips the
+; trailing dot from every other directory path.
+;
+; Undo with tools/unregister-explorer-context-menu.reg
+; ==============================================================================
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\Background\shell\OmarchyTerminal]
+@="Open in Omarchy Terminal"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\Background\shell\OmarchyTerminal\command]
+@="wt.exe -w 0 new-tab -p \"Omarchy\" -d \"%V.\""
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\OmarchyTerminal]
+@="Open in Omarchy Terminal"
+
+[HKEY_CURRENT_USER\Software\Classes\Directory\shell\OmarchyTerminal\command]
+@="wt.exe -w 0 new-tab -p \"Omarchy\" -d \"%V.\""
+
+[HKEY_CURRENT_USER\Software\Classes\Drive\shell\OmarchyTerminal]
+@="Open in Omarchy Terminal"
+
+[HKEY_CURRENT_USER\Software\Classes\Drive\shell\OmarchyTerminal\command]
+@="wt.exe -w 0 new-tab -p \"Omarchy\" -d \"%V.\""

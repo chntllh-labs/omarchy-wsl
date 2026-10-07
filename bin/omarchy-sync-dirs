@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Windows Known-Folder Symlink Generator
+# /usr/bin/omarchy-sync-dirs
+# ==============================================================================
+# Links the *real* locations of Windows Known Folders (Downloads, Desktop,
+# Documents, ...) into ~/win/<Name>, resolving relocation and OneDrive Known
+# Folder Move through the Windows shell API rather than guessing
+# C:\Users\<name>\Downloads.
+#
+# Performance boundary: ~/win/* is for moving files in and out, never for
+# working in. DrvFs (9P) metadata calls are slow, inotify does not see Windows
+# edits, and OneDrive placeholders hydrate when read. The companion guard
+# (/usr/lib/omarchy-wsl/drvfs-guard.sh) blocks builds started under /mnt/*.
+#
+# Safety: never replaces a real file or directory, only re-points symlinks that
+# already point into the DrvFs mount root, and every swap is an atomic rename.
+# ==============================================================================
+
+set -euo pipefail
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_is_wsl >/dev/null || { echo "omarchy-sync-dirs: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-sync-dirs"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-sync-dirs [options]
+
+Options:
+  --dirs "A B C"        Known Folders to link (default: "Downloads Desktop Documents")
+                        Available: Downloads Desktop Documents Pictures Videos Music Home
+  --root DIR            Link directory (default: ~/win)
+  --dry-run             Show what would change without touching the filesystem
+  --force               Re-point symlinks even if they currently point outside DrvFs
+  --remove              Remove managed symlinks (never touches real directories)
+  --pin-quick-access    Pin \\wsl.localhost\<distro>\home\<user> to Explorer Quick Access
+  --status              Print the current link table
+  -h, --help            Show this help
+EOF
+}
+
+DIRS="${OMARCHY_SYNC_DIRS:-Downloads Desktop Documents}"
+LINK_ROOT="${HOME}/win"
+DRY_RUN=0
+FORCE=0
+ACTION="sync"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dirs) DIRS="${2:?--dirs requires a value}"; shift 2 ;;
+    --root) LINK_ROOT="${2:?--root requires a value}"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --remove) ACTION="remove"; shift ;;
+    --pin-quick-access) ACTION="pin"; shift ;;
+    --status) ACTION="status"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) omw_err "Unknown option: $1"; usage >&2; exit 2 ;;
+  esac
+done
+
+MOUNT_ROOT=$(omw_mount_root)
+
+act() {
+  if (( DRY_RUN )); then
+    echo "[dry-run] $*"
+  else
+    "$@"
+  fi
+}
+
+points_into_drvfs() {
+  local t; t=$(readlink -- "$1" 2>/dev/null) || return 1
+  [[ "$t" == "$MOUNT_ROOT"/?/* || "$t" == "$MOUNT_ROOT"/? ]]
+}
+
+# -----------------------------------------------------------------------------
+# Known-Folder resolution through the Windows shell API (one PowerShell call)
+# -----------------------------------------------------------------------------
+# [Environment]::GetFolderPath honours Known Folder redirection (OneDrive KFM,
+# Group Policy). Downloads has no SpecialFolder value, so it is resolved via
+# the shell: namespace, which calls SHGetKnownFolderPath internally.
+query_known_folders() {
+  omw_ps_run '$r=@{}
+$r["Desktop"]=[Environment]::GetFolderPath("Desktop")
+$r["Documents"]=[Environment]::GetFolderPath("MyDocuments")
+$r["Pictures"]=[Environment]::GetFolderPath("MyPictures")
+$r["Videos"]=[Environment]::GetFolderPath("MyVideos")
+$r["Music"]=[Environment]::GetFolderPath("MyMusic")
+$r["Home"]=[Environment]::GetFolderPath("UserProfile")
+try{$r["Downloads"]=(New-Object -ComObject Shell.Application).Namespace("shell:Downloads").Self.Path}catch{}
+foreach($k in $r.Keys){if($r[$k]){[Console]::Out.WriteLine($k+"`t"+$r[$k])}}'
+}
+
+declare -A FOLDERS=()
+load_folders() {
+  local name winpath
+  while IFS=$'\t' read -r name winpath; do
+    [[ -n "$name" && -n "$winpath" ]] || continue
+    [[ "$name" =~ ^[A-Za-z]+$ ]] || continue
+    FOLDERS["$name"]="$winpath"
+  done < <(query_known_folders)
+  (( ${#FOLDERS[@]} > 0 )) || omw_die "Could not resolve any Windows Known Folders (is interop enabled?)."
+}
+
+link_one() {
+  local name="$1" winpath="$2" target dest tmp
+  target=$(omw_win_to_unix "$winpath") || { omw_warn "$name: cannot translate '$winpath'"; return 0; }
+  if [[ "$target" != "$MOUNT_ROOT"/?/* ]]; then
+    omw_warn "$name: '$winpath' is not on a DrvFs drive (network share?); skipping."
+    return 0
+  fi
+  if [[ ! -d "$target" ]]; then
+    omw_warn "$name: $target does not exist; skipping."
+    return 0
+  fi
+  if [[ "$target" == *"/OneDrive"* ]]; then
+    omw_warn "$name is redirected to OneDrive ($winpath). Reading Files-On-Demand placeholders from Linux downloads them; avoid rg/fd/du across ~/win/$name."
+  fi
+
+  dest="${LINK_ROOT}/${name}"
+  if [[ -L "$dest" ]]; then
+    if [[ "$(readlink -- "$dest")" == "$target" ]]; then
+      omw_log "$name: up to date -> $target"
+      return 0
+    fi
+    if ! points_into_drvfs "$dest" && (( ! FORCE )); then
+      omw_warn "$name: $dest is a user symlink to $(readlink -- "$dest"); leaving it (use --force)."
+      return 0
+    fi
+  elif [[ -e "$dest" ]]; then
+    omw_warn "$name: $dest is a real file/directory; refusing to replace it."
+    return 0
+  fi
+
+  tmp="${LINK_ROOT}/.${name}.omarchy-tmp.$$"
+  act ln -s -- "$target" "$tmp"
+  act mv -fT -- "$tmp" "$dest"
+  omw_log "$name: linked -> $target"
+}
+
+write_boundary_note() {
+  local note="${LINK_ROOT}/.omarchy-boundary"
+  (( DRY_RUN )) && return 0
+  cat >"$note" <<'EOF'
+These entries are symlinks into Windows drives (DrvFs over 9P).
+
+Use them to move files between Windows and Linux, not to work in:
+  * git, npm, cargo, make, etc. are dramatically slower on DrvFs and
+    file watchers do not see edits made by Windows applications.
+  * OneDrive-redirected folders download placeholder files when read.
+
+Clone and build projects under ~/src (ext4) instead. Windows editors can
+reach them at \\wsl.localhost\<distro>\home\<user>\src.
+EOF
+}
+
+do_sync() {
+  omw_require_interop
+  load_folders
+  act mkdir -p -- "$LINK_ROOT"
+  local name
+  for name in $DIRS; do
+    if [[ -z "${FOLDERS[$name]:-}" ]]; then
+      omw_warn "$name: unknown or unavailable Known Folder; skipping."
+      continue
+    fi
+    link_one "$name" "${FOLDERS[$name]}"
+  done
+  write_boundary_note
+}
+
+do_remove() {
+  [[ -d "$LINK_ROOT" ]] || { omw_log "Nothing to remove."; return 0; }
+  local entry
+  for entry in "$LINK_ROOT"/* "$LINK_ROOT"/.*.omarchy-tmp.*; do
+    [[ -L "$entry" ]] || continue
+    if points_into_drvfs "$entry"; then
+      act rm -f -- "$entry"
+      omw_log "removed ${entry}"
+    fi
+  done
+  act rm -f -- "${LINK_ROOT}/.omarchy-boundary"
+  if (( ! DRY_RUN )); then
+    rmdir -- "$LINK_ROOT" 2>/dev/null || true
+  fi
+}
+
+do_status() {
+  [[ -d "$LINK_ROOT" ]] || { echo "${LINK_ROOT}: not created"; return 0; }
+  local entry state
+  for entry in "$LINK_ROOT"/*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    if [[ -L "$entry" ]]; then
+      [[ -d "$entry" ]] && state="ok" || state="BROKEN"
+      printf '%-12s %-7s -> %s\n' "${entry##*/}" "$state" "$(readlink -- "$entry")"
+    else
+      printf '%-12s %-7s (real directory, unmanaged)\n' "${entry##*/}" "user"
+    fi
+  done
+}
+
+do_pin() {
+  omw_require_interop
+  local unc
+  unc=$(omw_unix_to_win "$HOME")
+  # 'pintohome' toggles: invoking it on an already-pinned folder unpins it, so
+  # check the Quick Access namespace first.
+  omw_ps_run "\$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(omw_b64 "$unc")'))
+\$sh=New-Object -ComObject Shell.Application
+\$qa=\$sh.Namespace('shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}')
+if(\$qa -and (\$qa.Items() | Where-Object { \$_.Path -eq \$p })){[Console]::Out.WriteLine('already pinned');exit 0}
+\$f=\$sh.Namespace(\$p)
+if(-not \$f){[Console]::Error.WriteLine('cannot open '+\$p);exit 1}
+\$f.Self.InvokeVerb('pintohome');[Console]::Out.WriteLine('pinned '+\$p)"
+}
+
+case "$ACTION" in
+  sync) do_sync ;;
+  remove) do_remove ;;
+  status) do_status ;;
+  pin) do_pin ;;
+esac
