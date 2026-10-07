@@ -280,54 +280,71 @@ class ColorScheme:
         name = data.get("name") or data.get("title") or "Unnamed Scheme"
 
         # Check for nested Alacritty/Omarchy structure
-        colors_block: Dict[str, Any] = data.get("colors") if isinstance(data.get("colors"), dict) else data
+        raw_colors = data.get("colors")
+        colors_block: Dict[str, Any] = raw_colors if isinstance(raw_colors, dict) else (data if isinstance(data, dict) else {})
 
-        normal = colors_block.get("normal") if isinstance(colors_block.get("normal"), dict) else {}
-        bright = colors_block.get("bright") if isinstance(colors_block.get("bright"), dict) else {}
-        primary = colors_block.get("primary") if isinstance(colors_block.get("primary"), dict) else {}
-        cursor = colors_block.get("cursor") if isinstance(colors_block.get("cursor"), dict) else {}
-        selection = colors_block.get("selection") if isinstance(colors_block.get("selection"), dict) else {}
+        normal_val = colors_block.get("normal")
+        normal: Dict[str, Any] = normal_val if isinstance(normal_val, dict) else {}
+
+        bright_val = colors_block.get("bright")
+        bright: Dict[str, Any] = bright_val if isinstance(bright_val, dict) else {}
+
+        primary_val = colors_block.get("primary")
+        primary: Dict[str, Any] = primary_val if isinstance(primary_val, dict) else {}
+
+        cursor_val = colors_block.get("cursor")
+        cursor: Dict[str, Any] = cursor_val if isinstance(cursor_val, dict) else {}
+
+        selection_val = colors_block.get("selection")
+        selection: Dict[str, Any] = selection_val if isinstance(selection_val, dict) else {}
 
         def resolve(key: str, *fallbacks: Any) -> str:
             # Look in flat root first
             for k in [key, *fallbacks]:
                 if isinstance(k, str):
-                    if k in colors_block and isinstance(colors_block[k], str):
-                        return colors_block[k]
-                    if k in data and isinstance(data[k], str):
-                        return data[k]
+                    val = colors_block.get(k)
+                    if isinstance(val, str):
+                        return val
+                    data_val = data.get(k) if isinstance(data, dict) else None
+                    if isinstance(data_val, str):
+                        return data_val
             raise KeyError(f"Missing required color definition for {key!r}")
 
-        bg = primary.get("background") or resolve("background", "bg")
-        fg = primary.get("foreground") or resolve("foreground", "fg")
-        cur = (
-            cursor.get("cursor")
-            if isinstance(cursor, dict) and cursor.get("cursor")
-            else resolve("cursorColor", "cursor_color", "cursor", fg)
-        )
-        sel = (
-            selection.get("background")
-            if isinstance(selection, dict) and selection.get("background")
-            else resolve("selectionBackground", "selection_background", "selection", bg)
-        )
+        bg_val = primary.get("background")
+        bg: str = bg_val if isinstance(bg_val, str) else resolve("background", "bg")
 
-        black = normal.get("black") or resolve("black", "color0")
-        red = normal.get("red") or resolve("red", "color1")
-        green = normal.get("green") or resolve("green", "color2")
-        yellow = normal.get("yellow") or resolve("yellow", "color3")
-        blue = normal.get("blue") or resolve("blue", "color4")
-        purple = normal.get("magenta") or resolve("purple", "magenta", "color5")
-        cyan = normal.get("cyan") or resolve("cyan", "color6")
-        white = normal.get("white") or resolve("white", "color7")
+        fg_val = primary.get("foreground")
+        fg: str = fg_val if isinstance(fg_val, str) else resolve("foreground", "fg")
 
-        bright_black = bright.get("black") or resolve("brightBlack", "bright_black", "color8", black)
-        bright_red = bright.get("red") or resolve("brightRed", "bright_red", "color9", red)
-        bright_green = bright.get("green") or resolve("brightGreen", "bright_green", "color10", green)
-        bright_yellow = bright.get("yellow") or resolve("brightYellow", "bright_yellow", "color11", yellow)
-        bright_blue = bright.get("blue") or resolve("brightBlue", "bright_blue", "color12", blue)
-        bright_purple = bright.get("magenta") or resolve("brightPurple", "bright_purple", "brightMagenta", "bright_magenta", "color13", purple)
-        bright_cyan = bright.get("cyan") or resolve("brightCyan", "bright_cyan", "color14", cyan)
-        bright_white = bright.get("white") or resolve("brightWhite", "bright_white", "color15", white)
+        cur_candidate = cursor.get("cursor") if isinstance(cursor, dict) else None
+        cur: str = cur_candidate if isinstance(cur_candidate, str) else resolve("cursorColor", "cursor_color", "cursor", fg)
+
+        sel_candidate = selection.get("background") if isinstance(selection, dict) else None
+        sel: str = sel_candidate if isinstance(sel_candidate, str) else resolve("selectionBackground", "selection_background", "selection", bg)
+
+        def get_c(d: Dict[str, Any], k: str, *alt: str) -> str:
+            v = d.get(k)
+            if isinstance(v, str):
+                return v
+            return resolve(k, *alt)
+
+        black = get_c(normal, "black", "color0")
+        red = get_c(normal, "red", "color1")
+        green = get_c(normal, "green", "color2")
+        yellow = get_c(normal, "yellow", "color3")
+        blue = get_c(normal, "blue", "color4")
+        purple = get_c(normal, "purple", "magenta", "color5")
+        cyan = get_c(normal, "cyan", "color6")
+        white = get_c(normal, "white", "color7")
+
+        bright_black = get_c(bright, "black", "brightBlack", "bright_black", "color8", black)
+        bright_red = get_c(bright, "red", "brightRed", "bright_red", "color9", red)
+        bright_green = get_c(bright, "green", "brightGreen", "bright_green", "color10", green)
+        bright_yellow = get_c(bright, "yellow", "brightYellow", "bright_yellow", "color11", yellow)
+        bright_blue = get_c(bright, "blue", "brightBlue", "bright_blue", "color12", blue)
+        bright_purple = get_c(bright, "purple", "brightPurple", "bright_purple", "brightMagenta", "bright_magenta", "color13", purple)
+        bright_cyan = get_c(bright, "cyan", "brightCyan", "bright_cyan", "color14", cyan)
+        bright_white = get_c(bright, "white", "brightWhite", "bright_white", "color15", white)
 
         selection_fg: Optional[str] = (
             selection.get("text")

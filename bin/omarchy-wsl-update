@@ -36,20 +36,52 @@ if ! grep -q '^DisableSandbox' /etc/pacman.conf 2>/dev/null; then
 fi
 
 # -----------------------------------------------------------------------------
+# 1.1 Network, DNS & Enterprise Proxy Pre-flight Synchronization
+# -----------------------------------------------------------------------------
+log "Synchronizing DNS, corporate proxies, and TLS trust anchors..."
+if command -v omarchy-dns-sync >/dev/null 2>&1; then
+  sudo omarchy-dns-sync sync 2>/dev/null || true
+elif [[ -x "$(dirname "$0")/omarchy-dns-sync" ]]; then
+  sudo "$(dirname "$0")/omarchy-dns-sync" sync 2>/dev/null || true
+fi
+
+if command -v omarchy-ca-sync >/dev/null 2>&1; then
+  sudo omarchy-ca-sync 2>/dev/null || true
+elif [[ -x "$(dirname "$0")/omarchy-ca-sync" ]]; then
+  sudo "$(dirname "$0")/omarchy-ca-sync" 2>/dev/null || true
+fi
+
+if command -v omarchy-proxy-sync >/dev/null 2>&1; then
+  sudo omarchy-proxy-sync 2>/dev/null || true
+elif [[ -x "$(dirname "$0")/omarchy-proxy-sync" ]]; then
+  sudo "$(dirname "$0")/omarchy-proxy-sync" 2>/dev/null || true
+fi
+
+# Verify mirrorlist is non-empty before pacman sync
+if [[ ! -s /etc/pacman.d/mirrorlist ]] || ! grep -q "^Server" /etc/pacman.d/mirrorlist 2>/dev/null; then
+  warn "Pacman mirrorlist is empty or missing! Restoring resilient fallback mirrors..."
+  if command -v omarchy-mirror-sync >/dev/null 2>&1; then
+    sudo omarchy-mirror-sync restore-default 2>/dev/null || true
+  elif [[ -x "$(dirname "$0")/omarchy-mirror-sync" ]]; then
+    sudo "$(dirname "$0")/omarchy-mirror-sync" restore-default 2>/dev/null || true
+  fi
+fi
+
+# -----------------------------------------------------------------------------
 # 2. Pacman Keyring & System Rolling Upgrade
 # -----------------------------------------------------------------------------
 log "Refreshing pacman keyrings..."
 if [[ "$ARCH" == "aarch64" ]]; then
-  sudo pacman -Sy --noconfirm --needed archlinuxarm-keyring || {
+  sudo pacman -Sy --noconfirm --needed archlinuxarm-keyring omarchy-wsl-keyring 2>/dev/null || {
     warn "Keyring refresh encountered warnings, attempting key re-init..."
-    sudo pacman-key --init && sudo pacman-key --populate archlinuxarm
-    sudo pacman -Sy --noconfirm archlinuxarm-keyring
+    sudo pacman-key --init && sudo pacman-key --populate archlinuxarm omarchy-wsl
+    sudo pacman -Sy --noconfirm archlinuxarm-keyring omarchy-wsl-keyring 2>/dev/null || true
   }
 else
-  sudo pacman -Sy --noconfirm --needed archlinux-keyring omarchy-keyring || {
+  sudo pacman -Sy --noconfirm --needed archlinux-keyring omarchy-keyring omarchy-wsl-keyring 2>/dev/null || {
     warn "Keyring refresh encountered warnings, attempting key re-init..."
-    sudo pacman-key --init && sudo pacman-key --populate archlinux
-    sudo pacman -Sy --noconfirm archlinux-keyring omarchy-keyring
+    sudo pacman-key --init && sudo pacman-key --populate archlinux omarchy-wsl
+    sudo pacman -Sy --noconfirm archlinux-keyring omarchy-keyring omarchy-wsl-keyring 2>/dev/null || true
   }
 fi
 

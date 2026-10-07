@@ -37,10 +37,24 @@ ARG SOURCE_DATE_EPOCH
 # Stage 1: Isolated Unprivileged AUR & Toolchain Builder
 # ------------------------------------------------------------------------------
 FROM base-platform AS builder-aur
+ARG ARCH
+ARG SOURCE_DATE_EPOCH
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
-# Install compilation prerequisites
-RUN pacman -Sy --noconfirm --needed base-devel git sudo ca-certificates
+# Disable Landlock and prepare pacman sandbox bypass
+RUN sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf || true && \
+    grep -q '^DisableSandbox' /etc/pacman.conf || sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf && \
+    if [ "$ARCH" = "arm64" ]; then \
+      pacman-key --init && pacman-key --populate archlinuxarm && \
+      pacman -Sy --noconfirm --needed archlinuxarm-keyring; \
+    else \
+      pacman-key --init && pacman-key --populate archlinux && \
+      pacman -Sy --noconfirm --needed archlinux-keyring; \
+    fi && \
+    pacman -Sy --noconfirm --needed base-devel git sudo ca-certificates
+
+COPY scripts/makepkg-governor.sh /usr/local/bin/makepkg-governor
+RUN chmod +x /usr/local/bin/makepkg-governor
 
 # Create unprivileged build user
 RUN useradd -m -u 1001 -s /bin/bash builder && \
@@ -51,16 +65,16 @@ RUN useradd -m -u 1001 -s /bin/bash builder && \
 USER builder
 WORKDIR /home/builder
 
-# Compile yay-bin / yay
+# Compile yay-bin / yay under governor
 RUN git clone --depth 1 https://aur.archlinux.org/yay-bin.git /home/builder/yay-bin && \
     cd /home/builder/yay-bin && \
-    makepkg -s --noconfirm && \
+    makepkg-governor light -- makepkg -s --noconfirm && \
     cp *.pkg.tar.zst /packages/
 
-# Compile / package mise-bin
+# Compile / package mise-bin under governor
 RUN git clone --depth 1 https://aur.archlinux.org/mise-bin.git /home/builder/mise-bin && \
     cd /home/builder/mise-bin && \
-    makepkg -s --noconfirm && \
+    makepkg-governor light -- makepkg -s --noconfirm && \
     cp *.pkg.tar.zst /packages/
 
 # ------------------------------------------------------------------------------
@@ -87,6 +101,9 @@ RUN pacman -Syu --noconfirm --needed $(cat /tmp/base.packages /tmp/tools.package
 COPY --from=builder-aur /packages /tmp/packages
 RUN pacman -U --noconfirm /tmp/packages/*.pkg.tar.zst && \
     rm -rf /tmp/packages
+
+# 3b. Wire up dual-arch pacman repository configuration for rolling updates
+RUN printf '\n[omarchy-wsl]\nSigLevel = Required DatabaseOptional\nServer = https://pkgs.omarchy-wsl.org/%s\nServer = https://raw.githubusercontent.com/omacom-io/omarchy-wsl-pkgs/gh-pages/%s\n' "${ARCH}" "${ARCH}" >> /etc/pacman.conf
 
 # 4. Inject WSL Configuration, Services, and Scripts
 COPY wsl/wsl.conf /etc/wsl.conf

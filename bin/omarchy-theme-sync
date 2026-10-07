@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Omarchy WSL Cross-OS Theme Synchronization CLI.
+
+Safely synchronizes themes across Windows Terminal, VS Code, and Linux terminals
+with zero host configuration corruption and graceful degradation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Add lib directory to python search path
+repo_root = Path(__file__).resolve().parent.parent
+lib_dir = repo_root / "lib"
+if str(lib_dir) not in sys.path:
+    sys.path.insert(0, str(lib_dir))
+
+from omarchy_theme.adapters.linux_terminals import sync_all_linux_terminals
+from omarchy_theme.adapters.vscode import sync_vscode
+from omarchy_theme.adapters.windows_terminal import sync_windows_terminal
+from omarchy_theme.atomic_io import restore_from_backup
+from omarchy_theme.detector import HostDetector
+from omarchy_theme.palettes import (
+    get_builtin_palette,
+    list_builtin_palettes,
+    load_palette_from_file,
+)
+
+
+def print_banner() -> None:
+    print("\033[36m[omarchy-theme-sync]\033[0m Cross-OS Theme Synchronization Engine")
+
+
+def print_step(msg: str) -> None:
+    print(f"\033[36m[*]\033[0m {msg}")
+
+
+def print_success(msg: str) -> None:
+    print(f"\033[32m[+]\033[0m {msg}")
+
+
+def print_warn(msg: str) -> None:
+    print(f"\033[33m[!]\033[0m {msg}")
+
+
+def print_err(msg: str) -> None:
+    print(f"\033[31m[-]\033[0m {msg}")
+
+
+def show_status(detector: HostDetector) -> None:
+    """Print diagnostic status of host and detected configurations."""
+    print_banner()
+    print_step(f"Host OS: {'Windows' if detector.is_windows else ('WSL2' if detector.is_wsl else 'Linux/macOS')}")
+    print_step(f"WSL Interop Active: {'Yes' if detector.is_interop_available else 'No / Disabled'}")
+
+    local_appdata = detector.get_windows_local_appdata()
+    appdata = detector.get_windows_appdata()
+
+    print_step(f"Windows LocalAppData: {local_appdata or 'Not detected'}")
+    print_step(f"Windows AppData: {appdata or 'Not detected'}")
+
+    print("\n\033[1mDetected Targets:\033[0m")
+    wt_targets = detector.find_windows_terminal_targets()
+    if wt_targets:
+        for t in wt_targets:
+            status = "FOUND" if t.exists else "NEW (template ready)"
+            print(f"  - Windows Terminal [{t.edition}]: {t.path} ({status})")
+    else:
+        print("  - Windows Terminal: Not detected on host")
+
+    vscode_targets = detector.find_vscode_targets()
+    if vscode_targets:
+        for t in vscode_targets:
+            status = "FOUND" if t.exists else "NEW (template ready)"
+            print(f"  - VS Code [{t.edition}]: {t.path} ({status})")
+    else:
+        print("  - VS Code: Not detected on host")
+
+    linux_targets = detector.find_linux_terminal_targets()
+    for t in linux_targets:
+        status = "FOUND" if t.exists else "NOT CONFIGURED"
+        print(f"  - Linux Terminal [{t.target_type}]: {t.path} ({status})")
+
+
+def restore_backups(detector: HostDetector) -> int:
+    """Restore all detected targets from their latest .bak backups."""
+    print_banner()
+    print_step("Attempting rollback from safety backups...")
+    restored_count = 0
+
+    targets = [
+        *detector.find_windows_terminal_targets(),
+        *detector.find_vscode_targets(),
+        *detector.find_linux_terminal_targets(),
+    ]
+
+    for t in targets:
+        bak = restore_from_backup(t.path)
+        if bak:
+            print_success(f"Restored: {t.path} <- {bak}")
+            restored_count += 1
+
+    if restored_count == 0:
+        print_warn("No backup files found to restore.")
+        return 0
+
+    print_success(f"Rollback completed: {restored_count} file(s) restored.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Omarchy WSL Cross-OS Theme Synchronization Engine",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--theme", "-t",
+        type=str,
+        help="Theme name (e.g. 'tokyo-night', 'catppuccin-mocha', 'nord') or path to .toml/.json theme file",
+    )
+    parser.add_argument(
+        "--list-themes",
+        action="store_true",
+        help="List all built-in themes",
+    )
+    parser.add_argument(
+        "--target",
+        choices=["all", "wt", "vscode", "linux"],
+        default="all",
+        help="Synchronization target (default: 'all')",
+    )
+    parser.add_argument(
+        "--wt-profile",
+        type=str,
+        default=os.environ.get("WSL_DISTRO_NAME", "Omarchy"),
+        help="Target profile name in Windows Terminal (default: current distro name or 'Omarchy')",
+    )
+    parser.add_argument(
+        "--set-wt-default",
+        action="store_true",
+        help="Set theme as default for ALL Windows Terminal profiles (profiles.defaults)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and preview changes without modifying files",
+    )
+    parser.add_argument(
+        "--status",
+        action="store_true",
+        help="Show detected host environments and target configuration paths",
+    )
+    parser.add_argument(
+        "--restore",
+        action="store_true",
+        help="Rollback all targets from their most recent .bak backups",
+    )
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Suppress non-error output",
+    )
+
+    args = parser.parse_args()
+
+    detector = HostDetector()
+
+    if args.list_themes:
+        print("Available built-in themes:")
+        for name in list_builtin_palettes():
+            print(f"  - {name}")
+        return 0
+
+    if args.status:
+        show_status(detector)
+        return 0
+
+    if args.restore:
+        return restore_backups(detector)
+
+    if not args.theme:
+        parser.print_help()
+        print("\nError: --theme <name_or_path> is required unless using --list-themes, --status, or --restore.")
+        return 1
+
+    # Load Theme
+    theme = get_builtin_palette(args.theme)
+    if not theme:
+        # Check if it's a file
+        theme_path = Path(args.theme)
+        if theme_path.exists():
+            try:
+                theme = load_palette_from_file(theme_path)
+            except Exception as e:
+                print_err(f"Failed to load theme from file {theme_path}: {e}")
+                return 1
+        else:
+            print_err(f"Theme '{args.theme}' not recognized and file not found.")
+            print_step("Run with --list-themes to see available options.")
+            return 1
+
+    if not args.quiet:
+        print_banner()
+        print_step(f"Applying theme: \033[1m{theme.name}\033[0m")
+        if args.dry_run:
+            print_warn("Dry-run mode active: no host files will be modified.")
+
+    has_errors = False
+    synced_targets = 0
+
+    # 1. Sync Windows Terminal
+    if args.target in ("all", "wt"):
+        wt_targets = detector.find_windows_terminal_targets()
+        if not wt_targets:
+            if not args.quiet:
+                print_step("Windows Terminal not found on host (skipping gracefully).")
+        else:
+            for wt_target in wt_targets:
+                res = sync_windows_terminal(
+                    target_path=wt_target.path,
+                    theme=theme,
+                    target_profile=args.wt_profile,
+                    apply_to_defaults=args.set_wt_default,
+                    dry_run=args.dry_run,
+                )
+                if res.success:
+                    if not args.quiet:
+                        print_success(res.message)
+                    synced_targets += 1
+                else:
+                    print_err(res.message)
+                    has_errors = True
+
+    # 2. Sync VS Code
+    if args.target in ("all", "vscode"):
+        vscode_targets = detector.find_vscode_targets()
+        if not vscode_targets:
+            if not args.quiet:
+                print_step("VS Code user settings not found on host (skipping gracefully).")
+        else:
+            for vsc_target in vscode_targets:
+                res = sync_vscode(
+                    target_path=vsc_target.path,
+                    theme=theme,
+                    sync_extension_theme=True,
+                    dry_run=args.dry_run,
+                )
+                if res.success:
+                    if not args.quiet:
+                        print_success(res.message)
+                    synced_targets += 1
+                else:
+                    print_err(res.message)
+                    has_errors = True
+
+    # 3. Sync Linux Native Terminals
+    if args.target in ("all", "linux"):
+        linux_results = sync_all_linux_terminals(theme, dry_run=args.dry_run)
+        for res in linux_results:
+            if res.success:
+                if not args.quiet:
+                    print_success(res.message)
+                synced_targets += 1
+            else:
+                print_err(res.message)
+                has_errors = True
+
+    if has_errors:
+        if synced_targets > 0:
+            print_warn("Theme synchronization completed with partial warnings.")
+            return 2
+        else:
+            print_err("Theme synchronization failed.")
+            return 1
+
+    if not args.quiet:
+        print_success(f"Theme '{theme.name}' successfully synchronized across {synced_targets} target(s)!")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

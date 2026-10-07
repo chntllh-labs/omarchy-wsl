@@ -1,0 +1,22 @@
+{
+  "log-driver": "journald",
+  "storage-driver": "overlay2",
+  "bip": "198.18.0.1/24",
+  "default-address-pools": [
+    {
+      "base": "198.18.0.0/16",
+      "size": 24
+    }
+  ],
+  "mtu": 1420,
+  "iptables": true,
+  "ip-forward": true,
+  "dns": [
+    "127.0.0.53",
+    "1.1.1.1",
+    "8.8.8.8"
+  ],
+  "features": {
+    "buildkit": true
+  }
+}

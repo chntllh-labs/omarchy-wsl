@@ -1,0 +1,16 @@
+[Unit]
+Description=Omarchy WSL Windows Host Proxy & CA Sync Engine
+Documentation=https://github.com/omacom-io/omarchy-wsl
+After=network.target omarchy-dns-sync.service
+Before=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c "/usr/bin/omarchy-ca-sync || true; /usr/bin/omarchy-proxy-sync || true"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

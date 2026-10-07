@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# /usr/bin/omarchy-build
+# Omarchy-WSL Cgroup Resource Governor & Sandboxed Build Engine
+# ==============================================================================
+# Safely executes resource-intensive builds (cargo, rustc, clang, gcc, cmake,
+# ninja, node, esbuild, bun) inside an isolated cgroup v2 slice.
+#
+# Prevents:
+# 1. Interactive terminal & Neovim UI stuttering (enforces CPUWeight=100 vs 1000).
+# 2. Block I/O starvation of user tasks (enforces IOWeight=100).
+# 3. High-core low-memory compilation crashes (computes safe -j thread limits).
+# 4. Partial zombie OOM failure states (enforces atomic MemoryOOMGroup=yes).
+# 5. Sacrifices builds first during acute memory pressure (OOMScoreAdjust=500).
+# ==============================================================================
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-build [options] <command> [args...]
+
+Options:
+  -j, --jobs <N>       Explicitly set maximum parallel compilation jobs
+  --slice <name>       Custom systemd slice (default: build.slice)
+  --no-cgroup          Bypass cgroup isolation; apply nice/oom_score_adj directly
+  -h, --help           Display this help message
+
+Examples:
+  omarchy-build cargo build --release
+  omarchy-build ninja -C build
+  omarchy-build npm run build
+  omarchy-build make -j8
+EOF
+  exit 1
+}
+
+CUSTOM_JOBS=""
+TARGET_SLICE="build.slice"
+BYPASS_CGROUP=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -j|--jobs)
+      CUSTOM_JOBS="$2"
+      shift 2
+      ;;
+    --slice)
+      TARGET_SLICE="$2"
+      shift 2
+      ;;
+    --no-cgroup)
+      BYPASS_CGROUP=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "[omarchy-build] Unknown option: $1" >&2
+      usage
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -eq 0 ]]; then
+  usage
+fi
+
+# -----------------------------------------------------------------------------
+# 1. Compute Safe Parallelism (-j) based on RAM & Cores
+# -----------------------------------------------------------------------------
+# Compilers (rustc, clang++) and linkers (lld, gold) consume up to 2GB RAM per thread.
+# On high-core architectures with limited RAM (e.g. 18 Oryon cores on 16GB RAM),
+# unconstrained -j18 triggers instantaneous OOM panics during linking.
+TOTAL_CPUS=$(nproc 2>/dev/null || echo 2)
+MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 8388608)
+MEM_GB=$(( MEM_KB / 1024 / 1024 ))
+
+# Heuristic: 2GB RAM budget per concurrent compile/link job
+MAX_SAFE_BY_RAM=$(( MEM_GB / 2 ))
+[[ $MAX_SAFE_BY_RAM -lt 2 ]] && MAX_SAFE_BY_RAM=2
+
+if [[ -n "$CUSTOM_JOBS" ]]; then
+  JOBS="$CUSTOM_JOBS"
+else
+  # Clamp to smaller of total CPUs or safe RAM limit
+  if (( TOTAL_CPUS < MAX_SAFE_BY_RAM )); then
+    JOBS="$TOTAL_CPUS"
+  else
+    JOBS="$MAX_SAFE_BY_RAM"
+  fi
+fi
+
+export CARGO_BUILD_JOBS="$JOBS"
+export MAKEFLAGS="-j$JOBS"
+export CMAKE_BUILD_PARALLEL_LEVEL="$JOBS"
+export NINJA_STATUS="[%f/%t %s] "
+
+# -----------------------------------------------------------------------------
+# 2. Execution Engine (systemd-run cgroup isolation vs procfs fallback)
+# -----------------------------------------------------------------------------
+IS_SYSTEMD=0
+if [[ $(ps -p 1 -o comm= 2>/dev/null) == "systemd" ]]; then
+  IS_SYSTEMD=1
+fi
+
+# Check if systemd user manager is responsive
+CAN_SYSTEMD_RUN=0
+if (( IS_SYSTEMD == 1 && BYPASS_CGROUP == 0 )) && command -v systemd-run >/dev/null 2>&1; then
+  if systemctl --user is-active basic.target >/dev/null 2>&1; then
+    CAN_SYSTEMD_RUN=1
+  fi
+fi
+
+if (( CAN_SYSTEMD_RUN == 1 )); then
+  # Determine if terminal is interactive TTY
+  PTY_FLAG="--pipe"
+  if [[ -t 0 && -t 1 ]]; then
+    PTY_FLAG="--pty"
+  fi
+
+  exec systemd-run \
+    --user \
+    --slice="$TARGET_SLICE" \
+    --property="MemoryOOMGroup=yes" \
+    --property="OOMScoreAdjust=500" \
+    --property="CPUWeight=100" \
+    --property="IOWeight=100" \
+    --same-dir \
+    $PTY_FLAG \
+    --quiet \
+    -- "$@"
+else
+  # Fallback: Apply direct kernel process governance
+  # 1. Lower scheduler priority (nice +10) so interactive shells take precedence
+  renice -n 10 -p $$ >/dev/null 2>&1 || true
+
+  # 2. Demote OOM score adjustment so kernel OOM killer sacrifices this build first
+  if [[ -w /proc/$$/oom_score_adj ]]; then
+    echo 500 > /proc/$$/oom_score_adj 2>/dev/null || true
+  fi
+
+  # 3. If direct cgroup v2 is accessible, join build cgroup
+  CGROUP_PATH="/sys/fs/cgroup/build.slice"
+  if [[ -d "$CGROUP_PATH" && -w "$CGROUP_PATH/cgroup.procs" ]]; then
+    echo $$ > "$CGROUP_PATH/cgroup.procs" 2>/dev/null || true
+  fi
+
+  exec "$@"
+fi

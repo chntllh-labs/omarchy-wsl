@@ -1,0 +1,47 @@
+# ==============================================================================
+# Omarchy WSL: Hardened Resilient Pacman Configuration
+# /etc/pacman.conf
+# ==============================================================================
+# Tuned for high-concurrency downloads, corporate proxy traversal,
+# and deterministic 5-second connection timeout failover.
+# ==============================================================================
+
+[options]
+HoldPkg     = pacman glibc
+Architecture = auto
+
+# UI and Output
+Color
+CheckSpace
+VerbosePkgLists
+ILoveCandy
+
+# High-Performance Parallel Downloads
+ParallelDownloads = 5
+
+# WSL / Container Sandbox Compatibility
+# Prevents seccomp / bubblewrap permission faults inside containerized builds
+DisableSandbox
+
+# Resilient Download Engine with Aggressive Connection Timeout
+# Standard curl flags:
+#   --connect-timeout 5 : Give up after 5 seconds if mirror is unresponsive/blackholed
+#   --max-time 300      : Allow ample time for large package payloads
+#   --retry 2           : Quick retry for transient connection drops
+#   --retry-delay 1     : 1 second backoff
+XferCommand = /usr/bin/curl -s -L -C - -f --connect-timeout 5 --max-time 300 --retry 2 --retry-delay 1 -o %o %u
+
+# Signature Verification
+SigLevel    = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+# Repositories
+[core]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist
+
+# Multilib only valid on x86_64
+#[multilib]
+#Include = /etc/pacman.d/mirrorlist

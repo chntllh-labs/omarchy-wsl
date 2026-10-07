@@ -1,0 +1,34 @@
+[Unit]
+Description=Omarchy-WSL Build & Compilation Slice (Sandboxed Heavy Computes)
+Documentation=https://github.com/omacom-io/omarchy-wsl
+Before=slices.target
+
+[Slice]
+# --- CPU Scheduling Priority ---
+# Default user sessions have CPUWeight=1000. Build processes receive CPUWeight=100 (10x lower priority).
+# Guarantees that interactive Neovim, tmux, SSH, and Bash shells remain 100% responsive
+# even while 18 Oryon cores or 32 x86 threads are pinned at 100% utilization.
+CPUWeight=100
+
+# --- Block I/O Prioritization ---
+# Prevents heavy compiler write streams (.o, .rlib, target/ directories) from saturating
+# the virtual disk queue ahead of interactive terminal commands.
+IOWeight=100
+
+# --- Memory High Throttling (Soft Ceiling) ---
+# When builds consume 85% of guest memory, the Linux kernel applies proportional reclaim throttling.
+# This slows down memory allocations and gives kswapd and autoMemoryReclaim time to reclaim clean page cache
+# instead of slamming directly into a hard out-of-memory state.
+MemoryHigh=85%
+
+# --- Atomic OOM Group Kill (CRITICAL RESILIENCE) ---
+# When an out-of-memory event triggers in this slice, the Linux kernel terminates ALL processes
+# in this cgroup simultaneously as a single atomic unit.
+# Prevents partial OOM kills where 1 clang/rustc process dies while 17 others keep running,
+# leaving the system stuck in swap-thrashing D-state.
+MemoryOOMGroup=yes
+
+# --- OOM Sacrifice Priority ---
+# Tells the Linux kernel OOM killer to sacrifice compilation jobs first (OOMScoreAdjust=500)
+# before ever touching user interactive shells (0), SSH sessions (-200), or tmux (-200).
+OOMScoreAdjust=500

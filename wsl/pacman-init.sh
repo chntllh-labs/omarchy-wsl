@@ -30,6 +30,7 @@ esac
 
 keyrings=("$distro_keyring")
 [[ -f "/usr/share/pacman/keyrings/omarchy.gpg" ]] && keyrings+=("omarchy")
+[[ -f "/usr/share/pacman/keyrings/omarchy-wsl.gpg" ]] && keyrings+=("omarchy-wsl")
 
 echo "[omarchy-pacman-init] Initializing pacman keyring for $ARCH..."
 

@@ -1,0 +1,16 @@
+[Unit]
+Description=Omarchy WSL Dynamic DNS & Resolver Sync Engine
+Documentation=https://github.com/omacom-io/omarchy-wsl
+After=systemd-resolved.service network.target
+Before=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/omarchy-dns-sync sync
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

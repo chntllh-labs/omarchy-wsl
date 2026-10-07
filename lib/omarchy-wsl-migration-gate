@@ -141,18 +141,35 @@ run_migrations() {
 }
 
 # -----------------------------------------------------------------------------
-# 4. Post-Migration Stability Lockdown
+# 4. Post-Migration Stability Lockdown & Cgroup Governance
 # -----------------------------------------------------------------------------
 lockdown_stability() {
-  log "Verifying WSL kernel memory parameters and sysctl ordering..."
+  log "Verifying WSL kernel memory parameters, sysctl ordering, and cgroup governance..."
 
-  # Ensure hardened sysctl rule exists
+  # 1. Enforce hardened sysctl rules
   local stability_file="/etc/sysctl.d/99-zz-omarchy-wsl-stability.conf"
+  if [[ -f "/usr/lib/omarchy-wsl/99-zz-omarchy-wsl-stability.conf" && ! -f "$stability_file" ]]; then
+    sudo cp "/usr/lib/omarchy-wsl/99-zz-omarchy-wsl-stability.conf" "$stability_file"
+  fi
   if [[ -f "$stability_file" ]]; then
     sudo sysctl -q -p "$stability_file" 2>/dev/null || true
   fi
 
-  # Ensure critical systemd units remain masked
+  # 2. Enforce systemd cgroup v2 build slicing and interactive protection
+  if [[ -d "/usr/lib/omarchy-wsl/cgroups" ]]; then
+    sudo mkdir -p /etc/systemd/system/user-.slice.d /etc/systemd/oomd.conf.d
+    [[ -f "/usr/lib/omarchy-wsl/cgroups/build.slice" ]] && \
+      sudo cp "/usr/lib/omarchy-wsl/cgroups/build.slice" /etc/systemd/system/build.slice
+    [[ -f "/usr/lib/omarchy-wsl/cgroups/10-interactive-protection.conf" ]] && \
+      sudo cp "/usr/lib/omarchy-wsl/cgroups/10-interactive-protection.conf" /etc/systemd/system/user-.slice.d/
+    [[ -f "/usr/lib/omarchy-wsl/cgroups/10-omarchy-oomd.conf" ]] && \
+      sudo cp "/usr/lib/omarchy-wsl/cgroups/10-omarchy-oomd.conf" /etc/systemd/oomd.conf.d/
+    if [[ $(ps -p 1 -o comm= 2>/dev/null) == "systemd" ]]; then
+      sudo systemctl daemon-reload 2>/dev/null || true
+    fi
+  fi
+
+  # 3. Ensure critical bare-metal systemd units remain masked
   sudo systemctl mask \
     systemd-firstboot.service \
     systemd-resolved.service \
@@ -160,7 +177,7 @@ lockdown_stability() {
     NetworkManager.service \
     tmp.mount 2>/dev/null || true
 
-  success "WSL kernel and systemd stability state verified."
+  success "WSL kernel, cgroup governance, and systemd stability state verified."
 }
 
 # -----------------------------------------------------------------------------

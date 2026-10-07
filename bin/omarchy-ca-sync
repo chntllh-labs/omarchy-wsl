@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Enterprise Root CA Synchronization Engine
+# /usr/bin/omarchy-ca-sync
+# ==============================================================================
+# Automatically extracts Windows Enterprise Root CAs (Zscaler, Netskope,
+# Palo Alto, Active Directory Enterprise PKI) and injects them into the
+# Arch Linux system trust store (/etc/ca-certificates/trust-source/anchors/).
+# Eliminates SSL/TLS MITM certificate validation errors across pacman, curl, git.
+# ==============================================================================
+
+set -euo pipefail
+
+ANCHORS_DIR="/etc/ca-certificates/trust-source/anchors"
+EXPORT_DIR="/run/omarchy/ca-export"
+POWERSHELL_BIN="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+log() { echo -e "\e[32m[omarchy-ca-sync]\e[0m $*"; }
+warn() { echo -e "\e[33m[omarchy-ca-sync:WARN]\e[0m $*"; }
+err() { echo -e "\e[31m[omarchy-ca-sync:ERROR]\e[0m $*"; }
+
+mkdir -p "$ANCHORS_DIR" "$EXPORT_DIR"
+
+if [[ ! -x "$POWERSHELL_BIN" ]]; then
+  warn "Windows PowerShell interop not available at $POWERSHELL_BIN. Skipping CA extraction."
+  exit 0
+fi
+
+log "Auditing Windows Certificate Store for corporate Root and Intermediate CAs..."
+
+# Export non-standard / enterprise root certificates from Windows Certificate Store
+# Filters out common public CAs to avoid duplicating the Mozilla bundle,
+# extracting only enterprise, internal, and SSL-inspection roots.
+EXPORT_SCRIPT='
+$ErrorActionPreference = "SilentlyContinue"
+$exportDir = "'$EXPORT_DIR'"
+New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
+
+$certs = @()
+$certs += Get-ChildItem -Path Cert:\LocalMachine\Root
+$certs += Get-ChildItem -Path Cert:\LocalMachine\CA
+$certs += Get-ChildItem -Path Cert:\CurrentUser\Root
+
+# Filter for certificates likely to be enterprise interception proxies or corporate PKI
+$enterpriseCAs = $certs | Where-Object {
+  $issuer = $_.Issuer
+  $subject = $_.Subject
+  $issuer -match "(Zscaler|Netskope|Palo Alto|Fortinet|BlueCoat|Cisco|Enterprise|Corporate|Internal|Root CA|Proxy)" -or
+  $subject -match "(Zscaler|Netskope|Palo Alto|Fortinet|BlueCoat|Cisco|Enterprise|Corporate|Internal|Root CA|Proxy)"
+}
+
+$count = 0
+foreach ($cert in $enterpriseCAs) {
+  $thumb = $cert.Thumbprint
+  $subjectClean = ($cert.Subject -replace "[^a-zA-Z0-9_-]", "_").Substring(0, [Math]::Min(30, $cert.Subject.Length))
+  $outPath = Join-Path $exportDir "win-ca-${subjectClean}-${thumb}.crt"
+  
+  $pem = "-----BEGIN CERTIFICATE-----`n" + `
+    [System.Convert]::ToBase64String($cert.RawData, [System.Base64FormattingOptions]::InsertLineBreaks) + `
+    "`n-----END CERTIFICATE-----`n"
+    
+  [System.IO.File]::WriteAllText($outPath, $pem, [System.Text.Encoding]::ASCII)
+  $count++
+}
+Write-Output $count
+'
+
+IMPORTED_COUNT=$("$POWERSHELL_BIN" -NoProfile -NonInteractive -Command "$EXPORT_SCRIPT" 2>/dev/null | tr -d '\r' | tail -n 1 || echo "0")
+
+if [[ "$IMPORTED_COUNT" -gt 0 ]]; then
+  log "Discovered and exported $IMPORTED_COUNT corporate CA certificates from Windows host."
+
+  # Copy exported certs into Arch Linux trust anchors
+  COPIED=0
+  for cert in "$EXPORT_DIR"/*.crt; do
+    if [[ -f "$cert" ]]; then
+      DEST="${ANCHORS_DIR}/$(basename "$cert")"
+      if ! cmp -s "$cert" "$DEST" 2>/dev/null; then
+        cp -f "$cert" "$DEST"
+        COPIED=1
+      fi
+    fi
+  done
+
+  if [[ $COPIED -eq 1 ]]; then
+    log "Updating Arch Linux system trust store (update-ca-trust)..."
+    if command -v update-ca-trust >/dev/null 2>&1; then
+      update-ca-trust extract
+    elif command -v trust >/dev/null 2>&1; then
+      trust extract-compat
+    fi
+    log "Successfully updated system trust store with Windows Enterprise CAs."
+  else
+    log "Enterprise CA certificates already synchronized; no update needed."
+  fi
+else
+  log "No corporate interception certificates detected in Windows store (standard public network)."
+fi
+
+# Clean up ephemeral export directory
+rm -rf "$EXPORT_DIR"

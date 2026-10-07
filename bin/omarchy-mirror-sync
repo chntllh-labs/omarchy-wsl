@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Ping-less Resilient Mirror Ranking & Sync Engine
+# /usr/bin/omarchy-mirror-sync
+# ==============================================================================
+# Safe for corporate networks and VPNs that block ICMP echo (ping) packets.
+# Probes HTTP/HTTPS headers directly with a strict 3-second connect timeout.
+# Guarantees /etc/pacman.d/mirrorlist is NEVER wiped or left empty.
+# ==============================================================================
+
+set -euo pipefail
+
+MIRRORLIST="/etc/pacman.d/mirrorlist"
+BACKUP_MIRRORLIST="${MIRRORLIST}.bak"
+DEFAULT_TEMPLATES="/usr/share/omarchy-wsl/pacman"
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+  aarch64) ARCH_DIR="aarch64" ;;
+  x86_64)  ARCH_DIR="x86_64" ;;
+  *)       ARCH_DIR="x86_64" ;;
+esac
+
+log() { echo -e "\e[32m[omarchy-mirror-sync]\e[0m $*"; }
+warn() { echo -e "\e[33m[omarchy-mirror-sync:WARN]\e[0m $*"; }
+err() { echo -e "\e[31m[omarchy-mirror-sync:ERROR]\e[0m $*"; }
+
+# Candidate test endpoints for latency and reachability verification
+get_candidates() {
+  if [[ "$ARCH_DIR" == "aarch64" ]]; then
+    cat << 'EOF'
+http://os.archlinuxarm.org/$arch/$repo
+https://fl.us.mirror.archlinuxarm.org/$arch/$repo
+https://de.mirror.archlinuxarm.org/$arch/$repo
+https://sg.mirror.archlinuxarm.org/$arch/$repo
+https://dk.mirror.archlinuxarm.org/$arch/$repo
+http://mirror.archlinuxarm.org/$arch/$repo
+EOF
+  else
+    cat << 'EOF'
+https://geo.mirror.pkgbuild.com/$repo/os/$arch
+https://mirrors.kernel.org/archlinux/$repo/os/$arch
+https://mirror.rackspace.com/archlinux/$repo/os/$arch
+https://america.mirror.pkgbuild.com/$repo/os/$arch
+https://europe.mirror.pkgbuild.com/$repo/os/$arch
+https://asia.mirror.pkgbuild.com/$repo/os/$arch
+https://archlinux.thaller.ws/$repo/os/$arch
+https://mirror.osbeck.com/archlinux/$repo/os/$arch
+http://geo.mirror.pkgbuild.com/$repo/os/$arch
+EOF
+  fi
+}
+
+probe_mirror() {
+  local template_url="$1"
+  # Substitute placeholders with core repo to test actual HTTP response
+  local test_url
+  if [[ "$ARCH_DIR" == "aarch64" ]]; then
+    test_url="${template_url//\$arch/aarch64}"
+    test_url="${test_url//\$repo/core}/core.db"
+  else
+    test_url="${template_url//\$repo/core}"
+    test_url="${test_url//\$arch/x86_64}/core.db"
+  fi
+
+  # Probe with curl: HEAD request, follow redirects, 3s connect timeout, 5s total
+  local latency
+  latency=$(curl -s -f -I -L \
+    --connect-timeout 3 \
+    --max-time 5 \
+    -w "%{time_total}\n" \
+    -o /dev/null \
+    "$test_url" 2>/dev/null || echo "999")
+
+  echo "$latency"
+}
+
+rank_mirrors() {
+  log "Probing candidate mirrors via ping-less HTTPS/HTTP handshakes (Architecture: $ARCH)..."
+
+  local results=()
+  local tmp_rank
+  tmp_rank=$(mktemp)
+
+  while read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    # Run test
+    local latency
+    latency=$(probe_mirror "$candidate")
+    if (( $(echo "$latency < 10.0" | bc -l 2>/dev/null || [ "$latency" != "999" ] && echo 1 || echo 0) )); then
+      echo "${latency} ${candidate}" >> "$tmp_rank"
+    fi
+  done < <(get_candidates)
+
+  if [[ ! -s "$tmp_rank" ]]; then
+    warn "All live mirror probes failed or timed out (offline/restrictive captive portal)."
+    warn "Preserving existing mirrorlist to avoid bricking package management."
+    rm -f "$tmp_rank"
+    return 1
+  fi
+
+  # Sort by latency ascending
+  local sorted_mirrors
+  sorted_mirrors=$(sort -n "$tmp_rank" | head -n 5)
+  rm -f "$tmp_rank"
+
+  log "Top reachable mirrors discovered:"
+  echo "$sorted_mirrors" | while read -r time url; do
+    printf "  - %-60s [%.3fs]\n" "$url" "$time"
+  done
+
+  # Atomically update /etc/pacman.d/mirrorlist
+  local tmp_dest="${MIRRORLIST}.tmp.$$"
+  {
+    echo "# =============================================================================="
+    echo "# Omarchy WSL Resilient Mirrorlist ($ARCH)"
+    echo "# Ranked: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    echo "# =============================================================================="
+    echo ""
+    echo "# --- Fastest Probed Mirrors ---"
+    while read -r _ url; do
+      echo "Server = $url"
+    done <<< "$sorted_mirrors"
+    echo ""
+    echo "# --- Redundant Static Fallbacks ---"
+    get_candidates | while read -r url; do
+      # Avoid duplicating top mirrors
+      if ! echo "$sorted_mirrors" | grep -q "$url"; then
+        echo "# Server = $url"
+      fi
+    done
+  } > "$tmp_dest"
+
+  # Backup previous mirrorlist
+  [[ -f "$MIRRORLIST" ]] && cp -f "$MIRRORLIST" "$BACKUP_MIRRORLIST"
+  mv -f "$tmp_dest" "$MIRRORLIST"
+  log "Successfully updated $MIRRORLIST."
+}
+
+# -----------------------------------------------------------------------------
+# Main Dispatcher
+# -----------------------------------------------------------------------------
+case "${1:-rank}" in
+  rank|sync)
+    rank_mirrors || true
+    ;;
+  check|status)
+    echo "=== Current Mirrorlist ($MIRRORLIST) ==="
+    if [[ -f "$MIRRORLIST" ]]; then
+      grep "^Server" "$MIRRORLIST" || echo "No active Server entries found!"
+    else
+      echo "Mirrorlist does not exist!"
+    fi
+    ;;
+  restore-default)
+    log "Restoring default resilient mirrorlist for $ARCH..."
+    if [[ -f "${DEFAULT_TEMPLATES}/mirrorlist.${ARCH_DIR}" ]]; then
+      cp -f "${DEFAULT_TEMPLATES}/mirrorlist.${ARCH_DIR}" "$MIRRORLIST"
+      log "Restored from package template."
+    elif [[ -f "$(dirname "$0")/../wsl/pacman/mirrorlist.${ARCH_DIR}" ]]; then
+      cp -f "$(dirname "$0")/../wsl/pacman/mirrorlist.${ARCH_DIR}" "$MIRRORLIST"
+      log "Restored from source template."
+    else
+      {
+        echo "# Omarchy Default Fallback Mirrorlist"
+        get_candidates | while read -r url; do echo "Server = $url"; done
+      } > "$MIRRORLIST"
+      log "Restored from built-in candidates."
+    fi
+    ;;
+  *)
+    echo "Usage: $(basename "$0") [rank|status|restore-default]"
+    exit 1
+    ;;
+esac
