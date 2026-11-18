@@ -35,6 +35,8 @@ pkg     link  -     /usr/lib/omarchy-wsl/omarchy-theme-bridge.py    /usr/bin/oma
 
 # --- Shared libraries and helpers ---------------------------------------------
 pkg     file  0644  lib/omarchy-wsl-interop.sh                      /usr/lib/omarchy-wsl/interop.sh
+pkg     file  0644  lib/omarchy-wsl-account.sh                      /usr/lib/omarchy-wsl/account.sh
+pkg     file  0644  lib/omarchy-wsl-common.sh                       /usr/lib/omarchy-wsl/common.sh
 pkg     file  0755  lib/omarchy-wsl-migration-gate                  /usr/lib/omarchy-wsl/migration-gate
 pkg     tree  0644  lib/omarchy_theme                               /usr/lib/omarchy-wsl/python/omarchy_theme
 pkg     file  0644  wsl/lib/drvfs-guard.sh                          /usr/lib/omarchy-wsl/drvfs-guard.sh
@@ -51,6 +53,8 @@ pkg     file  0755  wsl/oobe.sh                                     /usr/lib/wsl
 pkg     link  -     /usr/lib/wsl/oobe.sh                            /usr/lib/omarchy-wsl/oobe.sh
 pkg     file  0644  wsl/omarchy.ico                                 /usr/lib/wsl/omarchy.ico
 pkg     file  0644  wsl/terminal-profile.json                       /usr/lib/wsl/terminal-profile.json
+# Template the OOBE copies to /etc/omarchy-user.conf when that file is missing.
+pkg     file  0644  wsl/omarchy-user.conf                           /usr/share/omarchy-wsl/omarchy-user.conf.default
 pkg     config 0644  wsl/wsl-distribution.conf                       /etc/wsl-distribution.conf
 pkg     config 0644  wsl/wsl.conf                                    /etc/wsl.conf
 
