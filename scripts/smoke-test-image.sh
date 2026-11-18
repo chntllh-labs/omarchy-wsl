@@ -162,9 +162,9 @@ case "$(basename "$ARTIFACT")" in
 esac
 TAG="omarchy-wsl-smoke:$$"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-# shellcheck disable=SC2329 # invoked by the EXIT trap
-cleanup() { ((KEEP)) || $ENGINE rmi -f "$TAG" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+if ((KEEP == 0)); then
+  trap '$ENGINE rmi -f "$TAG" >/dev/null 2>&1 || true' EXIT
+fi
 
 echo "[smoke] importing $ARTIFACT ($(stat -c %s "$ARTIFACT" 2>/dev/null || stat -f %z "$ARTIFACT") bytes)"
 $ENGINE import ${PLATFORM:+--platform "$PLATFORM"} "$ARTIFACT" "$TAG" >/dev/null

@@ -100,7 +100,7 @@ sha256() {
 
 CID=""
 cleanup() {
-  [[ -n $CID ]] && $ENGINE rm -f "$CID" >/dev/null 2>&1 || true
+  if [[ -n $CID ]]; then $ENGINE rm -f "$CID" >/dev/null 2>&1 || true; fi
   if ((KEEP_EXPORT == 0)); then rm -f "$EXPORT_TAR"; fi
   rm -f "$DIST_DIR/.determinism-"*.wsl "$DIST_DIR/.leaktest.wsl"
 }
