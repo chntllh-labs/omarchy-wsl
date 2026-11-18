@@ -35,9 +35,10 @@ usage() {
 Usage: omarchy-ssh-agent-bridge <command> [options]
 
 Commands:
-  start         Start the SSH agent relay in the background (idempotent)
+  start         Start the SSH agent relay in the background (idempotent;
+                exit 75 if another start holds the lock)
   run           Run the SSH agent relay in the foreground (systemd)
-  stop          Stop the background relay
+  stop          Stop the background relay and its per-connection relays
   status        Show relay state and the identities the agent offers
   env           Print `export SSH_AUTH_SOCK=...` when the bridge is live
   enable        Autostart at login (systemd user unit, or profile.d fallback)
@@ -45,11 +46,15 @@ Commands:
   doctor        Diagnose npiperelay, socat, the Windows agent, and services
   gpg-start     Bridge Gpg4win gpg-agent into the Linux gpg agent socket
   gpg-run       Same, in the foreground
+  gpg-stop      Stop the background gpg bridge
 
 Options:
   --pipe NAME   Windows pipe (default: openssh-ssh-agent; env OMARCHY_SSH_AGENT_PIPE)
   --pageant     Use the Pageant pipe from %USERPROFILE%\.ssh\pageant.conf
-  --socket PATH Linux socket (default: $XDG_RUNTIME_DIR/ssh-agent.sock)
+  --socket PATH Linux socket (default: $XDG_RUNTIME_DIR/ssh-agent.sock, or
+                ~/.cache/omarchy/run/ssh-agent.sock without a runtime dir)
+  --replace     gpg-start/gpg-run: stop a running Linux gpg-agent first
+                (without it the bridge refuses to touch a live agent)
   -q, --quiet   Suppress informational output
 
 Install npiperelay on Windows (keep it on the Windows filesystem):
@@ -63,22 +68,26 @@ shift
 
 PIPE="${OMARCHY_SSH_AGENT_PIPE:-openssh-ssh-agent}"
 USE_PAGEANT=0
+REPLACE=0
 SOCKET="${OMARCHY_SSH_AGENT_SOCK:-}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pipe) PIPE="${2:?--pipe requires a value}"; shift 2 ;;
     --pageant) USE_PAGEANT=1; shift ;;
     --socket) SOCKET="${2:?--socket requires a value}"; shift 2 ;;
+    --replace) REPLACE=1; shift ;;
     -q|--quiet) OMW_QUIET=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) omw_err "Unknown option: $1"; exit 2 ;;
   esac
 done
 
-RUN_DIR=$(omw_runtime_dir)
+RUN_DIR=$(omw_runtime_dir) || exit 1
 if [[ -z "$SOCKET" ]]; then
-  if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" && -w "${XDG_RUNTIME_DIR}" ]]; then
-    SOCKET="${XDG_RUNTIME_DIR}/ssh-agent.sock"
+  # The runtime dir is $XDG_RUNTIME_DIR/omarchy only when $XDG_RUNTIME_DIR is a
+  # private directory of this user; otherwise it is the ~/.cache fallback.
+  if [[ -n "${XDG_RUNTIME_DIR:-}" && "$RUN_DIR" == "${XDG_RUNTIME_DIR%/}/omarchy" ]]; then
+    SOCKET="${XDG_RUNTIME_DIR%/}/ssh-agent.sock"
   else
     SOCKET="${RUN_DIR}/ssh-agent.sock"
   fi
@@ -87,6 +96,9 @@ PIDFILE="${RUN_DIR}/ssh-agent-bridge.pid"
 LOGFILE="${RUN_DIR}/ssh-agent-bridge.log"
 CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
 CONF_FILE="${CONF_DIR}/ssh-agent-bridge.conf"
+# systemd --user services, and everything they start, read environment.d.
+ENVD_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/environment.d/30-omarchy-ssh-agent.conf"
+GPG_PIDFILE="${RUN_DIR}/gpg-agent-bridge.pid"
 
 # Pipe names are interpolated into a relay wrapper; constrain them.
 validate_pipe() {
@@ -122,14 +134,40 @@ agent_rc() {
   echo "$rc"
 }
 
-bridge_pid() {
+# socat_pid <pidfile>: the pid recorded there if it is a live socat process.
+socat_pid() {
   local pid
-  [[ -r "$PIDFILE" ]] || return 1
-  pid=$(<"$PIDFILE")
+  [[ -r "$1" ]] || return 1
+  pid=$(<"$1")
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   grep -qa 'socat' "/proc/$pid/cmdline" 2>/dev/null || return 1
   echo "$pid"
+}
+bridge_pid() { socat_pid "$PIDFILE"; }
+
+# stop_relay <pid>: socat runs as its own process-group leader (setsid), and
+# every per-connection child (socat fork + npiperelay) shares that group, so
+# signal the whole group: a live client connection must not keep a relay
+# (or anything it inherited) alive after `stop`.
+stop_relay() {
+  local pid="$1" pgid
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  if [[ "$pgid" == "$pid" ]]; then
+    kill -TERM -- "-$pid" 2>/dev/null || true
+  else
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  if [[ "$pgid" == "$pid" ]]; then
+    kill -KILL -- "-$pid" 2>/dev/null || true
+  else
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
 }
 
 # Refuse to replace a live socket that this tool does not own (for example an
@@ -183,14 +221,19 @@ cmd_start() {
     return 0
   fi
   exec 9>"${RUN_DIR}/ssh-agent-bridge.lock"
-  flock -n 9 || { omw_log "Another start is in progress."; return 0; }
+  if ! flock -n 9; then
+    omw_err "Another 'omarchy-ssh-agent-bridge start' holds ${RUN_DIR}/ssh-agent-bridge.lock; not starting a second bridge."
+    return 75
+  fi
   pipe=$(resolve_ssh_relay)
   prepare_socket "$SOCKET" || return 0
   local -a args
   mapfile -t args < <(socat_args "$SOCKET" "${RUN_DIR}/ssh-agent-relay.sh")
   # Not a process-group leader when backgrounded from a script, so setsid does
-  # not fork again and $! is socat's own pid.
-  setsid socat "${args[@]}" </dev/null >>"$LOGFILE" 2>&1 &
+  # not fork again and $! is socat's own pid. 9>&-: the lock fd must not leak
+  # into socat or its per-connection children, or a client that is still
+  # connected keeps the lock (and blocks every later start) after `stop`.
+  setsid socat "${args[@]}" </dev/null >>"$LOGFILE" 2>&1 9>&- &
   echo $! >"$PIDFILE"
   disown 2>/dev/null || true
   for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -198,6 +241,7 @@ cmd_start() {
     sleep 0.1
   done
   [[ -S "$SOCKET" ]] || omw_die "socat failed to create $SOCKET (see $LOGFILE)."
+  exec 9>&-
   omw_log "Bridging $SOCKET -> \\\\.\\pipe\\${pipe}"
   omw_log "Use it with: export SSH_AUTH_SOCK=$SOCKET"
 }
@@ -217,7 +261,7 @@ cmd_run() {
 cmd_stop() {
   local pid
   if pid=$(bridge_pid); then
-    kill "$pid" 2>/dev/null || true
+    stop_relay "$pid"
     omw_log "Stopped bridge (pid $pid)."
   fi
   rm -f -- "$PIDFILE"
@@ -253,8 +297,11 @@ cmd_env() {
 }
 
 cmd_enable() {
-  mkdir -p "$CONF_DIR"
+  mkdir -p "$CONF_DIR" "$(dirname "$ENVD_FILE")"
   printf 'OMARCHY_SSH_AGENT_BRIDGE=1\nOMARCHY_SSH_AGENT_PIPE=%q\n' "$PIPE" >"$CONF_FILE"
+  # Login shells get SSH_AUTH_SOCK from profile.d; user services (and tmux or
+  # editors they start) get it from environment.d.
+  printf '# Managed by omarchy-ssh-agent-bridge enable/disable\nSSH_AUTH_SOCK=%s\n' "$SOCKET" >"$ENVD_FILE"
   if systemctl --user is-active basic.target >/dev/null 2>&1 \
      && systemctl --user cat omarchy-ssh-agent-bridge.service >/dev/null 2>&1; then
     systemctl --user enable --now omarchy-ssh-agent-bridge.service
@@ -266,6 +313,9 @@ cmd_enable() {
 
 cmd_disable() {
   rm -f -- "$CONF_FILE"
+  if [[ -f "$ENVD_FILE" ]] && grep -q '^# Managed by omarchy-ssh-agent-bridge' "$ENVD_FILE"; then
+    rm -f -- "$ENVD_FILE"
+  fi
   systemctl --user disable --now omarchy-ssh-agent-bridge.service >/dev/null 2>&1 || true
   omw_log "Autostart disabled."
 }
@@ -307,6 +357,14 @@ find_win_gpgconf() {
     "$root/c/Program Files (x86)/Gpg4win/bin/gpgconf.exe"
 }
 
+# 0 when a Linux gpg-agent answers on its socket (never autostarts one).
+linux_gpg_agent_live() {
+  local sock="$1"
+  [[ -S "$sock" ]] || return 1
+  omw_have gpg-connect-agent || return 0   # cannot ask: assume live, stay safe
+  timeout 5 gpg-connect-agent --no-autostart /bye >/dev/null 2>&1
+}
+
 gpg_setup() {
   local relay gpgconf win_sock linux_sock
   omw_require_interop
@@ -315,6 +373,7 @@ gpg_setup() {
   relay=$(find_npiperelay) || omw_die "npiperelay.exe not found."
   gpgconf=$(find_win_gpgconf) || omw_die "Gpg4win gpgconf.exe not found."
   # Ask Windows where its agent socket lives (Gpg4win 4.x uses %LOCALAPPDATA%\gnupg).
+  omw_interop_ensure || exit 1
   win_sock=$(cd "$(omw_system_root)" && timeout 10 "$gpgconf" --list-dirs agent-socket | tr -d '\r')
   [[ -n "$win_sock" ]] || omw_die "Windows gpgconf did not report an agent socket."
   win_sock="${win_sock//\\//}"
@@ -322,7 +381,13 @@ gpg_setup() {
   if ! grep -qs '^[[:space:]]*no-autostart' "${GNUPGHOME:-$HOME/.gnupg}/gpg.conf"; then
     omw_warn "Add 'no-autostart' to ~/.gnupg/gpg.conf or a local gpg-agent will steal the socket."
   fi
-  gpgconf --kill gpg-agent 2>/dev/null || true
+  # Never kill the user's own gpg-agent (keys, cached passphrases, a running
+  # signing session) unless asked to.
+  if linux_gpg_agent_live "$linux_sock"; then
+    (( REPLACE )) || omw_die "A Linux gpg-agent is running on $linux_sock. Stop it yourself (gpgconf --kill gpg-agent) or pass --replace to stop it and bridge Gpg4win instead."
+    omw_warn "Stopping the running Linux gpg-agent (--replace)."
+    gpgconf --kill gpg-agent 2>/dev/null || true
+  fi
   rm -f -- "$linux_sock"
   mkdir -p "$(dirname "$linux_sock")" && chmod 0700 "$(dirname "$linux_sock")"
   # -a: Assuan mode (read the port + nonce file Gpg4win writes instead of a pipe)
@@ -331,7 +396,11 @@ gpg_setup() {
 }
 
 cmd_gpg() {
-  local linux_sock foreground="$1"
+  local linux_sock foreground="$1" pid
+  if [[ "$foreground" != 1 ]] && pid=$(socat_pid "$GPG_PIDFILE"); then
+    omw_log "gpg bridge already running (pid $pid)."
+    return 0
+  fi
   linux_sock=$(gpg_setup)
   local -a args
   mapfile -t args < <(socat_args "$linux_sock" "${RUN_DIR}/gpg-agent-relay.sh")
@@ -339,9 +408,18 @@ cmd_gpg() {
     exec socat "${args[@]}"
   fi
   setsid socat "${args[@]}" </dev/null >>"${RUN_DIR}/gpg-agent-bridge.log" 2>&1 &
-  echo $! >"${RUN_DIR}/gpg-agent-bridge.pid"
+  echo $! >"$GPG_PIDFILE"
   disown 2>/dev/null || true
   omw_log "Bridging $linux_sock -> Gpg4win gpg-agent"
+}
+
+cmd_gpg_stop() {
+  local pid
+  if pid=$(socat_pid "$GPG_PIDFILE"); then
+    stop_relay "$pid"
+    omw_log "Stopped gpg bridge (pid $pid)."
+  fi
+  rm -f -- "$GPG_PIDFILE"
 }
 
 case "$CMD" in
@@ -355,6 +433,7 @@ case "$CMD" in
   doctor) cmd_doctor ;;
   gpg-start) cmd_gpg 0 ;;
   gpg-run) cmd_gpg 1 ;;
+  gpg-stop) cmd_gpg_stop ;;
   -h|--help|help) usage ;;
   *) omw_err "Unknown command: $CMD"; usage >&2; exit 2 ;;
 esac

@@ -4,5 +4,6 @@
 # For non-login interactive shells, add to ~/.bashrc:
 #   . /usr/lib/omarchy-wsl/drvfs-guard.sh
 if [ -r /usr/lib/omarchy-wsl/drvfs-guard.sh ]; then
+  # shellcheck source=SCRIPTDIR/../lib/drvfs-guard.sh
   . /usr/lib/omarchy-wsl/drvfs-guard.sh
 fi

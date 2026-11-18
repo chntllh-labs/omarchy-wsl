@@ -91,6 +91,8 @@ run_windows() {
     printf '\n'
     return 0
   fi
+  # A tmux pane can outlive the wsl.exe that exported $WSL_INTEROP.
+  omw_interop_ensure || exit 1
   # explorer.exe exits 1 even on success; never trust its status.
   timeout 15 "$@" >/dev/null 2>&1 </dev/null || true
 }
@@ -257,6 +259,7 @@ open_editor() {
       fi
       # The Windows-side launcher scripts detect WSL_DISTRO_NAME themselves and
       # attach a Remote-WSL window; the Linux path is passed verbatim.
+      omw_interop_ensure || exit 1
       exec bash "$cli" "$abs"
     fi
   done
@@ -266,6 +269,7 @@ open_editor() {
 default_browser() {
   local reg out
   reg=$(require_exe reg.exe)
+  omw_interop_ensure || exit 1
   out=$(cd "$(omw_system_root)" && timeout 5 "$reg" query \
     'HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice' /v ProgId 2>/dev/null | tr -d '\r') || true
   local progid

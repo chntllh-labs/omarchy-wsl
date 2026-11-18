@@ -12,8 +12,10 @@
 #   wl-clipboard    WSLg Wayland clipboard (bounded by timeouts)   [WSLg]
 #   tmux / OSC 52   copy over SSH, mosh-less remote shells, tmux   [any terminal]
 #
-# Every backend call is wrapped in a timeout: wl-paste and Windows clipboard
-# locks are known to hang, and a hung clipboard must never freeze Neovim.
+# Windows clipboard calls and wl-paste are wrapped in timeouts (Windows
+# clipboard locks and wl-paste are known to hang). wl-copy, tmux load-buffer and
+# the OSC 52 terminal write are not. OSC 52 is only ever written to a terminal:
+# with no tty it fails (exit 3) instead of polluting stdout.
 # ==============================================================================
 
 set -euo pipefail
@@ -141,16 +143,23 @@ select_backend() {
 # -----------------------------------------------------------------------------
 # OSC 52 / tmux
 # -----------------------------------------------------------------------------
+# OSC 52 must reach the terminal emulator, never stdout: in a pipe or a
+# command substitution (editor jobs, scripts) the escape sequence would corrupt
+# the captured output while copying nothing.
 osc52_target() {
-  if [[ -n "${OMARCHY_CLIP_TTY:-}" ]]; then echo "$OMARCHY_CLIP_TTY"; return; fi
-  if [[ -n "${SSH_TTY:-}" && -w "${SSH_TTY}" ]]; then echo "$SSH_TTY"; return; fi
-  if { : >/dev/tty; } 2>/dev/null; then echo /dev/tty; return; fi
-  echo /dev/stdout
+  if [[ -n "${OMARCHY_CLIP_TTY:-}" ]]; then echo "$OMARCHY_CLIP_TTY"; return 0; fi
+  if [[ -n "${SSH_TTY:-}" && -w "${SSH_TTY}" ]]; then echo "$SSH_TTY"; return 0; fi
+  if { : >/dev/tty; } 2>/dev/null; then echo /dev/tty; return 0; fi
+  return 1
 }
 
 osc52_copy() {
-  local payload max="${OMARCHY_OSC52_MAX:-100000}" seq
+  local payload max="${OMARCHY_OSC52_MAX:-100000}" seq target
   [[ "$MIME" == "text/plain" ]] || omw_die "OSC 52 carries text only."
+  if ! target=$(osc52_target); then
+    omw_err "No terminal to send OSC 52 to (no controlling tty or \$SSH_TTY); nothing was copied."
+    exit 3
+  fi
   payload=$(base64 -w0)
   if (( ${#payload} > max )); then
     omw_die "Selection is ${#payload} base64 bytes; OSC 52 limit is ${max} (OMARCHY_OSC52_MAX). Refusing to truncate silently."
@@ -162,7 +171,7 @@ osc52_copy() {
   elif [[ "${TERM:-}" == screen* ]]; then
     seq=$'\eP'"${seq}"$'\e\\'
   fi
-  printf '%s' "$seq" >"$(osc52_target)"
+  printf '%s' "$seq" >"$target"
 }
 
 tmux_copy() {
@@ -195,6 +204,7 @@ strip_cr() {
 windows_copy_text() {
   local clip
   clip=$(omw_find_exe clip.exe) || omw_die "clip.exe not found."
+  omw_interop_ensure || exit 1
   # clip.exe decodes stdin with the console ANSI codepage unless it sees a
   # UTF-16LE BOM; feeding UTF-8 directly produces mojibake for non-ASCII text.
   {
@@ -240,6 +250,7 @@ if(-not $bytes){exit 3}
 
 win32yank_copy() {
   local y; y=$(win32yank_path)
+  omw_interop_ensure || exit 1
   if (( CRLF )); then
     timeout 10 "$y" -i --crlf
   else
@@ -249,6 +260,7 @@ win32yank_copy() {
 
 win32yank_paste() {
   local y; y=$(win32yank_path)
+  omw_interop_ensure || exit 1
   if (( CRLF )); then
     timeout 10 "$y" -o
   else

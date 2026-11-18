@@ -7,10 +7,13 @@
 # battery (Snapdragon X / X2, Intel/AMD ultrabooks) is not drained by -j18
 # builds, and a thermally limited machine is not pushed into deeper throttling.
 #
-# Signals (best available wins, results cached for OMARCHY_POWER_CACHE_TTL s):
-#   1. /sys/class/power_supply  — WSL2 battery/AC passthrough. Built in on
-#      arm64 kernels; a module (ACPI_BATTERY/ACPI_AC =m) on x86 6.6+ kernels,
-#      so it is frequently absent on x86.
+# Signals (best available wins; Windows answers cached OMARCHY_POWER_CACHE_TTL
+# seconds, failed Windows queries negative-cached OMARCHY_POWER_FAIL_TTL s):
+#   1. /sys/class/power_supply  — WSL2 battery/AC passthrough. Whether the WSL
+#      kernel exposes it depends on the kernel build and host, so it is often
+#      empty (notably on x86 hosts). Only a present Battery entry can make the
+#      host "on battery": USB-C / USB-PD nodes report online=0 on battery-less
+#      desktops and mini-PCs whenever nothing is plugged into those ports.
 #   2. Windows host via PowerShell 5.1 (no admin required):
 #      SystemInformation.PowerStatus     AC line + battery % (0..1 float)
 #      PowerManager.EnergySaverStatus    Energy Saver (Disabled/Off/On)
@@ -22,6 +25,7 @@
 # Policy: AC -> 100%; battery -> 50%; battery <= 20% or Energy Saver -> 25%;
 # "best power efficiency" mode caps at the battery level; a performance/passive
 # limit below 80% scales the result proportionally. Never below 1 job.
+# A Windows "NoSystemBattery" answer always means AC, whatever sysfs reports.
 # ==============================================================================
 
 set -euo pipefail
@@ -51,6 +55,8 @@ Configuration (~/.config/omarchy/power-governor.conf or environment):
   OMARCHY_POWER_LOW_THRESHOLD=20               "low battery" percentage
   OMARCHY_POWER_THERMAL_FLOOR=80               scale when perf limit drops below this
   OMARCHY_POWER_CACHE_TTL=60                   seconds to cache the Windows query
+  OMARCHY_POWER_FAIL_TTL=120                   seconds to remember a failed Windows query
+  OMARCHY_POWER_NO_WINDOWS=1                   never query Windows (sysfs only)
 EOF
 }
 
@@ -61,7 +67,7 @@ if [[ -r "$CONF_FILE" ]]; then
     value="${value//[\"\' ]/}"
     case "$key" in
       OMARCHY_POWER_GOVERNOR) [[ "$value" =~ ^(auto|off|ac|battery)$ ]] && : "${OMARCHY_POWER_GOVERNOR:=$value}" ;;
-      OMARCHY_POWER_BATTERY_PCT|OMARCHY_POWER_LOW_PCT|OMARCHY_POWER_LOW_THRESHOLD|OMARCHY_POWER_THERMAL_FLOOR|OMARCHY_POWER_CACHE_TTL)
+      OMARCHY_POWER_BATTERY_PCT|OMARCHY_POWER_LOW_PCT|OMARCHY_POWER_LOW_THRESHOLD|OMARCHY_POWER_THERMAL_FLOOR|OMARCHY_POWER_CACHE_TTL|OMARCHY_POWER_FAIL_TTL)
         [[ "$value" =~ ^[0-9]+$ ]] && printf -v "$key" '%s' "${!key:-$value}" ;;
     esac
   done <"$CONF_FILE"
@@ -73,6 +79,7 @@ LOW_PCT="${OMARCHY_POWER_LOW_PCT:-25}"
 LOW_THRESHOLD="${OMARCHY_POWER_LOW_THRESHOLD:-20}"
 THERMAL_FLOOR="${OMARCHY_POWER_THERMAL_FLOOR:-80}"
 CACHE_TTL="${OMARCHY_POWER_CACHE_TTL:-60}"
+FAIL_TTL="${OMARCHY_POWER_FAIL_TTL:-120}"
 SUPPLY_DIR="${OMW_POWER_SUPPLY_DIR:-/sys/class/power_supply}"
 
 OVERLAY_EFFICIENCY="961cc777-2547-4f9d-8174-7d86181b8a7a"
@@ -92,35 +99,38 @@ PASSIVE_LIMIT=""     # % Passive Limit of the hottest thermal zone
 # Signal 1: sysfs passthrough
 # -----------------------------------------------------------------------------
 read_sysfs() {
-  local d type online=0 mains=0 bat_status="" found=0
+  local d type online=0 supplies=0 battery=0 bat_status=""
   [[ -d "$SUPPLY_DIR" ]] || return 1
   for d in "$SUPPLY_DIR"/*; do
     [[ -r "$d/type" ]] || continue
     type=$(<"$d/type")
     case "$type" in
-      Mains|USB|USB_PD|USB_C)
-        mains=1
+      Mains|USB|USB_PD|USB_PD_DRP|USB_C|USB_DCP|USB_CDP|USB_ACA|Wireless)
+        supplies=1
         [[ "$(cat "$d/online" 2>/dev/null)" == "1" ]] && online=1
-        found=1
         ;;
       Battery)
         [[ "$(cat "$d/present" 2>/dev/null || echo 1)" == "1" ]] || continue
+        battery=1
         BATTERY=$(cat "$d/capacity" 2>/dev/null || true)
         [[ "$BATTERY" =~ ^[0-9]+$ ]] || BATTERY=""
         bat_status=$(cat "$d/status" 2>/dev/null || true)
-        found=1
         ;;
     esac
   done
-  (( found )) || return 1
-  if (( online )); then
+  if (( ! battery )); then
+    # No battery at all: an offline USB-C/PD node on a desktop or mini-PC is an
+    # unused port, not a sign of running on battery.
+    (( supplies )) || return 1
+    SOURCE="ac"
+  elif (( online )); then
     SOURCE="ac"
   elif [[ "$bat_status" == "Discharging" ]]; then
     SOURCE="battery"
-  elif (( mains )); then
-    SOURCE="battery"
   elif [[ "$bat_status" =~ ^(Charging|Full|Not\ charging)$ ]]; then
     SOURCE="ac"
+  elif (( supplies )); then
+    SOURCE="battery"    # a battery exists and every supply reports offline
   else
     return 1
   fi
@@ -146,9 +156,15 @@ windows_query() {
     printf '%s\n' "$raw"
     return 0
   fi
+  # A failed query (no interop, session 0, timeout) is remembered briefly so
+  # back-to-back omarchy-build runs do not each pay the PowerShell timeout.
+  omw_cache_get power-state-failed "$FAIL_TTL" >/dev/null && return 1
   omw_is_wsl && omw_interop_enabled || return 1
-  raw=$(OMW_TIMEOUT=8 omw_ps_run "$WINDOWS_QUERY") || return 1
-  [[ -n "$raw" ]] || return 1
+  if ! raw=$(OMW_TIMEOUT=8 omw_ps_run "$WINDOWS_QUERY") || [[ -z "$raw" ]]; then
+    omw_cache_put power-state-failed "$(date +%s)"
+    return 1
+  fi
+  omw_cache_del power-state-failed
   omw_cache_put power-state "$raw"
   printf '%s\n' "$raw"
 }
@@ -168,15 +184,18 @@ read_windows() {
       passive) [[ "$value" =~ ^[0-9]+$ ]] && PASSIVE_LIMIT="$value" ;;
     esac
   done <<<"$raw"
-  if [[ "$SIGNAL" != "sysfs" ]]; then
-    if [[ "$chg" == *NoSystemBattery* ]]; then
-      SOURCE="ac"
-    elif [[ "$line" == "Offline" ]]; then
+  if [[ "$chg" == *NoSystemBattery* ]]; then
+    # Windows knows the machine has no battery: authoritative over sysfs.
+    SOURCE="ac"
+    BATTERY=""
+    SIGNAL="windows"
+  elif [[ "$SIGNAL" != "sysfs" ]]; then
+    if [[ "$line" == "Offline" ]]; then
       SOURCE="battery"
     elif [[ "$line" == "Online" ]]; then
       SOURCE="ac"
     fi
-    if [[ "$chg" != *NoSystemBattery* && -n "$pct" ]] && (( pct <= 100 )); then
+    if [[ -n "$pct" ]] && (( pct <= 100 )); then
       BATTERY="$pct"
     fi
     [[ "$SOURCE" != "unknown" ]] && SIGNAL="windows"
@@ -296,7 +315,7 @@ case "$CMD" in
   status) cmd_status "${1:-}" ;;
   jobs) cmd_jobs "${1:-}" ;;
   factor) gather; compute_factor; echo "$FACTOR" ;;
-  refresh) rm -f -- "$(omw_runtime_dir)/cache-power-state"; omw_log "Cache cleared." ;;
+  refresh) omw_cache_del power-state; omw_cache_del power-state-failed; omw_log "Cache cleared." ;;
   -h|--help|help) usage ;;
   *) omw_err "Unknown command: $CMD"; usage >&2; exit 2 ;;
 esac

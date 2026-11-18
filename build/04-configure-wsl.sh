@@ -26,6 +26,12 @@ systemctl enable omarchy-pacman-init.service
 if is_installed docker; then
   systemctl enable docker.socket
 fi
+# build.slice hands memory-pressure kills to systemd-oomd
+# (ManagedOOMMemoryPressure=kill, 60% for 10 s); the WSL kernel exposes PSI.
+# Only units that opt in are affected.
+if [[ -f /usr/lib/systemd/system/systemd-oomd.service ]]; then
+  systemctl enable systemd-oomd.service
+fi
 systemctl set-default multi-user.target
 
 log "locale en_US.UTF-8"

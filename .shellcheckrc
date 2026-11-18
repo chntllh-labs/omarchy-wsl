@@ -1,2 +1,5 @@
 # PowerShell snippets are deliberately single-quoted so bash never expands them.
 disable=SC2016
+# Functions invoked only from traps (cleanup on EXIT) are reported as never
+# invoked by shellcheck >= 0.10.
+disable=SC2329
