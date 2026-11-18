@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# omarchy:summary=Update the Omarchy WSL system: pacman, mise tools, Neovim plugins and migrations
+# omarchy:alias=omarchy up
+# omarchy:args=[-y] [--aur] [--self]
+# omarchy:examples=omarchy update | omarchy update -y
+# omarchy:requires-sudo=true
+
+# WSL replacement for upstream omarchy-update. Upstream's pipeline revolves
+# around Snapper snapshots, Limine, firmware and Hyprland migrations, none of
+# which exist under WSL; omarchy-wsl-update is the WSL update engine.
+
+exec omarchy-wsl-update "$@"

@@ -1,18 +1,9 @@
-# ==============================================================================
-# Omarchy WSL: Resilient Multi-Tier Fallback Mirrorlist (ARM64 / aarch64)
-# /etc/pacman.d/mirrorlist
-# ==============================================================================
-# Tier 1: Official Arch Linux ARM Mirrors
-Server = http://os.archlinuxarm.org/$arch/$repo
-Server = http://mirror.archlinuxarm.org/$arch/$repo
-
-# Tier 2: Global Distributed CDN / High-Availability HTTPS Mirrors
+# /etc/pacman.d/mirrorlist for Omarchy on WSL (aarch64). HTTPS only.
+#
+# Omarchy's mirror of Arch Linux ARM: the stable snapshot the [omarchy]
+# packages are built against (upstream default/pacman/aarch64/mirrorlist-stable).
+Server = https://arm-stable-mirror.omarchy.org/$arch/$repo
+# Arch Linux ARM mirrors with valid TLS certificates. os.archlinuxarm.org and
+# most regional mirrors fail certificate validation over HTTPS.
 Server = https://fl.us.mirror.archlinuxarm.org/$arch/$repo
-Server = https://de.mirror.archlinuxarm.org/$arch/$repo
-Server = https://sg.mirror.archlinuxarm.org/$arch/$repo
-Server = https://dk.mirror.archlinuxarm.org/$arch/$repo
-
-# Tier 3: HTTP Fallback Mirrors
-Server = http://fl.us.mirror.archlinuxarm.org/$arch/$repo
-Server = http://de.mirror.archlinuxarm.org/$arch/$repo
-Server = http://sg.mirror.archlinuxarm.org/$arch/$repo
+Server = https://ca.us.mirror.archlinuxarm.org/$arch/$repo

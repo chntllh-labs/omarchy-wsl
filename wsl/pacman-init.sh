@@ -1,72 +1,70 @@
 #!/bin/bash
 # ==============================================================================
-# Omarchy WSL: Deterministic, Offline-Safe Pacman Keyring Initialization
+# /usr/lib/omarchy-wsl/pacman-init.sh
+# Create this install's pacman keyring.
 # ==============================================================================
-# Guarantees local keyring initialization without internet dependency,
-# preventing gpg-agent hanging, socket conflicts, and clock-skew failures.
+# The image ships without /etc/pacman.d/gnupg so no two installs share a local
+# master key. omarchy-pacman-init.service runs this on the first boot, and the
+# OOBE calls it too (wsl --import without systemd, containers). A no-op once
+# the keyring exists. Offline-safe: it only populates from the keyrings that
+# archlinux(arm)-keyring and omarchy-keyring ship under /usr/share/pacman.
 # ==============================================================================
 
 set -euo pipefail
 
-GNUPG_DIR="/etc/pacman.d/gnupg"
+GNUPG_DIR="${OMARCHY_PACMAN_GNUPG:-/etc/pacman.d/gnupg}"
+KEYRING_DIR="${OMARCHY_PACMAN_KEYRINGS:-/usr/share/pacman/keyrings}"
 
-# Fast-path: if trustdb exists and is non-empty, keyring is already initialized
-if [[ -s "${GNUPG_DIR}/trustdb.gpg" ]]; then
-  # Ensure no stale socket files from prior crashes
-  rm -f "${GNUPG_DIR}/S."* "${GNUPG_DIR}/"*.lock 2>/dev/null || true
+log() { printf '[omarchy-pacman-init] %s\n' "$*"; }
+
+clear_stale_agent_files() {
+  rm -f "$GNUPG_DIR"/S.* "$GNUPG_DIR"/*.lock "$GNUPG_DIR"/.#lk* 2>/dev/null || true
+}
+
+if [[ -s $GNUPG_DIR/trustdb.gpg ]]; then
+  clear_stale_agent_files
   exit 0
 fi
 
-# Detect architecture
-ARCH="$(uname -m)"
-case "$ARCH" in
-  aarch64) distro_keyring="archlinuxarm" ;;
-  x86_64)  distro_keyring="archlinux" ;;
+case "$(uname -m)" in
+  aarch64) distro_keyring=archlinuxarm ;;
+  x86_64) distro_keyring=archlinux ;;
   *)
-    echo "[omarchy-pacman-init] ERROR: Unsupported architecture: $ARCH" >&2
+    echo "[omarchy-pacman-init] unsupported architecture $(uname -m)" >&2
     exit 1
     ;;
 esac
 
-keyrings=("$distro_keyring")
-[[ -f "/usr/share/pacman/keyrings/omarchy.gpg" ]] && keyrings+=("omarchy")
-[[ -f "/usr/share/pacman/keyrings/omarchy-wsl.gpg" ]] && keyrings+=("omarchy-wsl")
+keyrings=()
+for keyring in "$distro_keyring" omarchy; do
+  [[ -f $KEYRING_DIR/$keyring.gpg ]] && keyrings+=("$keyring")
+done
+((${#keyrings[@]} > 0)) || {
+  echo "[omarchy-pacman-init] no keyrings under $KEYRING_DIR" >&2
+  exit 1
+}
 
-echo "[omarchy-pacman-init] Initializing pacman keyring for $ARCH..."
-
-# Guard against clock skew on clean/offline boot
-# If RTC is before 2024-01-01, GPG rejects keys as "created in the future"
-CURRENT_TIME=$(date +%s)
-MIN_EPOCH=1704067200 # 2024-01-01 00:00:00 UTC
-if (( CURRENT_TIME < MIN_EPOCH )); then
-  FALLBACK_EPOCH=${SOURCE_DATE_EPOCH:-1775000000}
-  echo "[omarchy-pacman-init] WARNING: System clock is set to past ($CURRENT_TIME). Clamping to fallback ($FALLBACK_EPOCH)..."
-  date -s "@${FALLBACK_EPOCH}" 2>/dev/null || true
+# GnuPG rejects keys "created in the future" when the clock is far behind (a
+# VM restored from an old snapshot). Report it; never set the clock here.
+if (($(date +%s) < 1704067200)); then
+  log "WARNING: system clock reads $(date -u); key import may fail until it is corrected"
 fi
 
-# Ensure clean directory and permissions
-mkdir -p -m 0700 "$GNUPG_DIR"
-rm -f "${GNUPG_DIR}/S."* "${GNUPG_DIR}/"*.lock 2>/dev/null || true
-
-# Enforce offline-safe GPG config
-cat << 'EOF' > "${GNUPG_DIR}/gpg.conf"
+log "initialising the pacman keyring (${keyrings[*]})"
+install -d -m 0700 "$GNUPG_DIR"
+clear_stale_agent_files
+# Never reach for a keyserver from a boot service.
+cat >"$GNUPG_DIR/gpg.conf" <<'CONF'
 no-greeting
 no-permission-warning
-keyserver-options timeout=5
 no-auto-key-retrieve
-EOF
-chmod 0600 "${GNUPG_DIR}/gpg.conf"
+keyserver-options timeout=5
+CONF
+chmod 0600 "$GNUPG_DIR/gpg.conf"
 
-# Initialize local master key
-pacman-key --init
+pacman-key --gpgdir "$GNUPG_DIR" --init
+pacman-key --gpgdir "$GNUPG_DIR" --populate "${keyrings[@]}"
 
-# Populate trusted distribution keys offline from /usr/share/pacman/keyrings/
-pacman-key --populate "${keyrings[@]}"
-
-# Kill background GPG agents and purge ephemeral sockets
 gpgconf --homedir "$GNUPG_DIR" --kill all 2>/dev/null || true
-rm -f "${GNUPG_DIR}/S."* "${GNUPG_DIR}/"*.lock 2>/dev/null || true
-chmod 0700 "$GNUPG_DIR"
-find "$GNUPG_DIR" -type f -exec chmod 0600 {} + 2>/dev/null || true
-
-echo "[omarchy-pacman-init] Pacman keyring successfully initialized and sanitized."
+clear_stale_agent_files
+log "keyring ready"

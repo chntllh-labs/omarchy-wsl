@@ -1,0 +1,48 @@
+# upstream.lock: every external input the image build trusts, pinned in one place.
+#
+# Plain KEY=value lines (no quotes, no spaces, no shell expansion). Consumed by
+# the Containerfile build steps (build/lib.sh), packages/PKGBUILDs/omarchy-wsl,
+# tests/test_upstream_lock.py and scripts/bump-upstream. Never source it from a
+# shell that runs untrusted input; build/lib.sh parses it with a whitelist.
+#
+# Bump procedure: scripts/bump-upstream <tag> reads the new _commit/_tag/sha256 from
+# omacom-io/omarchy-pkgs pkgbuilds/omarchy/PKGBUILD, rewrites this file and the
+# omarchy-wsl PKGBUILD, then the full build + test matrix must pass.
+
+# --- Basecamp Omarchy (CLI, themes, defaults) --------------------------------
+# _commit in omacom-io/omarchy-pkgs pkgbuilds/omarchy/PKGBUILD is the source of
+# truth (omarchy and omarchy-settings 4.5.0 are built from it). It is not the
+# tag object itself: v4.5.0 peels to ac2690cd, and the release packages were cut
+# from a948d8a6 (git describe: v4.5.0-rc3-93).
+OMARCHY_TAG=v4.5.0
+OMARCHY_VERSION=4.5.0
+OMARCHY_COMMIT=a948d8a6871f446b335258c827648ac5f4e9428b
+OMARCHY_SOURCE_URL=https://github.com/omacom/omarchy.git
+# makepkg checksum of the git source (sha256 of `git archive --format tar <commit>`).
+OMARCHY_SOURCE_SHA256=bf3220fcc7b9d883a86f1c59efd79ce675fe137cdbb1324e9785c3cc45d01de7
+
+# --- [omarchy] binary repository ----------------------------------------------
+# Packages are signed (detached .sig); the repository database is not, hence
+# SigLevel = Required DatabaseOptional and HTTPS-only servers.
+OMARCHY_CHANNEL=stable
+OMARCHY_REPO_URL=https://pkgs.omarchy.org/stable/$arch
+OMARCHY_KEY_FPR=40DFB630FF42BCFFB047046CF0134EE680CAC571
+OMARCHY_KEY_FILE=wsl/keys/omarchy.asc
+# Key material shipped by omarchy-keyring 20251027-1 (identical on both arches).
+OMARCHY_KEYRING_GPG_SHA256=15d6aac44df688165b2ea35fe0b23af239bbc66a6909c10a5c219e8d94b707de
+OMARCHY_KEYRING_TRUSTED_SHA256=ab0b688815444cffd48d15ca3597c77dbb364d59763c5784fca36691520f00fd
+
+# --- Arch Linux mirrors (Omarchy's stable snapshots, HTTPS) -------------------
+OMARCHY_MIRROR_AARCH64=https://arm-stable-mirror.omarchy.org/$arch/$repo
+OMARCHY_MIRROR_X86_64=https://stable-mirror.omarchy.org/$repo/os/$arch
+
+# --- Stage 0 base rootfs: aarch64 (Arch Linux ARM) -----------------------------
+# os.archlinuxarm.org fails TLS; the fl.us mirror serves the same signed files.
+ALARM_ROOTFS_URL=https://fl.us.mirror.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz
+ALARM_KEY_FPR=68B3537F39A313B3E574D06777193F152BDBE6A6
+ALARM_KEY_FILE=wsl/keys/archlinuxarm-build-system.asc
+
+# --- Stage 0 base rootfs: x86_64 (Arch Linux bootstrap) ------------------------
+ARCH_BOOTSTRAP_URL=https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst
+ARCH_BOOTSTRAP_KEY_FPR=3E80CA1A8B89F69CBA57D98A76A5EF9054449A5C
+ARCH_BOOTSTRAP_KEY_FILE=wsl/keys/archlinux-release-pierre-schmitz.asc

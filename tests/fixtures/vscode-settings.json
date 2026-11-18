@@ -1,0 +1,7 @@
+{
+    // Keep the editor calm.
+    "editor.fontSize": 14,
+    "workbench.colorTheme": "Default Dark Modern", // set by hand
+    /* trailing commas are legal in VS Code settings */
+    "files.autoSave": "afterDelay",
+}

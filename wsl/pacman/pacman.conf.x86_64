@@ -1,0 +1,41 @@
+# /etc/pacman.conf for Omarchy on WSL (x86_64).
+# Upstream Omarchy's default/pacman/pacman-stable.conf (v4.5.0)
+# plus NoExtract rules that keep documentation and translations out of the
+# WSL disk. Man pages stay. Copied from /usr/share/omarchy-wsl/pacman/.
+# Arch Linux provides the x86_64 repositories below.
+
+[options]
+Color
+ILoveCandy
+VerbosePkgLists
+HoldPkg = pacman glibc
+Architecture = auto
+CheckSpace
+ParallelDownloads = 5
+DownloadUser = alpm
+
+# Documentation and translations are never extracted (the omarchy-wsl docs
+# and English locales are kept).
+NoExtract = usr/share/help/* usr/share/gtk-doc/* usr/share/info/*
+NoExtract = usr/share/doc/* !usr/share/doc/omarchy-wsl/*
+NoExtract = usr/share/locale/* !usr/share/locale/en* !usr/share/locale/locale.alias
+
+# Packages must carry a signature from a key the local keyring trusts. The
+# [omarchy] and Arch Linux ARM databases are unsigned, so they are fetched
+# over HTTPS only.
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+# Repositories are searched in this order. Omarchy comes first, as upstream
+# ships it, so a package it also publishes is installed from Omarchy.
+[omarchy]
+Server = https://pkgs.omarchy.org/stable/$arch
+
+[core]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist

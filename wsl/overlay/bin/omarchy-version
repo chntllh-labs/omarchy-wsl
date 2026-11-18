@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# omarchy:summary=Print the installed Omarchy version
+
+# The WSL build ships the Omarchy tree in the omarchy-wsl package instead of
+# upstream's omarchy package, so the version comes from that package (minus
+# its pkgrel). Upstream's own version file lags releases, which is why upstream
+# also reads the package version. A development tree (OMARCHY_PATH pointing at
+# a checkout) is reported by upstream's script.
+
+omarchy_path=${OMARCHY_PATH:-/usr/share/omarchy}
+omarchy_path=${omarchy_path%/}
+
+if [[ $omarchy_path != "/usr/share/omarchy" && -x $omarchy_path/bin/omarchy-version ]]; then
+  exec "$omarchy_path/bin/omarchy-version"
+fi
+
+version=$(pacman -Q omarchy-wsl 2>/dev/null | awk '{ print $2 }')
+[[ -n $version ]] || exit 1
+
+echo "${version%-*}"

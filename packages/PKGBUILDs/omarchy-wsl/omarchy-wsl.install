@@ -1,0 +1,12 @@
+# /etc/os-release (owned by filesystem) and /etc/skel/.bashrc (owned by bash)
+# are copied from /usr/share/omarchy-wsl/etc-overrides, the pattern upstream's
+# omarchy-settings uses. A libalpm hook re-applies os-release whenever the
+# filesystem package reinstalls its symlink.
+
+post_install() {
+  /usr/lib/omarchy-wsl/apply-etc-overrides
+}
+
+post_upgrade() {
+  /usr/lib/omarchy-wsl/apply-etc-overrides
+}

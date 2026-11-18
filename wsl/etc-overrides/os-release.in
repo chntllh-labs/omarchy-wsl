@@ -1,0 +1,14 @@
+NAME="Omarchy"
+PRETTY_NAME="Omarchy @OMARCHY_VERSION@ (WSL)"
+ID=omarchy
+ID_LIKE=arch
+VARIANT="WSL"
+VARIANT_ID=wsl
+BUILD_ID=rolling
+VERSION_ID="@OMARCHY_VERSION@"
+ANSI_COLOR="38;2;158;206;106"
+HOME_URL="https://omarchy.org/"
+DOCUMENTATION_URL="https://github.com/chntllh-labs/omarchy-wsl#readme"
+SUPPORT_URL="https://github.com/chntllh-labs/omarchy-wsl/issues"
+BUG_REPORT_URL="https://github.com/chntllh-labs/omarchy-wsl/issues"
+LOGO=omarchy
