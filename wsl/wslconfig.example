@@ -1,39 +1,57 @@
-# %USERPROFILE%\.wslconfig
+# %USERPROFILE%\.wslconfig: example for Omarchy-WSL
 #
-# Production WSL2 Virtualization Profile for Omarchy-WSL
-# Tuned for high-core ARM64 (Snapdragon Oryon 18c) and x86_64 hosts.
+# This is exactly what tools/generate-wslconfig.ps1 writes (-Profile Desktop)
+# for a Windows 11 24H2 x64 host with 32 GB of RAM and 16 logical processors:
 #
-# Place this file in C:\Users\<YourUser>\.wslconfig and apply via:
-#   wsl --shutdown
+#   .\tools\generate-wslconfig.ps1 -DryRun -HostMemoryGB 32 -HostLogicalProcessors 16 -HostArch x64 -HostBuild 26100
 #
+# Prefer running the generator over copying this file: it sizes memory, swap
+# and processors from your machine, merges into your existing .wslconfig
+# instead of replacing it, and backs the old file up first. WSL reads this file
+# when its VM starts; apply changes with `wsl --shutdown`.
+#
+# Reference: https://learn.microsoft.com/en-us/windows/wsl/wsl-config
+# Only '#' starts a comment in .wslconfig.
 
 [wsl2]
-# Core Compute & Memory Governance
-# Generated adaptively by tools/generate-wslconfig.ps1
-processors = 18
-memory = 48GB
-swap = 16GB
-nestedVirtualization = true
-localhostForwarding = true
-guiApplications = true
-vmIdleTimeout = 60000
-
-# High-Performance Mirrored Networking Stack
-networkingMode = mirrored
-dnsTunneling = true
-autoProxy = true
-hostAddressLoopback = true
-firewall = true
-ignoredPorts = 5353,5355
+# Memory for the WSL 2 VM. Auto sizing: <=8 GB host: half; 16 GB tier: 8 GB;
+# 32 GB tier: RAM - 8 GB; 64 GB tier: 75 %; above 72 GB: RAM - 16 GB.
+# Never more than host RAM minus 4 GB (-WindowsReserveGB).
+memory=24GB
+processors=16
+# Never 0: without swap, file-backed pages are refaulted from the virtual disk
+# under memory pressure. The generator's minimum is 4 GB.
+swap=8GB
+# x64 on Windows 11 only; never written on ARM64 hosts.
+nestedVirtualization=true
+guiApplications=true
+# Mirrored networking needs Windows 11 22H2 (build 22621). Older builds and
+# -ForceNAT get networkingMode=NAT, dnsTunneling=false, autoProxy=false and
+# localhostForwarding=true instead (WSL ignores localhostForwarding in mirrored mode).
+networkingMode=mirrored
+dnsTunneling=true
+firewall=true
+autoProxy=true
 
 [experimental]
-# Automatic gradual memory reclamation when Linux is idle.
-# 'gradual' releases cached memory over 30 min of idle without
-# purging hot working sets, avoiding the cold-cache disk thrashing of 'dropCache'.
-autoMemoryReclaim = gradual
+# These four keys exist only in [experimental]; under [wsl2] WSL reports
+# "Unknown key" and ignores them.
+autoMemoryReclaim=gradual
+sparseVhd=false
+# Mirrored mode only.
+hostAddressLoopback=true
+ignoredPorts=5353,5355
 
-# Storage Integrity:
-# DO NOT enable sparseVhd=true on mission-critical distros!
-# Microsoft gated sparseVhd behind --allow-unsafe in WSL 2.5.6+ due to severe ext4
-# superblock and journal corruption from NTFS sparse hole-punching races.
-sparseVhd = false
+# Headless always-on host: .\tools\generate-wslconfig.ps1 -Profile Server
+# additionally writes
+#
+#   [wsl2]
+#   guiApplications=false   (no WSLg; -KeepGui keeps it)
+#   vmIdleTimeout=-1        (never stop the VM when no distro runs)
+#
+#   [general]
+#   instanceIdleTimeout=-1  (never stop the distro 15 s after its last process)
+#
+# Both idle timeouts are needed: with vmIdleTimeout=-1 alone the distro still
+# stops 15 s after the last session ends, taking systemd services with it.
+# tools/register-wsl-autostart.ps1 starts the distro at logon or boot.

@@ -144,7 +144,7 @@ jobs:
 
           ## Install (PowerShell)
           \`\`\`powershell
-          irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/install/install.ps1 | iex
+          irm https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install/install.ps1 | iex
           \`\`\`
           or download the file for your CPU and run \`wsl --install --from-file <file>\`:
           - \`Omarchy-x86_64.wsl\` (Intel/AMD)
