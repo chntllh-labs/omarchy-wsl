@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 from omarchy_theme.adapters.windows_terminal import AdapterResult
-from omarchy_theme.atomic_io import atomic_write_text, safe_read_text
+from omarchy_theme.atomic_io import atomic_update_text, safe_read_text
 from omarchy_theme.jsonc import JsoncModifier, JsoncParseError
 from omarchy_theme.models import ColorScheme
 
@@ -24,24 +24,33 @@ def sync_vscode(
     dry_run: bool = False,
     make_backup: bool = True,
 ) -> AdapterResult:
-    """Synchronize a color scheme to VS Code settings.json."""
+    """Synchronize a color scheme to VS Code settings.json (locked read-modify-write)."""
     path = Path(target_path).resolve()
+    color_customs = theme.to_vscode_color_customizations()
+    theme_name = theme.vscode_theme_name if sync_extension_theme else None
 
-    if not path.exists():
-        content = "{\n}\n"
-    else:
+    def transform(current: Optional[str]) -> str:
+        modifier = JsoncModifier(current if current is not None else "{\n}\n")
+        modifier.upsert_vscode_color_customizations(color_customs, theme_name=theme_name)
+        return modifier.raw_text
+
+    if dry_run:
         try:
-            content, _ = safe_read_text(path)
-        except Exception as e:
+            current = safe_read_text(path)[0] if path.exists() else None
+            transform(current)
+        except JsoncParseError as e:
             return AdapterResult(
                 success=False,
                 target_path=path,
-                message=f"Failed to read existing VS Code settings.json: {e}",
+                message=f"Syntax error in existing VS Code settings at {e}. Aborting to avoid corruption.",
                 error=str(e),
             )
+        except Exception as e:  # noqa: BLE001 - reported to the user
+            return AdapterResult(False, path, f"Failed modifying VS Code settings: {e}", error=str(e))
+        return AdapterResult(True, path, f"[DRY-RUN] Verified valid VS Code update for '{theme.name}' on {path.name}")
 
     try:
-        modifier = JsoncModifier(content)
+        result = atomic_update_text(path, transform, encoding="utf-8", make_backup=make_backup)
     except JsoncParseError as e:
         return AdapterResult(
             success=False,
@@ -49,47 +58,15 @@ def sync_vscode(
             message=f"Syntax error in existing VS Code settings at {e}. Aborting to avoid corruption.",
             error=str(e),
         )
+    except Exception as e:  # noqa: BLE001 - reported to the user
+        return AdapterResult(False, path, f"VS Code settings update failed: {e}", error=str(e))
 
-    color_customs = theme.to_vscode_color_customizations()
-    theme_name = theme.vscode_theme_name if sync_extension_theme else None
-
-    try:
-        modifier.upsert_vscode_color_customizations(color_customs, theme_name=theme_name)
-    except Exception as e:
-        return AdapterResult(
-            success=False,
-            target_path=path,
-            message=f"Failed modifying VS Code settings: {e}",
-            error=str(e),
-        )
-
-    final_text = modifier.raw_text
-
-    if dry_run:
-        return AdapterResult(
-            success=True,
-            target_path=path,
-            message=f"[DRY-RUN] Verified valid VS Code update for '{theme.name}' on {path.name}",
-        )
-
-    try:
-        written_path = atomic_write_text(
-            target_path=path,
-            content=final_text,
-            encoding="utf-8",
-            make_backup=make_backup,
-        )
-        bak_file = path.with_name(f"{path.name}.bak")
-        return AdapterResult(
-            success=True,
-            target_path=written_path,
-            message=f"Successfully synchronized '{theme.name}' to VS Code ({path})",
-            backup_path=bak_file if bak_file.exists() else None,
-        )
-    except Exception as e:
-        return AdapterResult(
-            success=False,
-            target_path=path,
-            message=f"Atomic write to VS Code config failed: {e}",
-            error=str(e),
-        )
+    bak_file = path.with_name(f"{path.name}.bak")
+    if not result.changed:
+        return AdapterResult(True, path, f"VS Code already uses '{theme.name}' ({path})", skipped=True)
+    return AdapterResult(
+        success=True,
+        target_path=result.path,
+        message=f"Successfully synchronized '{theme.name}' to VS Code ({path})",
+        backup_path=bak_file if bak_file.exists() else None,
+    )

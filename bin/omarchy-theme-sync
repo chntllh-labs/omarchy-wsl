@@ -12,11 +12,25 @@ import os
 import sys
 from pathlib import Path
 
-# Add lib directory to python search path
-repo_root = Path(__file__).resolve().parent.parent
-lib_dir = repo_root / "lib"
-if str(lib_dir) not in sys.path:
-    sys.path.insert(0, str(lib_dir))
+# Locate the omarchy_theme package: $OMARCHY_THEME_LIB, the repository checkout
+# (bin/../lib), then the installed copy (<prefix>/lib/omarchy-wsl/python, i.e.
+# /usr/lib/omarchy-wsl/python for /usr/bin/omarchy-theme-sync).
+def _find_lib() -> None:
+    here = Path(__file__).resolve().parent
+    candidates = [
+        os.environ.get("OMARCHY_THEME_LIB", ""),
+        str(here.parent / "lib"),
+        str(here.parent / "lib" / "omarchy-wsl" / "python"),
+        "/usr/lib/omarchy-wsl/python",
+    ]
+    for candidate in candidates:
+        if candidate and (Path(candidate) / "omarchy_theme" / "__init__.py").is_file():
+            if candidate not in sys.path:
+                sys.path.insert(0, candidate)
+            return
+
+
+_find_lib()
 
 from omarchy_theme.adapters.linux_terminals import sync_all_linux_terminals
 from omarchy_theme.adapters.vscode import sync_vscode
@@ -30,24 +44,31 @@ from omarchy_theme.palettes import (
 )
 
 
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _COLOR else text
+
+
 def print_banner() -> None:
-    print("\033[36m[omarchy-theme-sync]\033[0m Cross-OS Theme Synchronization Engine")
+    print(f"{_c('36', '[omarchy-theme-sync]')} Cross-OS Theme Synchronization Engine")
 
 
 def print_step(msg: str) -> None:
-    print(f"\033[36m[*]\033[0m {msg}")
+    print(f"{_c('36', '[*]')} {msg}")
 
 
 def print_success(msg: str) -> None:
-    print(f"\033[32m[+]\033[0m {msg}")
+    print(f"{_c('32', '[+]')} {msg}")
 
 
 def print_warn(msg: str) -> None:
-    print(f"\033[33m[!]\033[0m {msg}")
+    print(f"{_c('33', '[!]')} {msg}")
 
 
 def print_err(msg: str) -> None:
-    print(f"\033[31m[-]\033[0m {msg}")
+    print(f"{_c('31', '[-]')} {msg}", file=sys.stderr)
 
 
 def show_status(detector: HostDetector) -> None:
@@ -204,7 +225,7 @@ def main() -> int:
 
     if not args.quiet:
         print_banner()
-        print_step(f"Applying theme: \033[1m{theme.name}\033[0m")
+        print_step(f"Applying theme: {_c('1', theme.name)}")
         if args.dry_run:
             print_warn("Dry-run mode active: no host files will be modified.")
 
@@ -262,8 +283,9 @@ def main() -> int:
         for res in linux_results:
             if res.success:
                 if not args.quiet:
-                    print_success(res.message)
-                synced_targets += 1
+                    (print_step if res.skipped else print_success)(res.message)
+                if not res.skipped:
+                    synced_targets += 1
             else:
                 print_err(res.message)
                 has_errors = True
@@ -277,7 +299,10 @@ def main() -> int:
             return 1
 
     if not args.quiet:
-        print_success(f"Theme '{theme.name}' successfully synchronized across {synced_targets} target(s)!")
+        if args.dry_run:
+            print_success(f"Dry run: theme '{theme.name}' validated for {synced_targets} target(s); nothing written.")
+        else:
+            print_success(f"Theme '{theme.name}' synchronized across {synced_targets} target(s).")
     return 0
 
 
