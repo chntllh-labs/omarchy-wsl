@@ -1,0 +1,30 @@
+# /etc/ssh/sshd_config inside an omarchy-tenant guest (managed file).
+# Installed by `omarchy-tenant create`; @TENANT@ is the tenant's login user.
+# Key-only and loopback-only: tailnet peers reach it through the tenant's
+# userspace tailscaled, which forwards inbound TCP to the tenant's localhost.
+# Keys come from /etc/omarchy-tenant/authorized_keys, which the host manages
+# with `omarchy-tenant key <name> add|remove`.
+Port 22
+ListenAddress 127.0.0.1
+ListenAddress ::1
+
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AuthorizedKeysFile /etc/omarchy-tenant/authorized_keys
+AllowUsers @TENANT@
+UsePAM yes
+
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
+GatewayPorts no
+PermitUserEnvironment no
+PrintMotd no
+
+Subsystem sftp /usr/lib/ssh/sftp-server

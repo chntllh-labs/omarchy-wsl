@@ -88,6 +88,8 @@ pkg     file  0644  assets/notify/*.png                             /usr/share/o
 pkg     file  0644  wsl/pacman/pacman.conf.*                        /usr/share/omarchy-wsl/pacman/
 pkg     file  0644  wsl/pacman/mirrorlist.*                         /usr/share/omarchy-wsl/pacman/
 pkg     file  0644  wsl/libalpm/hooks/*.hook                        /usr/share/libalpm/hooks/
+# Files omarchy-tenant renders into each guest (sshd, tailscaled, users).
+pkg     file  0644  wsl/tenant/*                                    /usr/share/omarchy-wsl/tenant/
 
 # --- New-user defaults (layered over upstream's config/ in /etc/skel) ------------
 pkg     file  0644  wsl/skel/.config/tmux/tmux.conf                 /etc/skel/.config/tmux/tmux.conf

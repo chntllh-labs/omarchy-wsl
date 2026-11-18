@@ -1,0 +1,2059 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Isolated Tenant Manager
+# /usr/bin/omarchy-tenant
+# ==============================================================================
+# Creates and manages isolated guests ("tenants") inside one Omarchy WSL distro.
+#
+# Why: WSL interop and DrvFs are per distro, not per Linux user. Every Linux
+# account in the distro can start powershell.exe as the Windows owner and read
+# the C: drive within the automount permissions. A second Linux *user* is
+# therefore not a security boundary. A tenant is:
+#
+#   systemd-nspawn  own user namespace (PrivateUsers=pick), own network
+#                   namespace (PrivateNetwork), no host bind mounts,
+#                   NoNewPrivileges, a sparse ext4 disk image per tenant,
+#                   memory/CPU/task caps from the service cgroup
+#   slirp4netns     user-mode NAT started inside the tenant's service cgroup,
+#                   --disable-host-loopback --disable-dns
+#   cgroup BPF      IPAddressDeny= on that cgroup: host loopback, RFC 1918,
+#                   CGNAT (tailnets), link-local/metadata, multicast, ULA and
+#                   link-local IPv6 (it filters the slirp4netns host sockets)
+#   seccomp         RestrictAddressFamilies=~AF_VSOCK (no hvsock to the
+#                   Windows host) and the io_uring syscalls refused
+#   tailnet         tailscaled --tun=userspace-networking inside the tenant,
+#                   key-only sshd on the tenant's own loopback
+#
+# Safety: mutating commands need root; --dry-run renders every file and prints
+# every command but changes nothing (no mkdir, no lock file); tenant paths are
+# realpath-checked against the state root before anything is removed and only
+# known file names are deleted (never rm -rf); tenant.conf is parsed, never
+# sourced; Tailscale auth keys are never accepted on argv, travel to the tenant
+# on stdin only and tskey-* values are masked in all output. Never writes
+# .wslconfig, /etc/wsl.conf, the Windows registry, or host sysctl (the only
+# exception is the explicit `create --harden-host-io-uring` opt-in).
+#
+# Design and threat model: docs/MULTI-TENANT-ISOLATION.md
+#
+# Test seams (tests/test_tenant.sh):
+#   OMARCHY_ALLOW_NONROOT=1             skip the root check
+#   OMARCHY_TENANT_EUID=<n>             EUID used by the root check
+#   OMARCHY_TENANT_UNIT_DIR=<dir>       default /etc/systemd/system
+#   OMARCHY_TENANT_NSPAWN_DIR=<dir>     default /etc/systemd/nspawn
+#   OMARCHY_TENANT_RUN_DIR=<dir>        default /run/omarchy-tenant
+#   OMARCHY_TENANT_SYSCTL_DIR=<dir>     default /etc/sysctl.d
+#   OMARCHY_TENANT_DATA_DIR=<dir>       in-tenant config templates
+#   OMARCHY_TENANT_PROC=<dir>           alternate /proc (leader, route, sysctls)
+#   OMARCHY_TENANT_DEV=<dir>            alternate /dev (doctor)
+#   OMARCHY_TENANT_SYSFS=<dir>          alternate /sys (doctor)
+#   OMARCHY_TENANT_HOST_RESOLV=<file>   alternate /etc/resolv.conf (probes)
+#   OMARCHY_TENANT_NOW=<ISO-8601>       pin created_at (else SOURCE_DATE_EPOCH)
+#   OMARCHY_TENANT_WAIT_SECS=<n>        bound for leader/tap/container waits
+#   OMARCHY_TENANT_DEBUG=1              log every external command (redacted)
+# ==============================================================================
+
+set -euo pipefail
+export LC_ALL=C
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB_DIR:+$OMARCHY_WSL_LIB_DIR/omarchy-wsl-common.sh}" \
+            "${OMARCHY_WSL_LIB_DIR:+$OMARCHY_WSL_LIB_DIR/common.sh}" \
+            "${_self%/*}/../lib/omarchy-wsl-common.sh" /usr/lib/omarchy-wsl/common.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-common.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_log >/dev/null || { echo "omarchy-tenant: common library not found" >&2; exit 1; }
+OMW_TAG="omarchy-tenant"
+
+readonly OT_VERSION="1.0.0"
+readonly EX_FAIL=1 EX_USAGE=2 EX_PRECOND=3 EX_ISOLATION=4 EX_NOTFOUND=5 EX_BUSY=75
+
+UNIT_DIR="${OMARCHY_TENANT_UNIT_DIR:-/etc/systemd/system}"
+NSPAWN_DIR="${OMARCHY_TENANT_NSPAWN_DIR:-/etc/systemd/nspawn}"
+RUN_DIR="${OMARCHY_TENANT_RUN_DIR:-/run/omarchy-tenant}"
+SYSCTL_DIR="${OMARCHY_TENANT_SYSCTL_DIR:-/etc/sysctl.d}"
+PROC_DIR="${OMARCHY_TENANT_PROC:-/proc}"
+DEV_DIR="${OMARCHY_TENANT_DEV:-/dev}"
+SYS_DIR="${OMARCHY_TENANT_SYSFS:-/sys}"
+HOST_RESOLV="${OMARCHY_TENANT_HOST_RESOLV:-/etc/resolv.conf}"
+WAIT_SECS="${OMARCHY_TENANT_WAIT_SECS:-30}"
+[[ "$WAIT_SECS" =~ ^[0-9]{1,4}$ ]] || WAIT_SECS=30
+
+readonly NSPAWN_BIN=/usr/bin/systemd-nspawn
+readonly SELF_BIN=/usr/bin/omarchy-tenant
+readonly DEFAULT_ROOT=/var/lib/omarchy/tenants
+readonly DEFAULT_DNS="1.1.1.1,9.9.9.9"
+readonly IPDENY="0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4 ::1/128 fc00::/7 fe80::/10 ff00::/8"
+readonly IOURING_FILTER="~io_uring_setup io_uring_enter io_uring_register"
+readonly NAME_RE='^[a-z][a-z0-9-]{0,30}$'
+readonly TS_AUTHKEY_PATH=/run/omarchy-tenant/ts-authkey
+
+OT_DRY_RUN=0
+OT_YES=0
+OT_JSON=0
+OT_ROOT_ARG="$DEFAULT_ROOT"
+OT_ROOT=""
+OT_SHIFT=1
+OT_MOUNTED=""
+OT_DATA=""
+OT_TMPDIRS=()
+OT_ARGV=()
+OT_SC_MISSING=()
+OT_SC_DRIFT=()
+OT_SC_LEAKS=()
+# Loaded tenant.conf values
+C_NAME="" C_STATE="" C_SIZE="" C_MEM="" C_CPUS="" C_TASKS="" C_DNS="" C_SRC=""
+
+# -----------------------------------------------------------------------------
+# Probe run inside a tenant by the isolation self-check (POSIX sh). Arguments
+# are "host port" pairs that must NOT be reachable from the tenant.
+# -----------------------------------------------------------------------------
+# shellcheck disable=SC2016
+readonly OT_PROBE='
+for p in /mnt/c /mnt/wsl /usr/lib/wsl /run/WSL /dev/dxg /init; do
+  if [ -e "$p" ] || [ -L "$p" ]; then echo "leak:path:$p"; else echo "ok:path:$p"; fi
+done
+if command -v bash >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+  while [ "$#" -ge 2 ]; do
+    if timeout 3 bash -c '\''exec 3<>"/dev/tcp/$0/$1"'\'' "$1" "$2" 2>/dev/null; then
+      echo "leak:net:$1:$2"
+    else
+      echo "ok:net:$1:$2"
+    fi
+    shift 2
+  done
+else
+  echo "warn:net:no-bash-or-timeout"
+fi
+echo "done:probe"
+'
+
+# -----------------------------------------------------------------------------
+# Usage
+# -----------------------------------------------------------------------------
+_ot_usage() {
+  cat <<'EOF'
+Usage: omarchy-tenant [global options] <command> [args]
+
+Isolated guests (systemd-nspawn + slirp4netns + userspace tailscaled) inside
+one Omarchy WSL distro. See docs/MULTI-TENANT-ISOLATION.md.
+
+Commands:
+  create <name> [--size 20G] [--mem 4G] [--cpus 2] [--tasks 512]
+                [--bootstrap | --image TAR] [--key FILE | --key-stdin]
+                [--dns IP[,IP,IP]] [--allow-overcommit] [--no-start]
+                [--harden-host-io-uring]
+  key <name> add FILE|-          add public keys (private keys, option-prefixed
+                                 lines and RSA < 3072 bits are refused)
+  key <name> list [--json]
+  key <name> remove SHA256:FPR
+  auth-url <name> [--timeout 60] [--authkey-file FILE | --authkey-stdin]
+                                 print the tailnet login URL, or log in with an
+                                 auth key read from a file or stdin (never argv)
+  status [<name>] [--json]
+  list [--json]
+  start <name> | stop <name>
+  destroy <name> [--keep-data] [--yes]
+  doctor [--tenant NAME]
+
+Global options (also accepted after the command):
+  -n, --dry-run    print rendered files and commands; change nothing
+  -y, --yes        confirm destructive actions (destroy)
+      --json       machine-readable output (status, list, key list)
+  -q, --quiet      only warnings and errors on stderr
+      --root DIR   tenant state directory (default /var/lib/omarchy/tenants)
+  -h, --help       show this help
+      --version    print the version
+
+Exit codes: 0 ok, 1 failure, 2 usage, 3 precondition (not root, missing host
+commands, invalid or colliding name, not enough disk, no --yes), 4 isolation
+self-check failed (tenant stopped), 5 tenant or key not found, 75 busy.
+EOF
+}
+
+_ot_usage_error() {
+  omw_err "$*"
+  _ot_usage >&2
+  exit "$EX_USAGE"
+}
+
+# -----------------------------------------------------------------------------
+# Cleanup & signals: EXIT keeps $?, signals exit 128+n.
+# -----------------------------------------------------------------------------
+_ot_cleanup() {
+  if [[ -n "$OT_MOUNTED" ]]; then
+    umount "$OT_MOUNTED" 2>/dev/null || umount -l "$OT_MOUNTED" 2>/dev/null || true
+    OT_MOUNTED=""
+  fi
+  omw_cleanup_tmp
+  local d f
+  for d in ${OT_TMPDIRS[@]+"${OT_TMPDIRS[@]}"}; do
+    [[ -d "$d" && ! -L "$d" ]] || continue
+    for f in "$d"/* "$d"/.[!.]*; do
+      [[ -e "$f" || -L "$f" ]] && rm -f -- "$f"
+    done
+    rmdir -- "$d" 2>/dev/null || true
+  done
+  OT_TMPDIRS=()
+}
+
+_ot_on_exit() {
+  local rc=$?
+  _ot_cleanup
+  exit "$rc"
+}
+
+_ot_on_signal() {
+  trap - EXIT
+  _ot_cleanup
+  omw_err "Interrupted by SIG$1. Completed steps are journaled; re-run the same command to resume."
+  exit $((128 + $2))
+}
+
+trap _ot_on_exit EXIT
+trap '_ot_on_signal INT 2' INT
+trap '_ot_on_signal TERM 15' TERM
+trap '_ot_on_signal HUP 1' HUP
+
+# -----------------------------------------------------------------------------
+# Command execution: everything that changes state goes through _ot_run.
+# -----------------------------------------------------------------------------
+_ot_quote() {
+  local q
+  printf -v q '%q ' "$@"
+  REPLY="${q% }"
+}
+
+_ot_debug() {
+  [[ -n "${OMARCHY_TENANT_DEBUG:-}" ]] && omw_log "debug: $*"
+  return 0
+}
+
+_ot_run() {
+  _ot_quote "$@"
+  if (( OT_DRY_RUN )); then
+    _omw_redact "$REPLY"
+    printf '[dry-run] %s\n' "$REPLY"
+    return 0
+  fi
+  _ot_debug "run: $REPLY"
+  "$@"
+}
+
+# Like _ot_run, but the command reads stdin (consumed and discarded in dry-run).
+_ot_run_in() {
+  if (( OT_DRY_RUN )); then
+    cat >/dev/null
+    _ot_quote "$@"
+    _omw_redact "$REPLY"
+    printf '[dry-run] %s < (stdin)\n' "$REPLY"
+    return 0
+  fi
+  _ot_quote "$@"
+  _ot_debug "run: $REPLY < (stdin)"
+  "$@"
+}
+
+# _ot_write <dest> <mode> [show] < content
+_ot_write() {
+  local dest="$1" mode="$2" show="${3:-}"
+  if (( OT_DRY_RUN )); then
+    if [[ -n "$show" ]]; then
+      printf '# ---- BEGIN %s (%s) ----\n' "$dest" "$mode"
+      cat
+      printf '# ---- END %s ----\n' "$dest"
+    else
+      cat >/dev/null
+      printf '[dry-run] write %s (%s)\n' "$dest" "$mode"
+    fi
+    return 0
+  fi
+  _ot_debug "write $dest ($mode)"
+  omw_atomic_write "$dest" "$mode" "root:root"
+}
+
+_ot_mktempdir() {
+  local d
+  d="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-tenant.XXXXXX")" || omw_fail "$EX_FAIL" "cannot create a temporary directory"
+  chmod 0700 "$d"
+  OT_TMPDIRS+=("$d")
+  REPLY="$d"
+}
+
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
+_ot_shown() {
+  printf -v REPLY '%q' "$1"
+  _omw_redact "$REPLY"
+}
+
+_ot_need_val() {
+  [[ $# -ge 2 && -n "$2" ]] || _ot_usage_error "$1 requires a value"
+}
+
+# Global flags, accepted before and after the command. Sets OT_SHIFT.
+_ot_common_flag() {
+  OT_SHIFT=1
+  case "$1" in
+    -n|--dry-run) OT_DRY_RUN=1 ;;
+    -y|--yes) OT_YES=1 ;;
+    --json) OT_JSON=1 ;;
+    -q|--quiet) OMW_QUIET=1 ;;
+    --root)
+      [[ $# -ge 2 && -n "$2" ]] || _ot_usage_error "--root requires a value"
+      OT_ROOT_ARG="$2"
+      OT_SHIFT=2
+      ;;
+    --root=*) OT_ROOT_ARG="${1#--root=}" ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# Auth keys are never accepted on the command line, whatever the command.
+_ot_reject_secret_args() {
+  local a
+  for a in "$@"; do
+    if [[ "$a" == *tskey-* ]]; then
+      _omw_redact "$a"
+      omw_err "Refusing a Tailscale auth key on the command line ($REPLY): argv is visible to every local user."
+      omw_err "Use: omarchy-tenant auth-url <name> --authkey-file FILE   (or --authkey-stdin)"
+      exit "$EX_USAGE"
+    fi
+  done
+}
+
+_ot_euid() {
+  REPLY="${OMARCHY_TENANT_EUID:-${EUID:-$(id -u)}}"
+}
+
+_ot_require_root() {
+  (( OT_DRY_RUN )) && return 0
+  [[ "${OMARCHY_ALLOW_NONROOT:-}" == 1 ]] && return 0
+  _ot_euid
+  [[ "$REPLY" == 0 ]] && return 0
+  _ot_quote ${OT_ARGV[@]+"${OT_ARGV[@]}"}
+  local args="$REPLY"
+  omw_err "omarchy-tenant must run as root."
+  omw_err "  inside the distro:  sudo omarchy-tenant $args"
+  omw_err "  from Windows:       wsl.exe -d ${WSL_DISTRO_NAME:-Omarchy} -u root -- omarchy-tenant $args"
+  exit "$EX_PRECOND"
+}
+
+_ot_pkg_for() {
+  case "$1" in
+    systemd-nspawn|machinectl|systemctl|systemd-run) REPLY="systemd" ;;
+    slirp4netns) REPLY="slirp4netns" ;;
+    mkfs.ext4) REPLY="e2fsprogs" ;;
+    truncate|du|df) REPLY="coreutils" ;;
+    mount|umount|mountpoint|findmnt|flock|setsid) REPLY="util-linux" ;;
+    ssh-keygen) REPLY="openssh" ;;
+    pacstrap) REPLY="arch-install-scripts" ;;
+    tar) REPLY="tar" ;;
+    *) REPLY="?" ;;
+  esac
+}
+
+_ot_require_deps() {
+  local c missing=()
+  for c in "$@"; do
+    if ! omw_have "$c"; then
+      _ot_pkg_for "$c"
+      missing+=("$c (package: $REPLY)")
+    fi
+  done
+  (( ${#missing[@]} == 0 )) && return 0
+  local list="" m
+  for m in "${missing[@]}"; do list+="${list:+, }$m"; done
+  if (( OT_DRY_RUN )); then
+    omw_warn "Missing host commands (a real run would stop here): $list"
+    return 0
+  fi
+  omw_err "Missing host commands: $list"
+  exit "$EX_PRECOND"
+}
+
+_ot_now() {
+  local re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+  if [[ -n "${OMARCHY_TENANT_NOW:-}" && "$OMARCHY_TENANT_NOW" =~ $re ]]; then
+    REPLY="$OMARCHY_TENANT_NOW"
+  elif [[ "${SOURCE_DATE_EPOCH:-}" =~ ^[0-9]+$ ]]; then
+    REPLY="$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)"
+  else
+    REPLY="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
+}
+
+# _ot_size_bytes 20G -> REPLY=bytes (M and G are binary units, like systemd).
+_ot_size_bytes() {
+  local re='^([1-9][0-9]{0,6})([MG])$'
+  [[ "$1" =~ $re ]] || return 1
+  case "${BASH_REMATCH[2]}" in
+    M) REPLY=$(( BASH_REMATCH[1] * 1048576 )) ;;
+    G) REPLY=$(( BASH_REMATCH[1] * 1073741824 )) ;;
+  esac
+}
+
+_ot_human() {
+  local b="$1"
+  if (( b >= 1073741824 )); then
+    REPLY="$(( b / 1073741824 ))G"
+  elif (( b >= 1048576 )); then
+    REPLY="$(( b / 1048576 ))M"
+  else
+    REPLY="${b}B"
+  fi
+}
+
+# IPv4 resolvers reachable through slirp4netns (public unicast only).
+_ot_valid_dns() {
+  local list="$1" ip a b c d n=0
+  local re='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+  local -a ips=()
+  IFS=, read -r -a ips <<<"$list"
+  (( ${#ips[@]} >= 1 && ${#ips[@]} <= 3 )) || { REPLY="1 to 3 comma-separated IPv4 addresses"; return 1; }
+  for ip in "${ips[@]}"; do
+    n=$((n + 1))
+    [[ "$ip" =~ $re ]] || { REPLY="'$ip' is not an IPv4 address"; return 1; }
+    a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]})) c=$((10#${BASH_REMATCH[3]})) d=$((10#${BASH_REMATCH[4]}))
+    (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || { REPLY="'$ip' is not an IPv4 address"; return 1; }
+    if (( a == 0 || a == 10 || a == 127 || a >= 224 )) ||
+       (( a == 100 && b >= 64 && b <= 127 )) || (( a == 169 && b == 254 )) ||
+       (( a == 172 && b >= 16 && b <= 31 )) || (( a == 192 && b == 0 && c == 0 )) ||
+       (( a == 192 && b == 168 )) || (( a == 198 && (b == 18 || b == 19) )); then
+      REPLY="'$ip' is in a range tenants cannot reach by design (see IPAddressDeny)"
+      return 1
+    fi
+  done
+  return 0
+}
+
+_ot_json_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  s="${s//[$'\001'-$'\037']/}"
+  REPLY="\"${s}\""
+}
+
+# -----------------------------------------------------------------------------
+# Names, state root, tenant directories
+# -----------------------------------------------------------------------------
+_ot_name_syntax() {
+  if ! [[ "$1" =~ $NAME_RE ]]; then
+    REPLY="names must match ^[a-z][a-z0-9-]{0,30}\$ (a lowercase letter first; letters, digits and '-'; at most 31 characters)"
+    return 1
+  fi
+  if [[ "$1" == *- ]]; then
+    REPLY="names must not end with '-'"
+    return 1
+  fi
+  return 0
+}
+
+# A name for a NEW tenant: syntax, reserved words, host user/group collisions.
+_ot_name_new_ok() {
+  _ot_name_syntax "$1" || return 1
+  case "$1" in
+    root|host|localhost|omarchy|machines|all|list|default|none|self|tenant|tenants)
+      REPLY="'$1' is reserved"
+      return 1 ;;
+  esac
+  if getent passwd "$1" >/dev/null 2>&1 || getent group "$1" >/dev/null 2>&1; then
+    REPLY="'$1' collides with a user or group on the host"
+    return 1
+  fi
+  return 0
+}
+
+_ot_require_name() {
+  _ot_name_syntax "$1" && return 0
+  local why="$REPLY"
+  _ot_shown "$1"
+  omw_fail "$EX_PRECOND" "Invalid tenant name ${REPLY}: ${why}"
+}
+
+# Pure path checks; no external commands (keeps the idempotent path silent).
+_ot_init_root() {
+  local r="$OT_ROOT_ARG" re='^/[A-Za-z0-9._/-]*$'
+  [[ "$r" == /* ]] || _ot_usage_error "--root must be an absolute path"
+  [[ "$r" =~ $re ]] || _ot_usage_error "--root may only contain letters, digits and . _ / -"
+  r="$(realpath -m -- "$r")"
+  case "$r" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib|/var/tmp)
+      omw_fail "$EX_PRECOND" "Refusing --root $r: a system directory." ;;
+    /mnt/[a-z]|/mnt/[a-z]/*|/mnt/wsl|/mnt/wsl/*|/usr/lib/wsl|/usr/lib/wsl/*|/run/WSL|/run/WSL/*)
+      omw_fail "$EX_PRECOND" "Refusing --root $r: a Windows/WSL-managed path." ;;
+  esac
+  OT_ROOT="$r"
+}
+
+_ot_nearest_existing() {
+  local p="$1"
+  while [[ ! -e "$p" && "$p" != "/" ]]; do
+    p="$(dirname -- "$p")"
+  done
+  REPLY="$p"
+}
+
+# The tenant root must live on the distro's own ext4 disk, not on DrvFs.
+_ot_check_root_fs() {
+  omw_have findmnt || return 0
+  local fstype
+  _ot_nearest_existing "$OT_ROOT"
+  fstype="$(findmnt -no FSTYPE -T "$REPLY" 2>/dev/null | head -n 1 || true)"
+  case "$fstype" in
+    9p|v9fs|drvfs|virtiofs|fuse*|cifs|smb3|nfs*)
+      omw_fail "$EX_PRECOND" "Refusing --root $OT_ROOT on a $fstype filesystem (Windows- or network-backed); use the distro's own disk." ;;
+  esac
+}
+
+# The tenant directory must be a real directory exactly at <root>/<name>.
+_ot_safe_tenant_dir() {
+  local dir="$1" name="$2" real rroot
+  [[ -L "$dir" ]] && omw_fail "$EX_PRECOND" "Refusing: $dir is a symlink (it may point outside $OT_ROOT)."
+  [[ -d "$dir" ]] || omw_fail "$EX_PRECOND" "Refusing: $dir is not a directory."
+  rroot="$(realpath -e -- "$OT_ROOT")" || omw_fail "$EX_PRECOND" "Cannot resolve $OT_ROOT."
+  real="$(realpath -e -- "$dir")" || omw_fail "$EX_PRECOND" "Cannot resolve $dir."
+  [[ "$real" == "$rroot/$name" ]] || omw_fail "$EX_PRECOND" "Refusing: $dir resolves to $real, outside $rroot."
+}
+
+# Existing tenant: directory present and tenant.conf readable, else exit 5.
+_ot_require_tenant() {
+  local name="$1" dir="$OT_ROOT/$1"
+  [[ -e "$dir" || -L "$dir" ]] || omw_fail "$EX_NOTFOUND" "No tenant named '$name' under $OT_ROOT."
+  _ot_safe_tenant_dir "$dir" "$name"
+  [[ -f "$dir/tenant.conf" ]] || omw_fail "$EX_PRECOND" "$dir is not a tenant (no tenant.conf)."
+  _ot_load_conf "$dir/tenant.conf"
+  [[ "$C_NAME" == "$name" ]] || omw_fail "$EX_FAIL" "$dir/tenant.conf belongs to '$C_NAME', not '$name'."
+}
+
+_ot_lock() {
+  (( OT_DRY_RUN )) && return 0
+  local rc=0
+  if [[ ! -d "$OT_ROOT/.locks" ]]; then
+    [[ -d "$OT_ROOT" ]] || mkdir -p -- "$OT_ROOT" || omw_fail "$EX_FAIL" "cannot create $OT_ROOT"
+    mkdir -m 0700 -- "$OT_ROOT/.locks" || omw_fail "$EX_FAIL" "cannot create $OT_ROOT/.locks"
+  fi
+  omw_lock_acquire "$OT_ROOT/.locks/$1.lock" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    75) omw_fail "$EX_BUSY" "Tenant '$1' is busy: another omarchy-tenant command holds its lock." ;;
+    *) omw_fail "$EX_FAIL" "Cannot lock tenant '$1'." ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# tenant.conf (key=value, whitelist reader, never sourced)
+# -----------------------------------------------------------------------------
+_ot_conf_key() {
+  local file="$1" key="$2" re="$3" v
+  v="$(omw_kv_get "$file" "$key" 2>/dev/null)" || omw_fail "$EX_FAIL" "Corrupt $file: '$key' is missing."
+  [[ "$v" =~ $re ]] || omw_fail "$EX_FAIL" "Corrupt $file: '$key' has an invalid value."
+  REPLY="$v"
+}
+
+_ot_load_conf() {
+  local f="$1"
+  _ot_conf_key "$f" version '^1$'
+  _ot_conf_key "$f" name "$NAME_RE"; C_NAME="$REPLY"
+  _ot_conf_key "$f" state '^(creating|ready|detached)$'; C_STATE="$REPLY"
+  _ot_conf_key "$f" size '^[1-9][0-9]{0,6}[MG]$'; C_SIZE="$REPLY"
+  _ot_conf_key "$f" mem '^[1-9][0-9]{0,6}[MG]$'; C_MEM="$REPLY"
+  _ot_conf_key "$f" cpus '^[1-9][0-9]{0,2}$'; C_CPUS="$REPLY"
+  _ot_conf_key "$f" tasks '^[1-9][0-9]{1,4}$'; C_TASKS="$REPLY"
+  _ot_conf_key "$f" dns '^[0-9.,]{7,47}$'; C_DNS="$REPLY"
+  _ot_conf_key "$f" image_source '^(bootstrap|tarball)$'; C_SRC="$REPLY"
+  _ot_conf_key "$f" created_at '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+}
+
+_ot_render_conf() {
+  # name size mem cpus tasks dns image_source created_at state
+  cat <<EOF
+# omarchy-tenant state for tenant "$1" (key=value; parsed, never sourced).
+# Managed by omarchy-tenant: change settings with destroy + create.
+version=1
+name=$1
+state=$9
+size=$2
+mem=$3
+cpus=$4
+tasks=$5
+dns=$6
+image_source=$7
+created_at=$8
+EOF
+}
+
+_ot_set_state() {
+  local conf="$1" state="$2"
+  if (( OT_DRY_RUN )); then
+    printf '[dry-run] set state=%s in %s\n' "$state" "$conf"
+    return 0
+  fi
+  omw_kv_set "$conf" state "$state" 0600 "root:root"
+}
+
+# -----------------------------------------------------------------------------
+# Rendered host files (golden-tested: tests/fixtures/tenant/)
+# -----------------------------------------------------------------------------
+_ot_unit_name() { REPLY="omarchy-tenant-$1.service"; }
+
+_ot_render_unit() {
+  local name="$1" mem="$2" cpus="$3" tasks="$4"
+  cat <<EOF
+# Generated by omarchy-tenant ${OT_VERSION} for tenant "${name}". Do not edit:
+# \`omarchy-tenant create ${name}\` re-renders it and the isolation self-check
+# reports drift. Policy and threat model: MULTI-TENANT-ISOLATION.md
+[Unit]
+Description=Omarchy isolated tenant ${name}
+Documentation=man:systemd-nspawn(1) man:systemd.nspawn(5)
+Wants=modprobe@tun.service modprobe@loop.service
+After=network.target modprobe@tun.service modprobe@loop.service
+PartOf=machines.target
+Before=machines.target
+RequiresMountsFor=${OT_ROOT}/${name}
+
+[Service]
+Type=notify
+ExecStart=${NSPAWN_BIN} --quiet --keep-unit --register=yes --boot --link-journal=no --settings=override --machine=${name} --image=${OT_ROOT}/${name}/disk.raw
+ExecStartPost=${SELF_BIN} _net-up ${name}
+KillMode=mixed
+RestartForceExitStatus=133
+SuccessExitStatus=133
+Slice=machine.slice
+Delegate=yes
+DelegateSubgroup=supervisor
+TasksMax=${tasks}
+MemoryMax=${mem}
+MemorySwapMax=0
+CPUQuota=$(( cpus * 100 ))%
+IOWeight=50
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rwm
+DeviceAllow=char-pts rw
+DeviceAllow=/dev/loop-control rw
+DeviceAllow=block-loop rw
+DeviceAllow=block-blkext rw
+IPAddressDeny=${IPDENY}
+RestrictAddressFamilies=~AF_VSOCK
+SystemCallFilter=${IOURING_FILTER}
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+_ot_render_nspawn() {
+  local name="$1"
+  cat <<EOF
+# Generated by omarchy-tenant ${OT_VERSION} for tenant "${name}". Do not edit:
+# the isolation self-check rejects Bind=, Overlay= or shared networking here.
+# Policy and threat model: MULTI-TENANT-ISOLATION.md
+[Exec]
+Boot=yes
+PrivateUsers=pick
+NoNewPrivileges=yes
+Hostname=${name}
+ResolvConf=off
+Timezone=off
+LinkJournal=no
+DropCapability=CAP_NET_RAW CAP_MKNOD CAP_SYS_PTRACE
+SystemCallFilter=${IOURING_FILTER}
+
+[Files]
+PrivateUsersOwnership=auto
+
+[Network]
+Private=yes
+VirtualEthernet=no
+EOF
+}
+
+# Lines the self-check requires verbatim (any tenant).
+_ot_required_unit_lines() {
+  local name="$1"
+  printf '%s\n' \
+    "ExecStart=${NSPAWN_BIN} --quiet --keep-unit --register=yes --boot --link-journal=no --settings=override --machine=${name} --image=${OT_ROOT}/${name}/disk.raw" \
+    "ExecStartPost=${SELF_BIN} _net-up ${name}" \
+    "KillMode=mixed" "Delegate=yes" "MemorySwapMax=0" "DevicePolicy=closed" \
+    "IPAddressDeny=${IPDENY}" "RestrictAddressFamilies=~AF_VSOCK" \
+    "SystemCallFilter=${IOURING_FILTER}" "SystemCallErrorNumber=EPERM"
+}
+
+_ot_required_nspawn_lines() {
+  printf '%s\n' "PrivateUsers=pick" "NoNewPrivileges=yes" "ResolvConf=off" "LinkJournal=no" \
+    "SystemCallFilter=${IOURING_FILTER}" "Private=yes" "VirtualEthernet=no"
+}
+
+_ot_render_resolv() {
+  local dns="$1" ip
+  local -a ips=()
+  IFS=, read -r -a ips <<<"$dns"
+  printf '%s\n' "# Generated by omarchy-tenant. slirp4netns runs with --disable-dns, so the" \
+    "# tenant asks these public resolvers directly and their operators see its" \
+    "# queries. Chosen at creation time (omarchy-tenant create --dns IP[,IP])."
+  for ip in "${ips[@]}"; do
+    printf 'nameserver %s\n' "$ip"
+  done
+}
+
+_ot_units_current() {
+  # name mem cpus tasks
+  local u n
+  _ot_unit_name "$1"
+  u="$UNIT_DIR/$REPLY"
+  n="$NSPAWN_DIR/$1.nspawn"
+  [[ -f "$u" && -f "$n" ]] || return 1
+  [[ "$(<"$u")" == "$(_ot_render_unit "$@")" ]] || return 1
+  [[ "$(<"$n")" == "$(_ot_render_nspawn "$1")" ]] || return 1
+}
+
+_ot_write_units() {
+  # name mem cpus tasks
+  local unit
+  _ot_unit_name "$1"
+  unit="$REPLY"
+  _ot_run mkdir -p -- "$UNIT_DIR" "$NSPAWN_DIR"
+  _ot_render_unit "$@" | _ot_write "$UNIT_DIR/$unit" 0644 show
+  _ot_render_nspawn "$1" | _ot_write "$NSPAWN_DIR/$1.nspawn" 0644 show
+}
+
+# -----------------------------------------------------------------------------
+# In-tenant files (templates under /usr/share/omarchy-wsl/tenant)
+# -----------------------------------------------------------------------------
+_ot_find_data() {
+  local d
+  for d in "${OMARCHY_TENANT_DATA_DIR:-}" "${_self%/*}/../wsl/tenant" /usr/share/omarchy-wsl/tenant; do
+    if [[ -n "$d" && -r "$d/sshd_config" && -r "$d/tailscaled.conf" && -r "$d/sysusers.conf" && -r "$d/tmpfiles.conf" ]]; then
+      OT_DATA="$d"
+      return 0
+    fi
+  done
+  omw_fail "$EX_PRECOND" "Tenant templates not found (looked in \$OMARCHY_TENANT_DATA_DIR, ${_self%/*}/../wsl/tenant and /usr/share/omarchy-wsl/tenant)."
+}
+
+_ot_template() {
+  local content
+  content="$(<"$OT_DATA/$1")"
+  printf '%s\n' "${content//@TENANT@/$2}"
+}
+
+# True when no existing component of <base>/<rel> is a symlink. Image content
+# (an --image tarball) must never redirect our writes onto the host.
+_ot_no_symlinks() {
+  local cur="$1" rel="$2" part
+  local -a parts=()
+  [[ "$rel" == "." || -z "$rel" ]] && return 0
+  IFS=/ read -r -a parts <<<"$rel"
+  for part in "${parts[@]}"; do
+    [[ -z "$part" ]] && continue
+    cur="$cur/$part"
+    [[ -L "$cur" ]] && return 1
+  done
+  return 0
+}
+
+# _ot_put <mnt> <relative path> <mode> < content
+_ot_put() {
+  local mnt="$1" rel="$2" mode="$3" dest="$1/$2" parent
+  parent="$(dirname -- "$rel")"
+  if (( ! OT_DRY_RUN )) && ! _ot_no_symlinks "$mnt" "$parent"; then
+    cat >/dev/null
+    omw_fail "$EX_FAIL" "Refusing to write /$rel: a parent directory inside the image is a symlink."
+  fi
+  _ot_run mkdir -p -- "$mnt/$parent"
+  if (( ! OT_DRY_RUN )); then
+    [[ -L "$dest" ]] && rm -f -- "$dest"
+    if [[ -d "$dest" ]]; then
+      cat >/dev/null
+      omw_fail "$EX_FAIL" "Refusing to write /$rel: it is a directory inside the image."
+    fi
+  fi
+  _ot_write "$dest" "$mode"
+}
+
+_ot_tenant_files() {
+  local mnt="$1" name="$2" dns="$3" keys="$4"
+  _ot_template sshd_config "$name" | _ot_put "$mnt" etc/ssh/sshd_config 0644
+  _ot_template tailscaled.conf "$name" | _ot_put "$mnt" etc/systemd/system/tailscaled.service.d/10-omarchy-tenant.conf 0644
+  _ot_template sysusers.conf "$name" | _ot_put "$mnt" etc/sysusers.d/omarchy-tenant.conf 0644
+  _ot_template tmpfiles.conf "$name" | _ot_put "$mnt" etc/tmpfiles.d/omarchy-tenant.conf 0644
+  printf '%s\n' "$name" | _ot_put "$mnt" etc/hostname 0644
+  _ot_render_resolv "$dns" | _ot_put "$mnt" etc/resolv.conf 0644
+  if [[ -f "$keys" ]]; then
+    _ot_put "$mnt" etc/omarchy-tenant/authorized_keys 0644 <"$keys"
+  else
+    _ot_put "$mnt" etc/omarchy-tenant/authorized_keys 0644 </dev/null
+  fi
+}
+
+_ot_mount() {
+  local disk="$1" mnt="$2" name="$3"
+  _ot_run mkdir -p -m 0700 -- "$RUN_DIR" "$RUN_DIR/$name" "$mnt"
+  _ot_run mount -o loop,nosuid,nodev "$disk" "$mnt"
+  (( OT_DRY_RUN )) && return 0
+  OT_MOUNTED="$mnt"
+  mountpoint -q "$mnt" || omw_fail "$EX_FAIL" "$disk did not mount on $mnt."
+}
+
+_ot_umount() {
+  local mnt="$1"
+  _ot_run umount "$mnt"
+  OT_MOUNTED=""
+  (( OT_DRY_RUN )) || rmdir -- "$mnt" 2>/dev/null || true
+}
+
+# -----------------------------------------------------------------------------
+# Running tenants
+# -----------------------------------------------------------------------------
+_ot_unit_state() {
+  local s
+  _ot_unit_name "$1"
+  s="$(systemctl is-active "$REPLY" 2>/dev/null || true)"
+  REPLY="${s%%$'\n'*}"
+}
+
+_ot_is_running() {
+  _ot_unit_state "$1"
+  [[ "$REPLY" == active || "$REPLY" == activating || "$REPLY" == reloading ]]
+}
+
+_ot_leader() {
+  local l
+  l="$(machinectl show "$1" -p Leader --value 2>/dev/null | head -n 1 || true)"
+  [[ "$l" =~ ^[1-9][0-9]*$ ]] || return 1
+  REPLY="$l"
+}
+
+_ot_wait_container() {
+  local name="$1" i tries=$(( WAIT_SECS * 2 ))
+  for (( i = 0; i <= tries; i++ )); do
+    if systemd-run "--machine=$name" --quiet --wait --pipe --collect -- /bin/true </dev/null >/dev/null 2>&1; then
+      return 0
+    fi
+    (( i < tries )) && sleep 0.5
+  done
+  return 1
+}
+
+# "host port" pairs the tenant must not reach: slirp's host alias, the cloud
+# metadata address, and the WSL host's resolvers and default gateway (which
+# do have listeners, so a block there proves the policy).
+_ot_probe_targets() {
+  local -a t=(10.0.2.2 22 10.0.2.2 80 169.254.169.254 80)
+  local ns gw line dest gwhex re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+  if [[ -r "$HOST_RESOLV" ]]; then
+    while read -r line ns _; do
+      [[ "$line" == nameserver && "$ns" =~ $re ]] && t+=("$ns" 53)
+    done <"$HOST_RESOLV"
+  fi
+  if [[ -r "$PROC_DIR/net/route" ]]; then
+    while read -r _ dest gwhex _; do
+      [[ "$dest" == 00000000 && "$gwhex" =~ ^[0-9A-Fa-f]{8}$ && "$gwhex" != 00000000 ]] || continue
+      gw="$((16#${gwhex:6:2})).$((16#${gwhex:4:2})).$((16#${gwhex:2:2})).$((16#${gwhex:0:2}))"
+      t+=("$gw" 53)
+      break
+    done < <(tail -n +2 "$PROC_DIR/net/route")
+  fi
+  OT_TARGETS=("${t[@]}")
+}
+OT_TARGETS=()
+
+# Static policy: required lines present, nothing forbidden, no drift.
+_ot_policy_check() {
+  local name="$1" u n line
+  _ot_unit_name "$name"
+  u="$UNIT_DIR/$REPLY"
+  n="$NSPAWN_DIR/$name.nspawn"
+  if [[ ! -f "$u" ]]; then
+    OT_SC_MISSING+=("unit:file-missing")
+  else
+    while IFS= read -r line; do
+      grep -qxF -- "$line" "$u" || OT_SC_MISSING+=("unit:$line")
+    done < <(_ot_required_unit_lines "$name")
+    [[ "$(<"$u")" == "$(_ot_render_unit "$name" "$C_MEM" "$C_CPUS" "$C_TASKS")" ]] || OT_SC_DRIFT+=("unit:content-differs")
+  fi
+  if [[ ! -f "$n" ]]; then
+    OT_SC_MISSING+=("nspawn:file-missing")
+  else
+    while IFS= read -r line; do
+      grep -qxF -- "$line" "$n" || OT_SC_MISSING+=("nspawn:$line")
+    done < <(_ot_required_nspawn_lines)
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && OT_SC_MISSING+=("nspawn:forbidden:$line")
+    done < <(grep -E '^[[:space:]]*(Bind|BindReadOnly|BindUser|Overlay|OverlayReadOnly|Interface|MACVLAN|IPVLAN|Bridge|Zone|Port|VirtualEthernetExtra)[[:space:]]*=' "$n" || true)
+    [[ "$(<"$n")" == "$(_ot_render_nspawn "$name")" ]] || OT_SC_DRIFT+=("nspawn:content-differs")
+  fi
+}
+
+# Live checks against the running container (host /proc + in-tenant probe).
+_ot_live_check() {
+  local name="$1" leader proc map out line a b
+  if ! _ot_leader "$name"; then
+    OT_SC_LEAKS+=("live:no-leader")
+    return 0
+  fi
+  leader="$REPLY"
+  proc="$PROC_DIR/$leader"
+  map="$(head -n 1 "$proc/uid_map" 2>/dev/null || true)"
+  read -r a b _ <<<"$map"
+  [[ -n "$map" && "${a:-}" == 0 && "${b:-0}" != 0 ]] || OT_SC_LEAKS+=("userns:not-private")
+  grep -qE '^Seccomp:[[:space:]]+2' "$proc/status" 2>/dev/null || OT_SC_LEAKS+=("seccomp:not-active")
+  grep -qE '^NoNewPrivs:[[:space:]]+1' "$proc/status" 2>/dev/null || OT_SC_LEAKS+=("no-new-privs:off")
+  a="$(readlink "$proc/ns/net" 2>/dev/null || true)"
+  b="$(readlink /proc/self/ns/net 2>/dev/null || true)"
+  [[ -n "$a" && "$a" != "$b" ]] || OT_SC_LEAKS+=("netns:shared-with-host")
+  if ! _ot_wait_container "$name"; then
+    OT_SC_LEAKS+=("live:container-unreachable")
+    return 0
+  fi
+  _ot_probe_targets
+  out="$(systemd-run "--machine=$name" --quiet --wait --pipe --collect -- /bin/sh -c "$OT_PROBE" sh "${OT_TARGETS[@]}" </dev/null 2>/dev/null || true)"
+  if [[ "$out" != *"done:probe"* ]]; then
+    OT_SC_LEAKS+=("live:probe-failed")
+    return 0
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      leak:*) OT_SC_LEAKS+=("${line#leak:}") ;;
+    esac
+  done <<<"$out"
+}
+
+# _ot_selfcheck <name> <live 0|1> -> 0 when isolation holds (drift alone is
+# reported, not fatal). Needs _ot_load_conf first.
+_ot_selfcheck() {
+  OT_SC_MISSING=()
+  OT_SC_DRIFT=()
+  OT_SC_LEAKS=()
+  _ot_policy_check "$1"
+  (( $2 )) && _ot_live_check "$1"
+  (( ${#OT_SC_MISSING[@]} == 0 && ${#OT_SC_LEAKS[@]} == 0 ))
+}
+
+_ot_report_selfcheck() {
+  local i
+  for i in ${OT_SC_MISSING[@]+"${OT_SC_MISSING[@]}"}; do omw_err "policy: $i"; done
+  for i in ${OT_SC_LEAKS[@]+"${OT_SC_LEAKS[@]}"}; do omw_err "isolation: $i"; done
+  for i in ${OT_SC_DRIFT[@]+"${OT_SC_DRIFT[@]}"}; do omw_warn "drift: $i"; done
+  return 0
+}
+
+# Start + verify; any isolation failure stops and disables the tenant (exit 4).
+_ot_start_verified() {
+  local name="$1" unit
+  _ot_unit_name "$name"
+  unit="$REPLY"
+  _ot_run systemctl start "$unit"
+  (( OT_DRY_RUN )) && return 0
+  if ! _ot_selfcheck "$name" 1; then
+    _ot_report_selfcheck
+    systemctl stop "$unit" || true
+    systemctl disable "$unit" || true
+    omw_fail "$EX_ISOLATION" "Isolation self-check FAILED for '$name': tenant stopped and disabled."
+  fi
+  _ot_report_selfcheck
+  omw_log "Isolation self-check passed for '$name'."
+}
+
+# -----------------------------------------------------------------------------
+# SSH public keys (host copy is the source of truth; 0600 root)
+# -----------------------------------------------------------------------------
+readonly KEY_RE='^(ssh-ed25519|sk-ssh-ed25519@openssh\.com|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|sk-ecdsa-sha2-nistp256@openssh\.com|ssh-rsa)[[:space:]]+([A-Za-z0-9+/]+={0,3})([[:space:]]+(.*))?$'
+
+# Bounded read (64 KiB) of FILE or stdin ("-") into <dest>.
+_ot_read_input() {
+  local src="$1" dest="$2"
+  if [[ "$src" == "-" ]]; then
+    head -c 65537 >"$dest"
+  else
+    [[ -f "$src" && -r "$src" ]] || omw_fail "$EX_PRECOND" "Cannot read key file $src."
+    head -c 65537 <"$src" >"$dest"
+  fi
+  (( $(wc -c <"$dest") <= 65536 )) || omw_fail "$EX_USAGE" "Key input is larger than 64 KiB; refusing."
+}
+
+# _ot_fpr_line <one key line> -> REPLY="<bits> <SHA256:fpr> <TYPE>"
+_ot_fpr_line() {
+  local line="$1" tmpf out bits fpr type
+  (( ${#OT_TMPDIRS[@]} )) || omw_fail "$EX_FAIL" "internal: no temporary directory for key checks"
+  tmpf="${OT_TMPDIRS[0]}/one.${BASHPID}.pub"
+  printf '%s\n' "$line" >"$tmpf"
+  out="$(ssh-keygen -l -E sha256 -f "$tmpf" 2>/dev/null | head -n 1)" || { rm -f -- "$tmpf"; return 1; }
+  rm -f -- "$tmpf"
+  bits="${out%% *}"
+  fpr="$(awk '{print $2}' <<<"$out")"
+  type="${out##*(}"
+  type="${type%)}"
+  [[ "$bits" =~ ^[0-9]+$ && "$fpr" =~ ^SHA256:[A-Za-z0-9+/]{43}$ && "$type" =~ ^[A-Z0-9-]+$ ]] || return 1
+  REPLY="$bits $fpr $type"
+}
+
+# Validate <in>, write normalized unique keys to <out>. Exit 2 on bad input.
+_ot_validate_keys() {
+  local in="$1" out="$2" line n=0 count=0 type b64 comment bits fpr seen=" "
+  if grep -qE 'PRIVATE KEY|PuTTY-User-Key-File|BEGIN SSH2 ENCRYPTED' "$in"; then
+    omw_fail "$EX_USAGE" "Refusing private key material: give the PUBLIC key (.pub). Nothing was stored."
+  fi
+  : >"$out"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if ! [[ "$line" =~ $KEY_RE ]]; then
+      omw_fail "$EX_USAGE" "Key line $n is not a plain public key: options (from=, command=, ...) and other key types are refused. Nothing was stored."
+    fi
+    type="${BASH_REMATCH[1]}" b64="${BASH_REMATCH[2]}" comment="${BASH_REMATCH[4]:-}"
+    comment="${comment//[![:print:]]/}"
+    comment="${comment:0:128}"
+    _ot_fpr_line "$type $b64" || omw_fail "$EX_USAGE" "Key line $n is not a valid public key (ssh-keygen rejected it). Nothing was stored."
+    read -r bits fpr _ <<<"$REPLY"
+    if [[ "$type" == ssh-rsa ]] && (( bits < 3072 )); then
+      omw_fail "$EX_USAGE" "Key line $n: RSA keys must have at least 3072 bits (got $bits). Nothing was stored."
+    fi
+    [[ "$seen" == *" $fpr "* ]] && continue
+    seen="$seen$fpr "
+    if [[ -n "$comment" ]]; then
+      printf '%s %s %s\n' "$type" "$b64" "$comment" >>"$out"
+    else
+      printf '%s %s\n' "$type" "$b64" >>"$out"
+    fi
+    count=$((count + 1))
+  done <"$in"
+  (( count > 0 )) || omw_fail "$EX_USAGE" "No public key found in the input."
+}
+
+# Fingerprints of a normalized key file, one "fpr<TAB>bits<TAB>type<TAB>comment" per line.
+_ot_key_table() {
+  local file="$1" line bits fpr ktype rest
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ $KEY_RE ]] || continue
+    rest="${BASH_REMATCH[4]:-}"
+    _ot_fpr_line "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}" || continue
+    read -r bits fpr ktype <<<"$REPLY"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$fpr" "$bits" "$ktype" "$rest" "$line"
+  done <"$file"
+}
+
+# Copy the host key list into the tenant: via stdin when it runs, by mounting
+# its image when it is stopped (detached and half-created tenants are synced
+# when they are re-attached or resumed). Ownership follows the image's /etc so
+# it is right whether nspawn shifted the image (chown) or idmaps it.
+_ot_sync_keys() {
+  local name="$1" dir="$OT_ROOT/$1"
+  # Detached or half-created tenants have no unit: nothing can be running.
+  [[ "$C_STATE" == ready ]] || return 0
+  if _ot_is_running "$name"; then
+    _ot_run_in systemd-run "--machine=$name" --quiet --wait --pipe --collect -- /bin/sh -c \
+      'umask 022; mkdir -p /etc/omarchy-tenant && cat >/etc/omarchy-tenant/authorized_keys.new && mv -f /etc/omarchy-tenant/authorized_keys.new /etc/omarchy-tenant/authorized_keys' \
+      <"$dir/authorized_keys"
+    return 0
+  fi
+  _ot_sync_keys_offline "$name"
+}
+
+# Never call this for a running tenant: the image is mounted by nspawn then.
+_ot_sync_keys_offline() {
+  local name="$1" dir="$OT_ROOT/$1" mnt
+  [[ -f "$dir/disk.raw" && -f "$dir/authorized_keys" ]] || return 0
+  mnt="$RUN_DIR/$name/mnt"
+  _ot_mount "$dir/disk.raw" "$mnt" "$name"
+  _ot_put "$mnt" etc/omarchy-tenant/authorized_keys 0644 <"$dir/authorized_keys"
+  if (( ! OT_DRY_RUN )) && [[ -d "$mnt/etc" ]]; then
+    chown --reference="$mnt/etc" "$mnt/etc/omarchy-tenant" "$mnt/etc/omarchy-tenant/authorized_keys" 2>/dev/null || true
+  fi
+  _ot_umount "$mnt"
+}
+
+# -----------------------------------------------------------------------------
+# Disk preflight: never promise more sparse capacity than the disk can hold.
+# -----------------------------------------------------------------------------
+_ot_preflight() {
+  local new_bytes="$1" allow="$2" base avail reserve=0 d cap alloc need size
+  _ot_nearest_existing "$OT_ROOT"
+  base="$REPLY"
+  avail="$(df -B1 --output=avail -- "$base" 2>/dev/null | tail -n 1 | tr -d '[:space:]' || true)"
+  if ! [[ "$avail" =~ ^[0-9]+$ ]]; then
+    omw_warn "Cannot read free space on $base; skipping the overcommit check."
+    return 0
+  fi
+  for d in "$OT_ROOT"/*/; do
+    [[ -f "${d}tenant.conf" ]] || continue
+    size="$(omw_kv_get "${d}tenant.conf" size 2>/dev/null)" || continue
+    _ot_size_bytes "$size" || continue
+    cap="$REPLY"
+    alloc=0
+    if [[ -f "${d}disk.raw" ]]; then
+      alloc="$(du -B1 -s -- "${d}disk.raw" 2>/dev/null | cut -f 1 || true)"
+      [[ "$alloc" =~ ^[0-9]+$ ]] || alloc=0
+    fi
+    (( cap > alloc )) && reserve=$(( reserve + cap - alloc ))
+  done
+  need=$(( new_bytes + reserve ))
+  (( need <= avail )) && return 0
+  local h_need h_new h_res h_avail
+  _ot_human "$need"; h_need="$REPLY"
+  _ot_human "$new_bytes"; h_new="$REPLY"
+  _ot_human "$reserve"; h_res="$REPLY"
+  _ot_human "$avail"; h_avail="$REPLY"
+  if (( allow )); then
+    omw_warn "Overcommitting disk: tenants may grow to $h_need but only $h_avail is free on $base."
+    return 0
+  fi
+  if (( OT_DRY_RUN )); then
+    omw_warn "Not enough disk (a real run would stop here): need $h_need ($h_new new + $h_res still claimable by existing tenants), $h_avail free on $base."
+    return 0
+  fi
+  omw_fail "$EX_PRECOND" "Not enough disk for the sparse cap: need $h_need ($h_new new + $h_res still claimable by existing tenants), $h_avail free on $base. Use a smaller --size or --allow-overcommit."
+}
+
+_ot_harden_io_uring() {
+  local f="$SYSCTL_DIR/60-omarchy-tenant-io-uring.conf" content
+  content="# Written by 'omarchy-tenant create --harden-host-io-uring' (explicit opt-in).
+# Disables io_uring for EVERY process in this WSL VM, not only tenants (tenants
+# are already denied io_uring by seccomp). Delete this file and run
+# 'wsl --shutdown' from Windows to undo.
+kernel.io_uring_disabled = 2"
+  if [[ -f "$f" && "$(<"$f")" == "$content" ]]; then
+    return 0
+  fi
+  _ot_run mkdir -p -- "$SYSCTL_DIR"
+  printf '%s\n' "$content" | _ot_write "$f" 0644
+  _ot_run sysctl -p "$f"
+}
+
+# -----------------------------------------------------------------------------
+# create
+# -----------------------------------------------------------------------------
+_ot_journal_has() {
+  [[ -f "$1/journal" ]] && grep -qx -- "$2" "$1/journal"
+}
+
+_ot_journal_mark() {
+  (( OT_DRY_RUN )) && return 0
+  printf '%s\n' "$2" >>"$1/journal"
+}
+
+# The journaled creation steps (resumable).
+_ot_create_steps() {
+  local name="$1" mode="$2" image="$3" newkeys="$4" no_start="$5" harden="$6"
+  local dir="$OT_ROOT/$1" disk="$OT_ROOT/$1/disk.raw" mnt="$RUN_DIR/$1/mnt" unit
+  _ot_unit_name "$name"
+  unit="$REPLY"
+
+  if ! _ot_journal_has "$dir" keys; then
+    if [[ -n "$newkeys" ]]; then
+      _ot_write "$dir/authorized_keys" 0600 <"$newkeys"
+    else
+      _ot_write "$dir/authorized_keys" 0600 </dev/null
+    fi
+    _ot_journal_mark "$dir" keys
+  fi
+
+  if ! _ot_journal_has "$dir" disk; then
+    omw_step "Creating the sparse $C_SIZE disk image for '$name'..."
+    _ot_run truncate -s "$C_SIZE" "$disk"
+    _ot_run mkfs.ext4 -q -F -L "${name:0:16}" "$disk"
+    _ot_journal_mark "$dir" disk
+  fi
+
+  if _ot_journal_has "$dir" rootfs; then
+    # Resuming after the root was built: keys may have changed since.
+    _ot_sync_keys_offline "$name"
+  else
+    _ot_mount "$disk" "$mnt" "$name"
+    if [[ "$mode" == image ]]; then
+      omw_step "Extracting $image into the tenant image..."
+      _ot_run tar --numeric-owner -xpf "$image" -C "$mnt"
+    else
+      omw_step "Bootstrapping the tenant root (base, openssh, tailscale)..."
+      _ot_run pacstrap -c -K "$mnt" base openssh tailscale
+    fi
+    if (( ! OT_DRY_RUN )); then
+      [[ -e "$mnt/usr/bin/tailscaled" && ( -e "$mnt/usr/bin/sshd" || -e "$mnt/usr/sbin/sshd" ) ]] ||
+        omw_fail "$EX_FAIL" "The tenant root has no tailscaled/sshd: install tailscale and openssh in it (the --image tarball must contain them)."
+    fi
+    _ot_tenant_files "$mnt" "$name" "$C_DNS" "$dir/authorized_keys"
+    _ot_run systemctl "--root=$mnt" enable sshd.service tailscaled.service
+    _ot_umount "$mnt"
+    _ot_journal_mark "$dir" rootfs
+  fi
+
+  if ! _ot_journal_has "$dir" units; then
+    _ot_write_units "$name" "$C_MEM" "$C_CPUS" "$C_TASKS"
+    _ot_run systemctl daemon-reload
+    _ot_run systemctl enable "$unit"
+    _ot_journal_mark "$dir" units
+  fi
+
+  _ot_set_state "$dir/tenant.conf" ready
+  C_STATE=ready
+  _ot_journal_mark "$dir" ready
+  (( harden )) && _ot_harden_io_uring
+  if (( no_start )); then
+    omw_log "Tenant '$name' created (not started: omarchy-tenant start $name)."
+    return 0
+  fi
+  _ot_start_verified "$name"
+  (( OT_DRY_RUN )) && return 0
+  omw_log "Tenant '$name' is running. Next: 'omarchy-tenant auth-url $name' to join its tailnet; 'omarchy-tenant key $name add FILE' for more SSH keys."
+}
+
+cmd_create() {
+  local name="" have_name=0 size="20G" mem="4G" cpus="2" tasks="512" image="" mode="bootstrap"
+  local key_file="" key_stdin=0 dns="$DEFAULT_DNS" allow_over=0 no_start=0 harden=0
+  local set_size=0 set_mem=0 set_cpus=0 set_tasks=0 set_dns=0 set_boot=0 set_image=0
+  while (( $# )); do
+    case "$1" in
+      --size) _ot_need_val "$@"; size="$2"; set_size=1; shift 2 ;;
+      --mem) _ot_need_val "$@"; mem="$2"; set_mem=1; shift 2 ;;
+      --cpus) _ot_need_val "$@"; cpus="$2"; set_cpus=1; shift 2 ;;
+      --tasks) _ot_need_val "$@"; tasks="$2"; set_tasks=1; shift 2 ;;
+      --dns) _ot_need_val "$@"; dns="$2"; set_dns=1; shift 2 ;;
+      --image) _ot_need_val "$@"; image="$2"; mode=image; set_image=1; shift 2 ;;
+      --bootstrap) mode=bootstrap; set_boot=1; shift ;;
+      --key) _ot_need_val "$@"; key_file="$2"; shift 2 ;;
+      --key-stdin) key_stdin=1; shift ;;
+      --allow-overcommit) allow_over=1; shift ;;
+      --no-start) no_start=1; shift ;;
+      --harden-host-io-uring) harden=1; shift ;;
+      -h|--help) _ot_usage; exit 0 ;;
+      --) shift; break ;;
+      -*)
+        _ot_common_flag "$@" || _ot_usage_error "Unknown option for create: $1"
+        shift "$OT_SHIFT" ;;
+      *)
+        (( have_name )) && _ot_usage_error "Unexpected argument: $1"
+        name="$1"; have_name=1; shift ;;
+    esac
+  done
+  if (( $# )); then
+    (( have_name )) && _ot_usage_error "Unexpected argument: $1"
+    name="$1"; have_name=1; shift
+    (( $# )) && _ot_usage_error "Unexpected argument: $1"
+  fi
+  (( have_name )) || _ot_usage_error "create: missing tenant name"
+  (( set_boot && set_image )) && _ot_usage_error "--bootstrap and --image are mutually exclusive"
+  [[ -n "$key_file" && "$key_stdin" == 1 ]] && _ot_usage_error "--key and --key-stdin are mutually exclusive"
+
+  local size_bytes
+  _ot_size_bytes "$size" || _ot_usage_error "--size must look like 20G or 4096M"
+  size_bytes="$REPLY"
+  (( size_bytes >= 1073741824 )) || _ot_usage_error "--size must be at least 1G"
+  _ot_size_bytes "$mem" || _ot_usage_error "--mem must look like 4G or 512M"
+  (( REPLY >= 134217728 )) || _ot_usage_error "--mem must be at least 128M"
+  if ! [[ "$cpus" =~ ^[1-9][0-9]{0,2}$ ]] || (( cpus > 256 )); then
+    _ot_usage_error "--cpus must be an integer from 1 to 256"
+  fi
+  if ! [[ "$tasks" =~ ^[1-9][0-9]{1,4}$ ]] || (( tasks < 16 || tasks > 65536 )); then
+    _ot_usage_error "--tasks must be an integer from 16 to 65536"
+  fi
+  _ot_valid_dns "$dns" || _ot_usage_error "--dns: $REPLY"
+  if [[ "$mode" == image ]]; then
+    [[ -f "$image" && -r "$image" ]] || omw_fail "$EX_PRECOND" "Cannot read --image $image."
+    image="$(realpath -e -- "$image")"
+  fi
+
+  # Keys are validated before anything is touched.
+  local newkeys=""
+  if [[ -n "$key_file" || "$key_stdin" == 1 ]]; then
+    _ot_mktempdir
+    if (( key_stdin )); then
+      _ot_read_input - "$REPLY/in"
+    else
+      _ot_read_input "$key_file" "$REPLY/in"
+    fi
+    _ot_validate_keys "${OT_TMPDIRS[0]}/in" "${OT_TMPDIRS[0]}/keys"
+    newkeys="${OT_TMPDIRS[0]}/keys"
+  fi
+
+  _ot_require_root
+  _ot_require_name "$name"
+  _ot_init_root
+  local dir="$OT_ROOT/$name" unit
+  _ot_unit_name "$name"
+  unit="$REPLY"
+
+  # ---- Existing tenant: idempotent no-op, re-render, re-attach or resume ----
+  if [[ -e "$dir" || -L "$dir" ]]; then
+    _ot_safe_tenant_dir "$dir" "$name"
+    [[ -f "$dir/tenant.conf" ]] || omw_fail "$EX_PRECOND" "$dir exists but is not a tenant (no tenant.conf)."
+    _ot_lock "$name"
+    _ot_load_conf "$dir/tenant.conf"
+    [[ "$C_NAME" == "$name" ]] || omw_fail "$EX_FAIL" "$dir/tenant.conf belongs to '$C_NAME'."
+    local diff=""
+    (( set_size )) && [[ "$size" != "$C_SIZE" ]] && diff+=" size=$C_SIZE"
+    (( set_mem )) && [[ "$mem" != "$C_MEM" ]] && diff+=" mem=$C_MEM"
+    (( set_cpus )) && [[ "$cpus" != "$C_CPUS" ]] && diff+=" cpus=$C_CPUS"
+    (( set_tasks )) && [[ "$tasks" != "$C_TASKS" ]] && diff+=" tasks=$C_TASKS"
+    (( set_dns )) && [[ "$dns" != "$C_DNS" ]] && diff+=" dns=$C_DNS"
+    [[ -z "$diff" ]] || omw_fail "$EX_PRECOND" "Tenant '$name' already exists with different settings ($diff ). Destroy it first to change them."
+    if [[ -n "$newkeys" ]]; then
+      local have new_fprs fpr
+      have="$(_ot_key_table "$dir/authorized_keys" | cut -f 1)"
+      new_fprs="$(_ot_key_table "$newkeys" | cut -f 1)"
+      for fpr in $new_fprs; do
+        grep -qxF -- "$fpr" <<<"$have" || omw_fail "$EX_PRECOND" "Tenant '$name' already exists; add keys with: omarchy-tenant key $name add FILE"
+      done
+    fi
+    case "$C_STATE" in
+      ready)
+        if _ot_units_current "$name" "$C_MEM" "$C_CPUS" "$C_TASKS"; then
+          (( harden )) && _ot_harden_io_uring
+          omw_log "Tenant '$name' already exists; nothing to do."
+          return 0
+        fi
+        omw_step "Re-rendering the unit files of '$name' (missing or different from this version)..."
+        _ot_require_deps systemctl
+        _ot_write_units "$name" "$C_MEM" "$C_CPUS" "$C_TASKS"
+        _ot_run systemctl daemon-reload
+        _ot_run systemctl enable "$unit"
+        (( harden )) && _ot_harden_io_uring
+        omw_log "Units for '$name' updated; restart it to apply: omarchy-tenant stop $name && omarchy-tenant start $name"
+        return 0 ;;
+      detached)
+        _ot_require_deps systemctl systemd-run machinectl systemd-nspawn slirp4netns setsid
+        [[ -f "$dir/disk.raw" ]] || omw_fail "$EX_FAIL" "Detached tenant '$name' has no disk.raw; destroy it and create it again."
+        omw_step "Re-attaching detached tenant '$name' (its disk is kept)..."
+        _ot_sync_keys_offline "$name"
+        _ot_write_units "$name" "$C_MEM" "$C_CPUS" "$C_TASKS"
+        _ot_run systemctl daemon-reload
+        _ot_run systemctl enable "$unit"
+        _ot_set_state "$dir/tenant.conf" ready
+        C_STATE=ready
+        (( harden )) && _ot_harden_io_uring
+        (( no_start )) || _ot_start_verified "$name"
+        return 0 ;;
+      creating)
+        omw_step "Resuming the creation of '$name'..."
+        _ot_find_data
+        _ot_require_deps systemd-nspawn machinectl systemctl systemd-run slirp4netns truncate mkfs.ext4 \
+          mount umount mountpoint ssh-keygen setsid
+        if [[ "$C_SRC" == tarball ]]; then
+          [[ "$mode" == image ]] || omw_fail "$EX_PRECOND" "Tenant '$name' was started from a tarball; resume with --image TAR."
+          _ot_require_deps tar
+        else
+          _ot_require_deps pacstrap
+          mode=bootstrap
+        fi
+        _ot_create_steps "$name" "$mode" "$image" "$newkeys" "$no_start" "$harden"
+        return 0 ;;
+    esac
+  fi
+
+  # ---- New tenant ----
+  if ! _ot_name_new_ok "$name"; then
+    local why="$REPLY"
+    _ot_shown "$name"
+    omw_fail "$EX_PRECOND" "Invalid tenant name ${REPLY}: ${why}"
+  fi
+  _ot_find_data
+  _ot_require_deps systemd-nspawn machinectl systemctl systemd-run slirp4netns truncate mkfs.ext4 \
+    mount umount mountpoint ssh-keygen setsid
+  if [[ "$mode" == image ]]; then _ot_require_deps tar; else _ot_require_deps pacstrap; fi
+  _ot_check_root_fs
+  _ot_preflight "$size_bytes" "$allow_over"
+
+  _ot_run mkdir -p -m 0700 -- "$OT_ROOT"
+  _ot_lock "$name"
+  if (( ! OT_DRY_RUN )) && [[ -e "$dir" || -L "$dir" ]]; then
+    omw_fail "$EX_BUSY" "Tenant '$name' appeared while waiting; re-run the command."
+  fi
+  _ot_run mkdir -m 0700 -- "$dir"
+  local src=bootstrap now
+  [[ "$mode" == image ]] && src=tarball
+  _ot_now
+  now="$REPLY"
+  _ot_render_conf "$name" "$size" "$mem" "$cpus" "$tasks" "$dns" "$src" "$now" creating |
+    _ot_write "$dir/tenant.conf" 0600 show
+  C_NAME="$name" C_STATE=creating C_SIZE="$size" C_MEM="$mem" C_CPUS="$cpus" C_TASKS="$tasks"
+  C_DNS="$dns" C_SRC="$src"
+  _ot_journal_mark "$dir" conf
+  _ot_create_steps "$name" "$mode" "$image" "$newkeys" "$no_start" "$harden"
+}
+
+# -----------------------------------------------------------------------------
+# key
+# -----------------------------------------------------------------------------
+cmd_key() {
+  local -a pos=()
+  while (( $# )); do
+    case "$1" in
+      -h|--help) _ot_usage; exit 0 ;;
+      -) pos+=("$1"); shift ;;
+      --) shift; pos+=("$@"); break ;;
+      -*)
+        _ot_common_flag "$@" || _ot_usage_error "Unknown option for key: $1"
+        shift "$OT_SHIFT" ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  (( ${#pos[@]} >= 2 )) || _ot_usage_error "Usage: omarchy-tenant key <name> add FILE|- | list | remove SHA256:FPR"
+  local name="${pos[0]}" sub="${pos[1]}" arg="${pos[2]:-}"
+  case "$sub" in
+    add|remove) [[ -n "$arg" && ${#pos[@]} -eq 3 ]] || _ot_usage_error "key $sub needs exactly one argument" ;;
+    list) (( ${#pos[@]} == 2 )) || _ot_usage_error "key list takes no argument" ;;
+    *) _ot_usage_error "Unknown key subcommand: $sub" ;;
+  esac
+  if [[ "$sub" == remove ]] && ! [[ "$arg" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]; then
+    _ot_usage_error "key remove expects a SHA256 fingerprint (see: omarchy-tenant key $name list)"
+  fi
+  _ot_require_name "$name"
+  _ot_require_root
+  _ot_init_root
+  local dir="$OT_ROOT/$name"
+  _ot_require_tenant "$name"
+  _ot_require_deps ssh-keygen
+  _ot_mktempdir
+  local tmpd="$REPLY"
+
+  case "$sub" in
+    list)
+      local fpr bits ktype comment line first=1
+      if (( OT_JSON )); then
+        _ot_json_str "$name"
+        printf '{"version":1,"tenant":%s,"keys":[' "$REPLY"
+        while IFS=$'\t' read -r fpr bits ktype comment line; do
+          (( first )) || printf ','
+          first=0
+          printf '{"fingerprint":"%s","type":"%s","bits":%d,' "$fpr" "$ktype" "$bits"
+          _ot_json_str "$comment"
+          printf '"comment":%s}' "$REPLY"
+        done < <(_ot_key_table "$dir/authorized_keys")
+        printf ']}\n'
+      else
+        while IFS=$'\t' read -r fpr bits ktype comment line; do
+          printf '%s %s %s %s\n' "$fpr" "$ktype" "$bits" "$comment"
+        done < <(_ot_key_table "$dir/authorized_keys")
+      fi
+      return 0 ;;
+    add)
+      _ot_read_input "$arg" "$tmpd/in"
+      _ot_validate_keys "$tmpd/in" "$tmpd/keys"
+      _ot_lock "$name"
+      if [[ -f "$dir/authorized_keys" ]]; then
+        cat -- "$dir/authorized_keys" >"$tmpd/merged"
+      else
+        : >"$tmpd/merged"
+      fi
+      local have added=0 fpr bits ktype comment line
+      have="$(_ot_key_table "$tmpd/merged" | cut -f 1)"
+      while IFS=$'\t' read -r fpr bits ktype comment line; do
+        if grep -qxF -- "$fpr" <<<"$have"; then
+          omw_log "Already present: $fpr"
+          continue
+        fi
+        printf '%s\n' "$line" >>"$tmpd/merged"
+        have+=$'\n'"$fpr"
+        printf '%s\n' "$fpr"
+        added=$((added + 1))
+      done < <(_ot_key_table "$tmpd/keys")
+      if (( added == 0 )); then
+        omw_log "No new keys for '$name'."
+        return 0
+      fi
+      _ot_write "$dir/authorized_keys" 0600 <"$tmpd/merged"
+      if (( OT_DRY_RUN )); then
+        printf '[dry-run] sync %s/authorized_keys into tenant %s\n' "$dir" "$name"
+      else
+        _ot_sync_keys "$name"
+      fi
+      omw_log "Added $added key(s) to '$name'."
+      return 0 ;;
+    remove)
+      _ot_lock "$name"
+      local found=0 fpr bits ktype comment line
+      : >"$tmpd/kept"
+      while IFS=$'\t' read -r fpr bits ktype comment line; do
+        if [[ "$fpr" == "$arg" ]]; then
+          found=1
+          continue
+        fi
+        printf '%s\n' "$line" >>"$tmpd/kept"
+      done < <(_ot_key_table "$dir/authorized_keys")
+      (( found )) || omw_fail "$EX_NOTFOUND" "No key $arg on tenant '$name'."
+      _ot_write "$dir/authorized_keys" 0600 <"$tmpd/kept"
+      if (( OT_DRY_RUN )); then
+        printf '[dry-run] sync %s/authorized_keys into tenant %s\n' "$dir" "$name"
+      else
+        _ot_sync_keys "$name"
+      fi
+      omw_log "Removed $arg from '$name'."
+      return 0 ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# auth-url: tailnet login without ever exposing an auth key on argv
+# -----------------------------------------------------------------------------
+_ot_ts_status() {
+  systemd-run "--machine=$1" --quiet --wait --pipe --collect -- tailscale status --json </dev/null 2>/dev/null || true
+}
+
+_ot_json_top_string() {
+  # <json> <key> -> REPLY (first occurrence of "key": "value")
+  REPLY="$(sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" <<<"$1" | head -n 1)"
+}
+
+_ot_json_ips() {
+  awk '
+    !inarr && /"TailscaleIPs"[[:space:]]*:/ { inarr = 1; sub(/.*"TailscaleIPs"[[:space:]]*:[[:space:]]*\[/, "") }
+    inarr {
+      line = $0
+      while (match(line, /"[^"]*"/)) { print substr(line, RSTART + 1, RLENGTH - 2); line = substr(line, RSTART + RLENGTH) }
+      if ($0 ~ /\]/) exit
+    }' <<<"$1" | grep -E '^[0-9A-Fa-f.:]+$' || true
+}
+
+cmd_auth_url() {
+  local name="" have_name=0 timeout=60 keyfile="" keystdin=0
+  while (( $# )); do
+    case "$1" in
+      --timeout) _ot_need_val "$@"; timeout="$2"; shift 2 ;;
+      --authkey-file) _ot_need_val "$@"; keyfile="$2"; shift 2 ;;
+      --authkey-stdin) keystdin=1; shift ;;
+      -h|--help) _ot_usage; exit 0 ;;
+      --) shift; (( $# )) && { name="$1"; have_name=1; shift; }; break ;;
+      -*)
+        _ot_common_flag "$@" || _ot_usage_error "Unknown option for auth-url: $1"
+        shift "$OT_SHIFT" ;;
+      *)
+        (( have_name )) && _ot_usage_error "Unexpected argument: $1"
+        name="$1"; have_name=1; shift ;;
+    esac
+  done
+  (( have_name )) || _ot_usage_error "auth-url: missing tenant name"
+  [[ "$timeout" =~ ^[1-9][0-9]{0,3}$ ]] || _ot_usage_error "--timeout must be 1..9999 seconds"
+  [[ -n "$keyfile" && "$keystdin" == 1 ]] && _ot_usage_error "--authkey-file and --authkey-stdin are mutually exclusive"
+  _ot_require_name "$name"
+
+  local key=""
+  if [[ -n "$keyfile" || "$keystdin" == 1 ]]; then
+    if (( keystdin )); then
+      IFS= read -r -t 30 key || [[ -n "$key" ]] || omw_fail "$EX_USAGE" "No auth key on stdin."
+    else
+      [[ -f "$keyfile" && -r "$keyfile" ]] || omw_fail "$EX_PRECOND" "Cannot read --authkey-file $keyfile."
+      IFS= read -r key <"$keyfile" || [[ -n "$key" ]] || omw_fail "$EX_USAGE" "--authkey-file is empty."
+    fi
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^tskey-[A-Za-z0-9_-]{8,200}$ ]] || omw_fail "$EX_USAGE" "That is not a Tailscale auth key (expected tskey-...)."
+  fi
+
+  _ot_require_root
+  _ot_init_root
+  _ot_require_tenant "$name"
+  _ot_require_deps systemctl systemd-run
+  [[ "$C_STATE" == ready ]] || omw_fail "$EX_PRECOND" "Tenant '$name' is $C_STATE; finish it with 'omarchy-tenant create $name' first."
+  if (( ! OT_DRY_RUN )) && ! _ot_is_running "$name"; then
+    omw_fail "$EX_PRECOND" "Tenant '$name' is not running: omarchy-tenant start $name"
+  fi
+  _ot_lock "$name"
+  local -a up=(tailscale up --ssh=false --accept-dns=false --accept-routes=false "--hostname=$name")
+
+  if [[ -n "$key" ]]; then
+    printf '%s\n' "$key" | _ot_run_in systemd-run "--machine=$name" --quiet --wait --pipe --collect -- /bin/sh -c \
+      "umask 077; mkdir -p ${TS_AUTHKEY_PATH%/*} && cat >${TS_AUTHKEY_PATH}"
+    local rc=0
+    _ot_run systemd-run "--machine=$name" --quiet --wait --pipe --collect -- "${up[@]}" \
+      "--auth-key=file:${TS_AUTHKEY_PATH}" "--timeout=${timeout}s" </dev/null || rc=$?
+    _ot_run systemd-run "--machine=$name" --quiet --wait --pipe --collect -- rm -f -- "$TS_AUTHKEY_PATH" </dev/null || true
+    key=""
+    (( rc == 0 )) || omw_fail "$EX_FAIL" "tailscale up failed inside '$name' (exit $rc)."
+    omw_log "Tenant '$name' joined the tailnet."
+    return 0
+  fi
+
+  if (( OT_DRY_RUN )); then
+    _ot_run systemd-run "--machine=$name" --quiet --collect -- "${up[@]}"
+    printf '[dry-run] poll: tailscale status --json inside %s for AuthURL (%ss)\n' "$name" "$timeout"
+    return 0
+  fi
+
+  local json state url deadline url_re='^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/?=&%+-]*$'
+  json="$(_ot_ts_status "$name")"
+  _ot_json_top_string "$json" BackendState
+  state="$REPLY"
+  if [[ "$state" == Running ]]; then
+    omw_log "Tenant '$name' is already logged in to its tailnet."
+    return 0
+  fi
+  _ot_run systemd-run "--machine=$name" --quiet --collect -- "${up[@]}" </dev/null >/dev/null 2>&1 ||
+    omw_fail "$EX_FAIL" "Could not start 'tailscale up' inside '$name'."
+  deadline=$(( SECONDS + timeout ))
+  while (( SECONDS <= deadline )); do
+    json="$(_ot_ts_status "$name")"
+    _ot_json_top_string "$json" AuthURL
+    url="$REPLY"
+    if [[ "$url" =~ $url_re ]]; then
+      printf '%s\n' "$url"
+      return 0
+    fi
+    _ot_json_top_string "$json" BackendState
+    if [[ "$REPLY" == Running ]]; then
+      omw_log "Tenant '$name' is logged in to its tailnet."
+      return 0
+    fi
+    sleep 1
+  done
+  omw_fail "$EX_FAIL" "No login URL from tailscale inside '$name' within ${timeout}s."
+}
+
+# -----------------------------------------------------------------------------
+# status / list
+# -----------------------------------------------------------------------------
+_ot_tenant_names() {
+  OT_NAMES=()
+  local d n
+  if [[ -d "$OT_ROOT" && ! -r "$OT_ROOT" ]]; then
+    omw_warn "Cannot read $OT_ROOT (run as root)."
+  fi
+  for d in "$OT_ROOT"/*; do
+    [[ -d "$d" && ! -L "$d" && -f "$d/tenant.conf" ]] || continue
+    n="${d##*/}"
+    _ot_name_syntax "$n" || continue
+    OT_NAMES+=("$n")
+  done
+}
+OT_NAMES=()
+
+# Fills S_* for one tenant.
+_ot_gather() {
+  local name="$1" dir="$OT_ROOT/$1" json
+  _ot_load_conf "$dir/tenant.conf"
+  S_STATE="$C_STATE"
+  if [[ "$C_STATE" == ready ]]; then
+    _ot_unit_state "$name"
+    case "$REPLY" in
+      active|activating|reloading) S_STATE=running ;;
+      failed) S_STATE=failed ;;
+      *) S_STATE=stopped ;;
+    esac
+  fi
+  S_ALLOC=0
+  if [[ -f "$dir/disk.raw" ]]; then
+    S_ALLOC="$(du -B1 -s -- "$dir/disk.raw" 2>/dev/null | cut -f 1 || true)"
+    [[ "$S_ALLOC" =~ ^[0-9]+$ ]] || S_ALLOC=0
+  fi
+  S_KEYS=0
+  [[ -f "$dir/authorized_keys" ]] && S_KEYS="$(grep -cE '^[a-z]' "$dir/authorized_keys" || true)"
+  [[ "$S_KEYS" =~ ^[0-9]+$ ]] || S_KEYS=0
+  S_TS_STATE="" S_TS_IPS=()
+  if [[ "$S_STATE" == running ]]; then
+    json="$(_ot_ts_status "$name")"
+    _ot_json_top_string "$json" BackendState
+    [[ "$REPLY" =~ ^[A-Za-z]{1,32}$ ]] && S_TS_STATE="$REPLY"
+    mapfile -t S_TS_IPS < <(_ot_json_ips "$json")
+  fi
+  _ot_selfcheck "$name" 0 || true
+}
+S_STATE="" S_ALLOC=0 S_KEYS=0 S_TS_STATE=""
+S_TS_IPS=()
+
+_ot_json_tenant() {
+  local name="$1" first i
+  _ot_json_str "$name"
+  printf '{"name":%s,"state":"%s","size":"%s","mem":"%s","cpus":%d,"tasks":%d,"disk_allocated_bytes":%d,"keys":%d,' \
+    "$REPLY" "$S_STATE" "$C_SIZE" "$C_MEM" "$C_CPUS" "$C_TASKS" "$S_ALLOC" "$S_KEYS"
+  if [[ -n "$S_TS_STATE" ]]; then
+    printf '"tailnet":{"backend_state":"%s","ips":[' "$S_TS_STATE"
+  else
+    printf '"tailnet":{"backend_state":null,"ips":['
+  fi
+  first=1
+  for i in ${S_TS_IPS[@]+"${S_TS_IPS[@]}"}; do
+    (( first )) || printf ','
+    first=0
+    printf '"%s"' "$i"
+  done
+  if (( ${#OT_SC_MISSING[@]} == 0 && ${#OT_SC_DRIFT[@]} == 0 )); then
+    printf ']},"isolation":{"policy":"ok","missing":['
+  else
+    printf ']},"isolation":{"policy":"drift","missing":['
+  fi
+  first=1
+  for i in ${OT_SC_MISSING[@]+"${OT_SC_MISSING[@]}"} ${OT_SC_DRIFT[@]+"${OT_SC_DRIFT[@]}"}; do
+    (( first )) || printf ','
+    first=0
+    _ot_json_str "$i"
+    printf '%s' "$REPLY"
+  done
+  printf ']}}'
+}
+
+cmd_status() {
+  local name="" have_name=0
+  while (( $# )); do
+    case "$1" in
+      -h|--help) _ot_usage; exit 0 ;;
+      --) shift; (( $# )) && { name="$1"; have_name=1; shift; }; break ;;
+      -*)
+        _ot_common_flag "$@" || _ot_usage_error "Unknown option for status: $1"
+        shift "$OT_SHIFT" ;;
+      *)
+        (( have_name )) && _ot_usage_error "Unexpected argument: $1"
+        name="$1"; have_name=1; shift ;;
+    esac
+  done
+  _ot_init_root
+  local -a names=()
+  if (( have_name )); then
+    _ot_require_name "$name"
+    [[ -f "$OT_ROOT/$name/tenant.conf" ]] || omw_fail "$EX_NOTFOUND" "No tenant named '$name' under $OT_ROOT."
+    _ot_safe_tenant_dir "$OT_ROOT/$name" "$name"
+    names=("$name")
+  else
+    _ot_tenant_names
+    names=(${OT_NAMES[@]+"${OT_NAMES[@]}"})
+  fi
+  local n first=1 ips iso
+  if (( OT_JSON )); then
+    printf '{"version":1,"tenants":['
+    for n in ${names[@]+"${names[@]}"}; do
+      _ot_gather "$n"
+      (( first )) || printf ','
+      first=0
+      _ot_json_tenant "$n"
+    done
+    printf ']}\n'
+    return 0
+  fi
+  if (( ${#names[@]} == 0 )); then
+    omw_log "No tenants under $OT_ROOT."
+    return 0
+  fi
+  printf '%-20s %-9s %-6s %-6s %-4s %-6s %-12s %-4s %-12s %s\n' NAME STATE SIZE MEM CPUS TASKS DISK_BYTES KEYS TAILNET ISOLATION
+  for n in "${names[@]}"; do
+    _ot_gather "$n"
+    ips="${S_TS_IPS[*]:-}"
+    iso=ok
+    (( ${#OT_SC_MISSING[@]} + ${#OT_SC_DRIFT[@]} == 0 )) || iso="drift(${OT_SC_MISSING[*]:-}${OT_SC_DRIFT[*]:-})"
+    printf '%-20s %-9s %-6s %-6s %-4s %-6s %-12s %-4s %-12s %s%s\n' "$n" "$S_STATE" "$C_SIZE" "$C_MEM" "$C_CPUS" "$C_TASKS" \
+      "$S_ALLOC" "$S_KEYS" "${S_TS_STATE:--}" "$iso" "${ips:+  $ips}"
+  done
+}
+
+cmd_list() {
+  while (( $# )); do
+    case "$1" in
+      -h|--help) _ot_usage; exit 0 ;;
+      -*)
+        _ot_common_flag "$@" || _ot_usage_error "Unknown option for list: $1"
+        shift "$OT_SHIFT" ;;
+      *) _ot_usage_error "list takes no argument" ;;
+    esac
+  done
+  _ot_init_root
+  _ot_tenant_names
+  local n first=1
+  if (( OT_JSON )); then
+    printf '{"version":1,"tenants":['
+    for n in ${OT_NAMES[@]+"${OT_NAMES[@]}"}; do
+      _ot_load_conf "$OT_ROOT/$n/tenant.conf"
+      S_STATE="$C_STATE"
+      if [[ "$C_STATE" == ready ]]; then
+        if _ot_is_running "$n"; then S_STATE=running; else S_STATE=stopped; fi
+      fi
+      (( first )) || printf ','
+      first=0
+      printf '{"name":"%s","state":"%s"}' "$n" "$S_STATE"
+    done
+    printf ']}\n'
+    return 0
+  fi
+  for n in ${OT_NAMES[@]+"${OT_NAMES[@]}"}; do
+    _ot_load_conf "$OT_ROOT/$n/tenant.conf"
+    S_STATE="$C_STATE"
+    if [[ "$C_STATE" == ready ]]; then
+      if _ot_is_running "$n"; then S_STATE=running; else S_STATE=stopped; fi
+    fi
+    printf '%s\t%s\n' "$n" "$S_STATE"
+  done
+}
+
+# -----------------------------------------------------------------------------
+# start / stop
+# -----------------------------------------------------------------------------
+cmd_startstop() {
+  local action="$1" name="" have_name=0
+  shift
+  while (( $# )); do
+    case "$1" in
+      -h|--help) _ot_usage; exit 0 ;;
+      -*)
+        _ot_common_flag "$@" || _ot_usage_error "Unknown option for $action: $1"
+        shift "$OT_SHIFT" ;;
+      *)
+        (( have_name )) && _ot_usage_error "Unexpected argument: $1"
+        name="$1"; have_name=1; shift ;;
+    esac
+  done
+  (( have_name )) || _ot_usage_error "$action: missing tenant name"
+  _ot_require_name "$name"
+  _ot_require_root
+  _ot_init_root
+  _ot_require_tenant "$name"
+  _ot_require_deps systemctl systemd-run machinectl
+  [[ "$C_STATE" == ready ]] || omw_fail "$EX_PRECOND" "Tenant '$name' is $C_STATE; run 'omarchy-tenant create $name' to finish or re-attach it."
+  _ot_lock "$name"
+  local unit
+  _ot_unit_name "$name"
+  unit="$REPLY"
+  if [[ "$action" == stop ]]; then
+    _ot_run systemctl stop "$unit"
+    return 0
+  fi
+  _ot_start_verified "$name"
+}
+
+# -----------------------------------------------------------------------------
+# destroy
+# -----------------------------------------------------------------------------
+_ot_confirm_name() {
+  [[ -t 0 ]] || return 1
+  local reply=""
+  printf 'Type the tenant name (%s) to destroy it: ' "$1" >&2
+  IFS= read -r reply || true
+  [[ "$reply" == "$1" ]]
+}
+
+cmd_destroy() {
+  local name="" have_name=0 keep=0
+  while (( $# )); do
+    case "$1" in
+      --keep-data) keep=1; shift ;;
+      -h|--help) _ot_usage; exit 0 ;;
+      -*)
+        _ot_common_flag "$@" || _ot_usage_error "Unknown option for destroy: $1"
+        shift "$OT_SHIFT" ;;
+      *)
+        (( have_name )) && _ot_usage_error "Unexpected argument: $1"
+        name="$1"; have_name=1; shift ;;
+    esac
+  done
+  (( have_name )) || _ot_usage_error "destroy: missing tenant name"
+  _ot_require_name "$name"
+  _ot_require_root
+  _ot_init_root
+  local dir="$OT_ROOT/$name" unit
+  _ot_unit_name "$name"
+  unit="$REPLY"
+  if [[ ! -e "$dir" && ! -L "$dir" && ! -e "$UNIT_DIR/$unit" && ! -e "$NSPAWN_DIR/$name.nspawn" ]]; then
+    omw_fail "$EX_NOTFOUND" "No tenant named '$name' under $OT_ROOT."
+  fi
+  if [[ -e "$dir" || -L "$dir" ]]; then
+    _ot_safe_tenant_dir "$dir" "$name"
+  fi
+  if (( ! OT_YES && ! OT_DRY_RUN )); then
+    _ot_confirm_name "$name" || omw_fail "$EX_PRECOND" "Refusing to destroy '$name' without --yes (or typing its name at a terminal)."
+  fi
+  _ot_lock "$name"
+  _ot_require_deps systemctl
+  omw_step "Stopping and removing the units of '$name'..."
+  _ot_run systemctl stop "$unit" 2>/dev/null || omw_warn "systemctl stop $unit failed (not loaded?); continuing."
+  _ot_run systemctl disable "$unit" 2>/dev/null || omw_warn "systemctl disable $unit failed (not loaded?); continuing."
+  _ot_run rm -f -- "$UNIT_DIR/$unit" "$NSPAWN_DIR/$name.nspawn"
+  _ot_run systemctl daemon-reload
+  if [[ -e "$RUN_DIR/$name/slirp4netns.pid" ]]; then
+    _ot_run rm -f -- "$RUN_DIR/$name/slirp4netns.pid"
+  fi
+  (( OT_DRY_RUN )) || rmdir -- "$RUN_DIR/$name/mnt" "$RUN_DIR/$name" 2>/dev/null || true
+
+  [[ -d "$dir" ]] || { omw_log "Removed the units of '$name' (it had no state directory)."; return 0; }
+  if (( keep )); then
+    if [[ -f "$dir/tenant.conf" ]]; then
+      _ot_set_state "$dir/tenant.conf" detached
+    fi
+    omw_log "Tenant '$name' detached; its disk and keys stay in $dir ('omarchy-tenant create $name' re-attaches it)."
+    return 0
+  fi
+  local f
+  for f in tenant.conf disk.raw authorized_keys journal; do
+    if [[ -e "$dir/$f" || -L "$dir/$f" ]]; then
+      _ot_run rm -f -- "$dir/$f"
+    fi
+  done
+  if (( OT_DRY_RUN )); then
+    printf '[dry-run] rmdir -- %s\n' "$dir"
+    return 0
+  fi
+  if rmdir -- "$dir" 2>/dev/null; then
+    omw_log "Tenant '$name' destroyed."
+  else
+    local left=() e
+    for e in "$dir"/* "$dir"/.[!.]*; do
+      [[ -e "$e" || -L "$e" ]] && left+=("${e##*/}")
+    done
+    omw_warn "Kept $dir: it contains files omarchy-tenant did not create (${left[*]:0:5})."
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# doctor: host prerequisites (report only) + optional tenant self-check
+# -----------------------------------------------------------------------------
+cmd_doctor() {
+  local tenant="" fails=0 c v
+  while (( $# )); do
+    case "$1" in
+      --tenant) _ot_need_val "$@"; tenant="$2"; shift 2 ;;
+      --tenant=*) tenant="${1#--tenant=}"; shift ;;
+      -h|--help) _ot_usage; exit 0 ;;
+      -*)
+        _ot_common_flag "$@" || _ot_usage_error "Unknown option for doctor: $1"
+        shift "$OT_SHIFT" ;;
+      *) _ot_usage_error "doctor takes no positional argument (use --tenant NAME)" ;;
+    esac
+  done
+  _ot_init_root
+  _ot_check() { printf '%-5s %s\n' "$1" "$2"; [[ "$1" == fail ]] && fails=$((fails + 1)); return 0; }
+
+  _ot_euid
+  if [[ "$REPLY" == 0 ]]; then
+    _ot_check ok "running as root"
+  else
+    _ot_check warn "not root: tenant state and units may be unreadable"
+  fi
+  if omw_systemd_running; then _ot_check ok "systemd is PID 1"; else _ot_check fail "systemd is not PID 1 (enable [boot] systemd=true in wsl.conf, then wsl --shutdown)"; fi
+  for c in systemd-nspawn machinectl systemctl systemd-run slirp4netns mkfs.ext4 truncate mount umount mountpoint setsid ssh-keygen; do
+    _ot_pkg_for "$c"
+    if omw_have "$c"; then _ot_check ok "command $c"; else _ot_check fail "command $c missing (package: $REPLY)"; fi
+  done
+  for c in pacstrap tar; do
+    _ot_pkg_for "$c"
+    if omw_have "$c"; then _ot_check ok "command $c"; else _ot_check warn "command $c missing (package: $REPLY; needed for --bootstrap/--image)"; fi
+  done
+  if [[ -f "$SYS_DIR/fs/cgroup/cgroup.controllers" ]]; then _ot_check ok "cgroup v2 unified hierarchy"; else _ot_check fail "cgroup v2 not mounted at $SYS_DIR/fs/cgroup"; fi
+  v="$(cat "$PROC_DIR/sys/user/max_user_namespaces" 2>/dev/null || echo 0)"
+  if [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then _ot_check ok "user namespaces (max_user_namespaces=$v)"; else _ot_check fail "user namespaces disabled"; fi
+  if [[ -e "$DEV_DIR/net/tun" ]]; then _ot_check ok "$DEV_DIR/net/tun"; else _ot_check fail "$DEV_DIR/net/tun missing (slirp4netns needs TUN)"; fi
+  if [[ -e "$DEV_DIR/loop-control" ]]; then _ot_check ok "$DEV_DIR/loop-control"; else _ot_check fail "$DEV_DIR/loop-control missing (disk images need loop devices)"; fi
+  if [[ -r "$PROC_DIR/sys/kernel/io_uring_disabled" ]]; then
+    v="$(cat "$PROC_DIR/sys/kernel/io_uring_disabled" 2>/dev/null || echo "?")"
+    case "$v" in
+      0) _ot_check warn "kernel.io_uring_disabled=0: io_uring is enabled host-wide (tenants are still denied it by seccomp; opt in with 'create --harden-host-io-uring')" ;;
+      1|2) _ot_check ok "kernel.io_uring_disabled=$v" ;;
+      *) _ot_check warn "kernel.io_uring_disabled unreadable" ;;
+    esac
+  else
+    _ot_check ok "kernel.io_uring_disabled not present (kernel without the sysctl; tenants use seccomp)"
+  fi
+  if omw_have findmnt; then
+    _ot_nearest_existing "$OT_ROOT"
+    v="$(findmnt -no FSTYPE -T "$REPLY" 2>/dev/null | head -n 1 || true)"
+    case "$v" in
+      9p|v9fs|drvfs|virtiofs|fuse*|cifs|smb3|nfs*) _ot_check fail "tenant root $OT_ROOT is on $v (must be the distro's own disk)" ;;
+      *) _ot_check ok "tenant root $OT_ROOT on ${v:-unknown}" ;;
+    esac
+  fi
+
+  if [[ -n "$tenant" ]]; then
+    _ot_require_name "$tenant"
+    _ot_require_tenant "$tenant"
+    local live=0 i what="policy (tenant not running: no live checks)"
+    if [[ "$C_STATE" == ready ]] && _ot_is_running "$tenant"; then
+      live=1
+      what="policy + live checks"
+    fi
+    if _ot_selfcheck "$tenant" "$live"; then
+      _ot_check ok "tenant $tenant isolation: $what"
+      for i in ${OT_SC_DRIFT[@]+"${OT_SC_DRIFT[@]}"}; do _ot_check warn "tenant $tenant drift: $i"; done
+    else
+      for i in ${OT_SC_MISSING[@]+"${OT_SC_MISSING[@]}"}; do _ot_check fail "tenant $tenant policy: $i"; done
+      for i in ${OT_SC_LEAKS[@]+"${OT_SC_LEAKS[@]}"}; do _ot_check fail "tenant $tenant isolation: $i"; done
+      exit "$EX_ISOLATION"
+    fi
+  fi
+  (( fails == 0 )) || exit "$EX_PRECOND"
+}
+
+# -----------------------------------------------------------------------------
+# _net-up (ExecStartPost): attach slirp4netns to the container's netns
+# -----------------------------------------------------------------------------
+cmd_net_up() {
+  (( $# == 1 )) || _ot_usage_error "_net-up takes exactly one tenant name"
+  local name="$1" leader="" i tries pid
+  _ot_require_name "$name"
+  _ot_require_root
+  _ot_require_deps machinectl slirp4netns setsid
+  tries=$(( WAIT_SECS * 2 ))
+  for (( i = 0; i <= tries; i++ )); do
+    if _ot_leader "$name"; then leader="$REPLY"; break; fi
+    (( i < tries )) && sleep 0.5
+  done
+  [[ -n "$leader" ]] || omw_fail "$EX_FAIL" "Container '$name' has no leader process after ${WAIT_SECS}s."
+  if grep -qE '^[[:space:]]*tap0:' "$PROC_DIR/$leader/net/dev" 2>/dev/null; then
+    omw_log "Network of '$name' is already up."
+    return 0
+  fi
+  if (( OT_DRY_RUN )); then
+    _ot_run setsid slirp4netns --configure --mtu=65520 --disable-host-loopback --disable-dns \
+      --enable-sandbox --enable-seccomp "$leader" tap0
+    return 0
+  fi
+  [[ -d "$RUN_DIR" ]] || mkdir -p -- "$RUN_DIR"
+  [[ -d "$RUN_DIR/$name" ]] || mkdir -m 0700 -- "$RUN_DIR/$name"
+  # Detached, but inside this unit's cgroup: IPAddressDeny= filters its sockets.
+  if [[ -n "${JOURNAL_STREAM:-}" ]]; then
+    setsid slirp4netns --configure --mtu=65520 --disable-host-loopback --disable-dns \
+      --enable-sandbox --enable-seccomp "$leader" tap0 </dev/null 9>&- &
+  else
+    setsid slirp4netns --configure --mtu=65520 --disable-host-loopback --disable-dns \
+      --enable-sandbox --enable-seccomp "$leader" tap0 </dev/null >/dev/null 2>&1 9>&- &
+  fi
+  pid=$!
+  printf '%s\n' "$pid" >"$RUN_DIR/$name/slirp4netns.pid"
+  for (( i = 0; i <= tries; i++ )); do
+    if grep -qE '^[[:space:]]*tap0:' "$PROC_DIR/$leader/net/dev" 2>/dev/null; then
+      omw_log "Network of '$name' is up (slirp4netns pid $pid)."
+      return 0
+    fi
+    (( i < tries )) && sleep 0.5
+  done
+  kill "$pid" 2>/dev/null || true
+  omw_fail "$EX_FAIL" "slirp4netns did not bring up tap0 in '$name' within ${WAIT_SECS}s."
+}
+
+# -----------------------------------------------------------------------------
+# main
+# -----------------------------------------------------------------------------
+main() {
+  OT_ARGV=("$@")
+  _ot_reject_secret_args "$@"
+  while (( $# )); do
+    case "$1" in
+      -h|--help) _ot_usage; exit 0 ;;
+      --version) printf 'omarchy-tenant %s\n' "$OT_VERSION"; exit 0 ;;
+      --) shift; break ;;
+      -*)
+        _ot_common_flag "$@" || _ot_usage_error "Unknown option: $1"
+        shift "$OT_SHIFT" ;;
+      *) break ;;
+    esac
+  done
+  (( $# )) || _ot_usage_error "Missing command."
+  local cmd="$1"
+  shift
+  case "$cmd" in
+    create) cmd_create "$@" ;;
+    key) cmd_key "$@" ;;
+    auth-url) cmd_auth_url "$@" ;;
+    status) cmd_status "$@" ;;
+    list) cmd_list "$@" ;;
+    start) cmd_startstop start "$@" ;;
+    stop) cmd_startstop stop "$@" ;;
+    destroy) cmd_destroy "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    _net-up) cmd_net_up "$@" ;;
+    help) _ot_usage; exit 0 ;;
+    *) _ot_usage_error "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
