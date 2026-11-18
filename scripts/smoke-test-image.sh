@@ -7,10 +7,14 @@
 # Imports the exact archive users download (docker/podman import), then runs
 # the checks below as root in a container from it. Each check prints PASS/FAIL
 # with the measured value; the run fails if any check fails.
-#   - pacman keyring init + `pacman -Sy` exits 0
+#   - pacman keyring init + `pacman -Sy` exits 0 with the shipped sandbox
+#     (Landlock + DownloadUser=alpm). Container root lacks CAP_SYS_ADMIN, so
+#     this one check runs in a second container with no-new-privileges, which
+#     lets Landlock apply (and would break setuid sudo for the other checks).
 #   - gcc compiles and links a C program (libc_nonshared.a/libgcc intact)
 #   - /usr/bin/sudo is 4755, /tmp and /var/tmp are 1777
-#   - ping keeps cap_net_raw, or the iputils unprivileged-ICMP sysctl ships
+#   - file capabilities survive the export (newuidmap keeps cap_setuid);
+#     ping works unprivileged (cap_net_raw or systemd's ping_group_range)
 #   - /usr/lib/wsl/oobe.sh --headless --user devuser provisions uid 1000
 #   - omarchy-version matches upstream.lock; the rootfs manifest verifies
 #   - systemd-analyze verify of build.slice reports no unknown keys
@@ -21,6 +25,18 @@
 # ==============================================================================
 
 set -uo pipefail
+
+if [[ ${1:-} == --inner-pacman ]]; then
+  # ------------------------------------------- in container (no-new-privileges)
+  /usr/lib/omarchy-wsl/pacman-init.sh >/dev/null 2>&1 || { echo "  [FAIL] pacman-init failed"; exit 1; }
+  if out=$(pacman -Sy --noconfirm 2>&1); then
+    printf '  [PASS] pacman -Sy exit 0 with the shipped sandbox (DownloadUser=%s): %s\n' \
+      "$(sed -n 's/^DownloadUser *= *//p' /etc/pacman.conf)" "$(grep -c 'downloading' <<<"$out") databases synced"
+    exit 0
+  fi
+  printf '  [FAIL] pacman -Sy failed: %s\n' "$(tail -n 3 <<<"$out" | tr '\n' ' ')"
+  exit 1
+fi
 
 if [[ ${1:-} == --inner ]]; then
   # ---------------------------------------------------------------- in container
@@ -46,11 +62,10 @@ if [[ ${1:-} == --inner ]]; then
   echo "== $(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release) ($(uname -m))"
 
   if out=$(/usr/lib/omarchy-wsl/pacman-init.sh 2>&1); then ok "pacman keyring initialised (first-boot path)"; else bad "pacman-init: $out"; fi
-  if out=$(pacman -Sy --noconfirm 2>&1); then
-    ok "pacman -Sy exit 0 ($(grep -cE 'downloading|is up to date' <<<"$out") databases)"
-  else
-    bad "pacman -Sy failed: $(tail -n 3 <<<"$out" | tr '\n' ' ')"
-  fi
+  # Sync databases for the foreign-package check below. This container keeps
+  # setuid working, so pacman's Landlock sandbox cannot apply here; the
+  # sandboxed sync is checked separately (--inner-pacman).
+  pacman -Sy --noconfirm --disable-sandbox >/dev/null 2>&1 || bad "database sync (--disable-sandbox) failed"
   if pacman-key --list-keys "$(lock OMARCHY_KEY_FPR)" >/dev/null 2>&1; then ok "Omarchy key $(lock OMARCHY_KEY_FPR) trusted"; else bad "Omarchy key not in keyring"; fi
 
   tmpc=$(mktemp -d)
@@ -67,8 +82,10 @@ if [[ ${1:-} == --inner ]]; then
   m=$(stat -c %a /tmp)
   if [[ $m == 1777 ]]; then ok "stat -c %a /tmp = $m"; else bad "stat -c %a /tmp = $m (expected 1777)"; fi
 
+  ucap=$(getcap /usr/bin/newuidmap 2>/dev/null || true)
+  if [[ $ucap == *cap_setuid* ]]; then ok "file capabilities survive the export: $ucap"; else bad "newuidmap lost cap_setuid ('$ucap')"; fi
   caps=$(getcap /usr/bin/ping 2>/dev/null || true)
-  ping_range=$(grep -hs '^net.ipv4.ping_group_range' /usr/lib/sysctl.d/*.conf /etc/sysctl.d/*.conf | tail -n 1)
+  ping_range=$(grep -hsE '^-?net\.ipv4\.ping_group_range' /usr/lib/sysctl.d/*.conf /etc/sysctl.d/*.conf | tail -n 1)
   if [[ $caps == *cap_net_raw* ]]; then
     ok "getcap /usr/bin/ping: $caps"
   elif [[ -n $ping_range ]]; then
@@ -145,10 +162,15 @@ case "$(basename "$ARTIFACT")" in
 esac
 TAG="omarchy-wsl-smoke:$$"
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+# shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() { ((KEEP)) || $ENGINE rmi -f "$TAG" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 echo "[smoke] importing $ARTIFACT ($(stat -c %s "$ARTIFACT" 2>/dev/null || stat -f %z "$ARTIFACT") bytes)"
 $ENGINE import ${PLATFORM:+--platform "$PLATFORM"} "$ARTIFACT" "$TAG" >/dev/null
+rc=0
 $ENGINE run --rm ${PLATFORM:+--platform "$PLATFORM"} --network "${SMOKE_NETWORK:-host}" \
-  -v "$SELF:/smoke.sh:ro" "$TAG" /bin/bash /smoke.sh --inner
+  --security-opt no-new-privileges -v "$SELF:/smoke.sh:ro" "$TAG" /bin/bash /smoke.sh --inner-pacman || rc=1
+$ENGINE run --rm ${PLATFORM:+--platform "$PLATFORM"} --network "${SMOKE_NETWORK:-host}" \
+  -v "$SELF:/smoke.sh:ro" "$TAG" /bin/bash /smoke.sh --inner || rc=1
+exit "$rc"

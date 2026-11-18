@@ -24,4 +24,6 @@ jobs:
       - name: Build the test environment
         run: docker build -t omarchy-wsl-test -f tests/ci/Containerfile tests/ci
       - name: Run every suite (strict, skips fail)
-        run: docker run --rm --network host -v "$PWD:/src" -w /src -e OMW_STRICT=1 omarchy-wsl-test tests/run-all.sh
+        run: |
+          docker run --rm --network host -v "$PWD:/repo:ro" -e OMW_STRICT=1 omarchy-wsl-test \
+            bash -c 'cp -a /repo /tmp/src && cd /tmp/src && tests/run-all.sh'

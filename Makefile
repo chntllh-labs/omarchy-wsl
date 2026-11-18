@@ -56,8 +56,9 @@ test:
 
 test-container:
 	@[[ -n "$(CONTAINER_ENGINE)" ]] || { echo "docker or podman required" >&2; exit 2; }
-	$(CONTAINER_ENGINE) build -t omarchy-wsl-test -f tests/ci/Containerfile tests/ci
-	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR):/src" -w /src -e OMW_STRICT=1 omarchy-wsl-test tests/run-all.sh
+	$(CONTAINER_ENGINE) build --network host -t omarchy-wsl-test -f tests/ci/Containerfile tests/ci
+	$(CONTAINER_ENGINE) run --rm --network host -v "$(CURDIR):/repo:ro" -e OMW_STRICT=1 omarchy-wsl-test \
+		bash -c 'cp -a /repo /tmp/src && cd /tmp/src && tests/run-all.sh'
 
 lint:
 	@tests/run-all.sh --lint-only

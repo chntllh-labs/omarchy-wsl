@@ -84,20 +84,23 @@ if ((LINT)); then
   section "lint: PowerShell parse"
   mapfile -t ps1 < <(git ls-files '*.ps1' 2>/dev/null || find . -name '*.ps1' -not -path './.git/*' | sed 's|^\./||')
   if command -v pwsh >/dev/null; then
+    parse_ps1=$(mktemp "${TMPDIR:-/tmp}/parse-ps1.XXXXXX.ps1")
     # shellcheck disable=SC2016 # PowerShell variables, expanded by pwsh
-    if pwsh -NoLogo -NoProfile -Command '
-      $bad = 0
-      foreach ($f in $args) {
-        $tokens = $null; $errors = $null
-        [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$tokens, [ref]$errors)
-        if ($errors.Count) { $bad++; $errors | ForEach-Object { Write-Host ("{0}:{1}: {2}" -f $f, $_.Extent.StartLineNumber, $_.Message) } }
-        else { Write-Host "ok  $f" }
-      }
-      exit $bad' "${ps1[@]}"; then
+    printf '%s\n' \
+      '$bad = 0' \
+      'foreach ($f in $args) {' \
+      '  $tokens = $null; $errors = $null' \
+      '  [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$tokens, [ref]$errors)' \
+      '  if ($errors.Count) { $bad++; $errors | ForEach-Object { Write-Host ("{0}:{1}: {2}" -f $f, $_.Extent.StartLineNumber, $_.Message) } }' \
+      '  else { Write-Host "ok  $f" }' \
+      '}' \
+      'exit $bad' >"$parse_ps1"
+    if pwsh -NoLogo -NoProfile -File "$parse_ps1" "${ps1[@]}"; then
       record "pwsh parse (${#ps1[@]} scripts)" "${#ps1[@]}" 0 0 0
     else
       record "pwsh parse (${#ps1[@]} scripts)" 0 1 0 1
     fi
+    rm -f "$parse_ps1"
   else
     echo "pwsh not installed"
     record "pwsh parse" 0 0 1 0
