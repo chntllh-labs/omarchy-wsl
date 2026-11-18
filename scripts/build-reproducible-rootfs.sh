@@ -16,7 +16,9 @@
 # Environment: CONTAINER_ENGINE (docker|podman), SOURCE_DATE_EPOCH (default:
 # last commit time), OMARCHY_WSL_GIT_SHA, NORMALIZE_IMAGE (default
 # debian:bookworm-slim: GNU tar + gzip), MAX_SIZE_MB (default 800),
-# PACMAN_MIRROR, MAKE_JOBS, AUDIT_EXTRA_PATTERNS.
+# PACMAN_MIRROR, MAKE_JOBS, AUDIT_EXTRA_PATTERNS, BUILD_NETWORK (default host:
+# on a WSL host with DNS tunnelling the resolver, 10.255.255.254, is unreachable
+# from a bridge network, so RUN steps could not resolve anything).
 #
 # Outputs dist/Omarchy-arm64.wsl or dist/Omarchy-x86_64.wsl plus .sha256.
 # Archiving runs as root inside a Linux container (scripts/normalize-rootfs.sh):
@@ -76,6 +78,7 @@ export SOURCE_DATE_EPOCH
 OMARCHY_WSL_GIT_SHA="${OMARCHY_WSL_GIT_SHA:-$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)}"
 NORMALIZE_IMAGE="${NORMALIZE_IMAGE:-docker.io/library/debian:bookworm-slim}"
 MAX_SIZE_MB="${MAX_SIZE_MB:-800}"
+BUILD_NETWORK="${BUILD_NETWORK:-host}"
 
 ENGINE="${CONTAINER_ENGINE:-}"
 if [[ -z $ENGINE ]]; then
@@ -114,7 +117,7 @@ echo "========================================================================"
 
 if ((SKIP_BUILD == 0)); then
   log "building $IMAGE_TAG"
-  $ENGINE build --platform "$PLATFORM" \
+  $ENGINE build --platform "$PLATFORM" --network "$BUILD_NETWORK" \
     --build-arg ARCH="$ARCH" \
     --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     --build-arg OMARCHY_WSL_GIT_SHA="$OMARCHY_WSL_GIT_SHA" \
