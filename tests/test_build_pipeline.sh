@@ -13,6 +13,8 @@
 #     removes credentials (.config/gh, .netrc, ...) from every home
 # Root-only checks (ownership, file capabilities) need root in a container;
 # under OMW_STRICT=1 a missing prerequisite is a failure, not a skip.
+# OMW_REAL_ROOT=0 disables that tier on purpose (unprivileged CI jobs, same
+# convention as the OOBE suites): it is reported, not counted as a skip.
 # ==============================================================================
 
 set -uo pipefail
@@ -139,7 +141,9 @@ check "truncates logs, clears /tmp, keeps 1777" bash -c "[[ ! -s '$s/var/log/pac
 check "sanitised tree passes the audit" bash -c "bash '$AUDIT' '$s' >/dev/null 2>&1"
 
 header "deterministic export (scripts/normalize-rootfs.sh)"
-if [[ $(uname -s) != Linux || $EUID -ne 0 ]]; then
+if [[ ${OMW_REAL_ROOT:-} == 0 && $EUID -ne 0 ]]; then
+  echo "  [INFO] root tier disabled (OMW_REAL_ROOT=0): normalisation runs only as root"
+elif [[ $(uname -s) != Linux || $EUID -ne 0 ]]; then
   skip "normalisation needs root on Linux (run inside the test container)"
 elif ! tar --version 2>/dev/null | grep -q 'GNU tar'; then
   skip "GNU tar not available"
