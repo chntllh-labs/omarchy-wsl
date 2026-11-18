@@ -41,15 +41,30 @@ install=omarchy-wsl.install
 # Configuration users are expected to edit: pacman keeps local changes and
 # writes .pacnew files on upgrade instead of overwriting them.
 backup=(
-  'etc/wsl.conf'
-  'etc/wsl-distribution.conf'
+  'etc/alsa/conf.d/99-omarchy-wslg-pulse.conf'
+  'etc/containers/containers.conf'
   'etc/docker/daemon.json'
+  'etc/profile.d/00-omarchy-firstboot.sh'
+  'etc/profile.d/10-omarchy-wsl-path.sh'
+  'etc/profile.d/20-omarchy-browser.sh'
+  'etc/profile.d/20-omarchy-wslg-audio.sh'
+  'etc/profile.d/30-omarchy-ssh-agent.sh'
+  'etc/profile.d/40-omarchy-drvfs-guard.sh'
+  'etc/profile.d/50-omarchy-docker.sh'
+  'etc/profile.d/60-omarchy-cgroup-governance.sh'
+  'etc/pulse/client.conf.d/wslg.conf'
   'etc/sysctl.d/99-omarchy-wsl.conf'
   'etc/sysctl.d/99-zz-omarchy-wsl-network.conf'
   'etc/sysctl.d/99-zz-omarchy-wsl-stability.conf'
   'etc/systemd/logind.conf.d/10-omarchy-linger.conf'
-  'etc/systemd/system/build.slice'
   'etc/systemd/oomd.conf.d/10-omarchy-oomd.conf'
+  'etc/systemd/resolved.conf.d/10-omarchy-wsl.conf'
+  'etc/systemd/system/build.slice'
+  'etc/systemd/system/user-.slice.d/10-interactive-protection.conf'
+  'etc/tmpfiles.d/wsl-nvme-io.conf'
+  'etc/tmpfiles.d/x11.conf'
+  'etc/wsl-distribution.conf'
+  'etc/wsl.conf'
 )
 # makepkg checksum of the git source: sha256 of `git archive --format tar _commit`.
 _source_sha256='bf3220fcc7b9d883a86f1c59efd79ce675fe137cdbb1324e9785c3cc45d01de7'

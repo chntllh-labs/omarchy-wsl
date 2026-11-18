@@ -109,4 +109,3 @@ exclude wsl/keys/*
 exclude tools/generate-notify-icons.py
 exclude assets/*.svg
 exclude wsl/etc-overrides/*
-exclude wsl/ico/*

@@ -15,6 +15,7 @@
 #   AUDIT_EXTRA_PATTERNS  passed through to tests/audit-rootfs-leaks.sh
 #   HOST_UID/HOST_GID     owner of the output file on the host
 #   AUDIT_SCRIPT          default /tests/audit-rootfs-leaks.sh
+#   NORMALIZE_ROOTFS      scratch extraction directory (default /rootfs)
 # ==============================================================================
 
 set -euo pipefail
@@ -23,7 +24,7 @@ EXPORT="${1:?usage: normalize-rootfs.sh <export.tar> <output.wsl>}"
 OUTPUT="${2:?usage: normalize-rootfs.sh <export.tar> <output.wsl>}"
 : "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH must be set}"
 AUDIT_SCRIPT="${AUDIT_SCRIPT:-/tests/audit-rootfs-leaks.sh}"
-ROOTFS=/rootfs
+ROOTFS="${NORMALIZE_ROOTFS:-/rootfs}"
 
 log() { echo "[normalize] $*"; }
 ((EUID == 0)) || {

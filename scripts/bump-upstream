@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# scripts/bump-upstream: move the Omarchy pin to upstream's current release
+# ==============================================================================
+#   scripts/bump-upstream [--dry-run] [--pkgbuild-url URL]
+#
+# Reads _tag, _commit, pkgver and the git-source sha256 from upstream's own
+# omarchy PKGBUILD (omacom-io/omarchy-pkgs, the source of truth for what
+# pkgs.omarchy.org ships), checks that the [omarchy] stable repository already
+# publishes that version for aarch64 and x86_64, fetches the commit (depth 1)
+# and re-verifies the checksum, then rewrites upstream.lock and the omarchy-wsl
+# PKGBUILD together (pkgrel back to 1). Review, rebuild, run tests/run-all.sh.
+# ==============================================================================
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PKGBUILD_URL="https://raw.githubusercontent.com/omacom-io/omarchy-pkgs/master/pkgbuilds/omarchy/PKGBUILD"
+DRY_RUN=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --pkgbuild-url)
+      PKGBUILD_URL="${2:?}"
+      shift
+      ;;
+    -h | --help)
+      sed -n '5,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "bump-upstream: unknown argument $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+die() {
+  echo "bump-upstream: $*" >&2
+  exit 1
+}
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+
+curl -fsSL --proto '=https' "$PKGBUILD_URL" -o "$tmp/PKGBUILD"
+field() { sed -n "s/^$1=['\"]\{0,1\}\([^'\"]*\)['\"]\{0,1\}$/\1/p" "$tmp/PKGBUILD" | head -n 1; }
+tag=$(field _tag)
+commit=$(field _commit)
+version=$(field pkgver)
+sha=$(grep -oE "sha256sums=\('[0-9a-f]{64}'" "$tmp/PKGBUILD" | grep -oE '[0-9a-f]{64}' | head -n 1)
+[[ $commit =~ ^[0-9a-f]{40}$ && $sha =~ ^[0-9a-f]{64}$ && -n $version ]] || die "could not parse upstream PKGBUILD"
+echo "upstream: omarchy $version ($tag) commit $commit"
+
+for arch in aarch64 x86_64; do
+  curl -fsSL --proto '=https' "https://pkgs.omarchy.org/stable/$arch/omarchy.db" -o "$tmp/$arch.db"
+  published=$(tar -xOf "$tmp/$arch.db" 2>/dev/null |
+    awk '/^%NAME%$/{getline n} /^%VERSION%$/{getline v; if (n == "omarchy") print v}' | head -n 1)
+  [[ ${published%-*} == "$version" ]] || die "[omarchy] stable/$arch publishes omarchy '$published', not $version yet"
+  echo "[omarchy] stable/$arch: omarchy $published"
+done
+
+url=$(sed -n 's/^OMARCHY_SOURCE_URL=//p' "$ROOT_DIR/upstream.lock")
+git init -q "$tmp/src"
+git -C "$tmp/src" fetch -q --depth 1 "$url" "$commit"
+actual=$(git -C "$tmp/src" -c core.abbrev=no archive --format tar FETCH_HEAD | sha256sum | cut -d' ' -f1)
+[[ $actual == "$sha" ]] || die "checksum of $commit is $actual, upstream PKGBUILD says $sha"
+echo "verified git-archive sha256 $sha"
+
+if ((DRY_RUN)); then
+  echo "dry run: upstream.lock and the PKGBUILD were not changed"
+  exit 0
+fi
+
+lock="$ROOT_DIR/upstream.lock"
+pkgbuild="$ROOT_DIR/packages/PKGBUILDs/omarchy-wsl/PKGBUILD"
+sed -i.bak -e "s/^OMARCHY_TAG=.*/OMARCHY_TAG=$tag/" -e "s/^OMARCHY_VERSION=.*/OMARCHY_VERSION=$version/" \
+  -e "s/^OMARCHY_COMMIT=.*/OMARCHY_COMMIT=$commit/" -e "s/^OMARCHY_SOURCE_SHA256=.*/OMARCHY_SOURCE_SHA256=$sha/" "$lock"
+sed -i.bak -e "s/^_tag=.*/_tag='$tag'/" -e "s/^_commit=.*/_commit='$commit'/" -e "s/^pkgver=.*/pkgver=$version/" \
+  -e "s/^pkgrel=.*/pkgrel=1/" -e "s/^_source_sha256=.*/_source_sha256='$sha'/" "$pkgbuild"
+rm -f "$lock.bak" "$pkgbuild.bak"
+echo "updated upstream.lock and $(basename "$(dirname "$pkgbuild")")/PKGBUILD; now rebuild and run tests/run-all.sh"
