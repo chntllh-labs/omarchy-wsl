@@ -1,384 +1,348 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Omarchy WSL: Adversarial Network & Topology Diagnostic Suite
+# Omarchy WSL: Network Diagnostics
 # /usr/bin/omarchy-netdoctor
 # ==============================================================================
-# Comprehensive audit and automated self-healing for WSL networking modes,
-# DNS tunneling, corporate proxies, VPNs, Docker collisions, and pacman mirrors.
+# Audits WSL networking (mode, sysctls), DNS (resolv.conf model, resolution),
+# proxy/TLS trust, pacman configuration and mirrors, container engine configs
+# and the Windows interop shims. `--repair` runs the sync tools
+# (omarchy-dns-sync, omarchy-ca-sync, omarchy-proxy-sync, omarchy-mirror-sync;
+# they need root) and audits again.
+#
+# Counting: PASS / WARN / FAIL lines are checks; INFO lines are context and are
+# never counted as passed. Exit status: 0 no FAIL, 1 at least one FAIL,
+# 2 usage.
+#
+# Test seams: OMARCHY_NETDOCTOR_ROOT (prefix for every file path read), and
+# PATH for the commands used (ip, sysctl, getent, curl, ping, systemctl,
+# wslinfo, the omarchy-*-sync tools).
 # ==============================================================================
 
 set -euo pipefail
 
-COLOR_RESET="\e[0m"
-COLOR_GREEN="\e[32m"
-COLOR_YELLOW="\e[33m"
-COLOR_RED="\e[31m"
-COLOR_CYAN="\e[36m"
-COLOR_BOLD="\e[1m"
+R="${OMARCHY_NETDOCTOR_ROOT:-}"
+SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 
-pass() { echo -e "  [${COLOR_GREEN}PASS${COLOR_RESET}] $*"; }
-warn() { echo -e "  [${COLOR_YELLOW}WARN${COLOR_RESET}] $*"; }
-fail() { echo -e "  [${COLOR_RED}FAIL${COLOR_RESET}] $*"; }
-info() { echo -e "  [${COLOR_CYAN}INFO${COLOR_RESET}] $*"; }
-header() { echo -e "\n${COLOR_BOLD}${COLOR_CYAN}=== $* ===${COLOR_RESET}"; }
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\e[0m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_RED=$'\e[31m' C_CYAN=$'\e[36m' C_BOLD=$'\e[1m'
+else
+  C_RESET="" C_GREEN="" C_YELLOW="" C_RED="" C_CYAN="" C_BOLD=""
+fi
 
-TOTAL_CHECKS=0
-TOTAL_FAILS=0
-TOTAL_WARNS=0
+N_PASS=0
+N_WARN=0
+N_FAIL=0
+record_pass() { N_PASS=$((N_PASS + 1)); printf '  [%sPASS%s] %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+record_warn() { N_WARN=$((N_WARN + 1)); printf '  [%sWARN%s] %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+record_fail() { N_FAIL=$((N_FAIL + 1)); printf '  [%sFAIL%s] %s\n' "$C_RED" "$C_RESET" "$*"; }
+info() { printf '  [%sINFO%s] %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+header() { printf '\n%s%s=== %s ===%s\n' "$C_BOLD" "$C_CYAN" "$*" "$C_RESET"; }
+log() { printf '%s[omarchy-netdoctor]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
-check_start() { TOTAL_CHECKS=$((TOTAL_CHECKS + 1)); }
-record_fail() { TOTAL_FAILS=$((TOTAL_FAILS + 1)); fail "$*"; }
-record_warn() { TOTAL_WARNS=$((TOTAL_WARNS + 1)); warn "$*"; }
-record_pass() { pass "$*"; }
+# count_matches <regex> <file>: number of matching lines (0 when none/missing).
+count_matches() {
+  local n
+  n=$(grep -cE -- "$1" "$2" 2>/dev/null) || true
+  echo "${n:-0}"
+}
+
+sysctl_value() {
+  local v
+  v=$(sysctl -n "$1" 2>/dev/null) || return 1
+  [[ -n "$v" ]] || return 1
+  echo "$v"
+}
 
 # -----------------------------------------------------------------------------
-# 1. Host WSL Virtualization & Networking Mode Audit
+# 1. WSL networking
 # -----------------------------------------------------------------------------
 audit_wsl_mode() {
-  header "1. WSL Hypervisor & Networking Topology"
-
-  check_start
-  if [[ -f "/proc/sys/fs/binfmt_misc/WSLInterop" || -d "/run/WSL" ]]; then
-    record_pass "WSL environment detected."
+  header "1. WSL networking"
+  if [[ -e "$R/proc/sys/fs/binfmt_misc/WSLInterop" || -e "$R/proc/sys/fs/binfmt_misc/WSLInterop-late" || -d "$R/run/WSL" ]]; then
+    record_pass "Running under WSL (interop registered)."
   else
-    record_warn "Not running inside standard WSL environment (running on Linux host/container)."
+    record_warn "WSL interop not detected (plain Linux host, container, or interop disabled)."
   fi
 
-  check_start
-  # Detect mirrored vs NAT mode
-  # In mirrored mode, loopback or eth0 has host interfaces, or /sys/class/net shows mirrored devices
-  local has_mirrored=0
-  if ip link show 2>/dev/null | grep -qi "loopback0\|Wi-Fi\|Ethernet"; then
-    has_mirrored=1
-  elif ip -4 addr show 2>/dev/null | grep -q "10.255.255.254"; then
-    has_mirrored=1
+  local mode=""
+  if have wslinfo; then
+    mode=$(wslinfo --networking-mode 2>/dev/null || true)
+  fi
+  if [[ -n "$mode" ]]; then
+    info "Networking mode: $mode (wslinfo)."
+  elif ip -4 addr show 2>/dev/null | grep -q '10\.255\.255\.254'; then
+    info "DNS tunneling address 10.255.255.254 present (dnsTunneling=true)."
+  else
+    info "Networking mode unknown (no wslinfo); see .wslconfig networkingMode."
   fi
 
-  if [[ $has_mirrored -eq 1 ]]; then
-    record_pass "Windows 11 Mirrored Networking mode active (Hyper-V VFP)."
-  else
-    local default_gw
-    default_gw=$(ip route show default 2>/dev/null | awk '{print $3}' | head -n 1 || true)
-    if [[ "$default_gw" =~ ^172\. ]]; then
-      record_warn "WSL running in traditional NAT mode (Gateway: $default_gw)."
-      info "Mirrored networking recommended for VPN resilience on Windows 11 Build 22621+."
+  local port
+  if port=$(sysctl_value net.ipv4.ip_unprivileged_port_start); then
+    if (( port == 0 )); then
+      record_warn "net.ipv4.ip_unprivileged_port_start = 0: any local user can bind privileged ports (22, 53, 443)."
+    elif (( port < 1024 )); then
+      info "Unprivileged ports start at $port (lowered from 1024 by a local sysctl)."
     else
-      record_pass "Network routing active (Default Gateway: ${default_gw:-none})."
+      record_pass "Privileged ports (< $port) need root or CAP_NET_BIND_SERVICE."
     fi
-  fi
-
-  # Check unprivileged port sysctl
-  check_start
-  local unpriv_port
-  unpriv_port=$(sysctl -n net.ipv4.ip_unprivileged_port_start 2>/dev/null || echo "1024")
-  if [[ "$unpriv_port" -eq 0 ]]; then
-    record_pass "Unprivileged port binding enabled (net.ipv4.ip_unprivileged_port_start = 0)."
   else
-    record_warn "Privileged ports restricted (< $unpriv_port). Non-root users cannot bind port 80/443 without sudo."
+    info "net.ipv4.ip_unprivileged_port_start not readable."
   fi
 
-  # Check reverse path filter (RPF)
-  check_start
   local rpf
-  rpf=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo "1")
-  if [[ "$rpf" -eq 2 ]]; then
-    record_pass "Loose Reverse Path Filtering active (rp_filter = 2) for VPN resilience."
-  else
-    record_warn "Strict or default rp_filter ($rpf). Asymmetric VPN routes may cause packet drops."
+  if rpf=$(sysctl_value net.ipv4.conf.all.rp_filter); then
+    if [[ "$rpf" == 2 ]]; then
+      record_pass "Loose reverse-path filtering (rp_filter = 2) for VPN multi-homing."
+    else
+      record_warn "rp_filter = $rpf: asymmetric VPN routes may drop packets (Omarchy ships 2)."
+    fi
+  fi
+
+  local rl
+  if rl=$(sysctl_value net.ipv4.conf.all.route_localnet) && [[ "$rl" == 1 ]]; then
+    record_warn "net.ipv4.conf.all.route_localnet = 1: loopback addresses become routable."
   fi
 }
 
 # -----------------------------------------------------------------------------
-# 2. DNS Resolution & systemd-resolved Audit
+# 2. DNS
 # -----------------------------------------------------------------------------
-audit_dns_topology() {
-  header "2. DNS Subsystem & Resolver Topology"
-
-  check_start
-  local resolv_conf="/etc/resolv.conf"
-  if [[ -L "$resolv_conf" ]]; then
-    local target
-    target=$(readlink -f "$resolv_conf")
-    record_pass "/etc/resolv.conf is a symlink to: $target"
-  elif [[ -f "$resolv_conf" ]]; then
-    if grep -qi "automatically generated by WSL" "$resolv_conf"; then
-      record_pass "/etc/resolv.conf is generated by WSL init."
+audit_dns() {
+  header "2. DNS"
+  local rc="$R/etc/resolv.conf" ns
+  if [[ -L "$rc" ]]; then
+    info "/etc/resolv.conf is a symlink to $(readlink "$rc") (opt-in resolver)."
+  elif [[ -f "$rc" ]]; then
+    if grep -qi 'generated by WSL' "$rc"; then
+      record_pass "/etc/resolv.conf is generated by WSL (generateResolvConf = true)."
+    elif grep -q '^# Managed by omarchy-dns-sync' "$rc"; then
+      record_pass "/etc/resolv.conf was repaired by omarchy-dns-sync (direct mode)."
     else
-      info "/etc/resolv.conf is a static or custom configuration file."
+      info "/etc/resolv.conf is a custom file."
+    fi
+    ns=$(count_matches '^nameserver[[:space:]]+[0-9A-Fa-f:.]+' "$rc")
+    if (( ns > 0 )); then
+      record_pass "/etc/resolv.conf lists $ns nameserver(s)."
+    else
+      record_fail "/etc/resolv.conf has no nameserver. Run: sudo omarchy-dns-sync"
+    fi
+    if grep -Eq '^options.*\brotate\b' "$rc"; then
+      record_warn "resolv.conf uses 'options rotate' (split-horizon names may fail intermittently)."
     fi
   else
-    record_fail "/etc/resolv.conf does not exist!"
+    record_fail "/etc/resolv.conf does not exist. Run: sudo omarchy-dns-sync"
   fi
 
-  # Check systemd-resolved status
-  check_start
-  if command -v systemctl >/dev/null 2>&1; then
+  if have systemctl; then
     if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-      record_pass "systemd-resolved.service is running."
-      
-      # Check DNSSEC setting
-      if [[ -f "/etc/systemd/resolved.conf.d/10-omarchy-wsl.conf" ]]; then
-        if grep -q "DNSSEC=no" "/etc/systemd/resolved.conf.d/10-omarchy-wsl.conf"; then
-          record_pass "DNSSEC disabled in resolved drop-in (prevents corporate proxy SERVFAIL)."
-        else
-          record_warn "DNSSEC not explicitly disabled. May fail behind enterprise MITM proxies."
-        fi
-      fi
+      info "systemd-resolved is active (opt-in; the image masks it). Make sure /etc/resolv.conf points at it."
     else
-      record_warn "systemd-resolved.service is not active."
+      record_pass "systemd-resolved is not running (expected: WSL provides resolv.conf)."
     fi
-  else
-    info "systemctl not available; skipping systemd-resolved check."
   fi
 
-  # Functional DNS test
-  check_start
-  local dns_test=0
-  for domain in "archlinux.org" "github.com" "cloudflare.com"; do
-    if getent ahostsv4 "$domain" >/dev/null 2>&1; then
-      dns_test=1
-      break
-    fi
+  local d ok=0
+  for d in archlinux.org github.com cloudflare.com; do
+    if timeout 5 getent ahosts "$d" >/dev/null 2>&1; then ok=1; break; fi
   done
-
-  if [[ $dns_test -eq 1 ]]; then
-    record_pass "DNS resolution is functional across public endpoints."
+  if (( ok )); then
+    record_pass "Public names resolve."
   else
-    record_fail "CRITICAL: DNS resolution completely failed! Unable to resolve public hosts."
+    record_fail "DNS resolution failed for archlinux.org, github.com and cloudflare.com."
   fi
 }
 
 # -----------------------------------------------------------------------------
-# 3. Corporate Proxy & TLS Certificate Audit
+# 3. Proxy & TLS
 # -----------------------------------------------------------------------------
 audit_proxy_and_tls() {
-  header "3. Corporate Proxy & TLS Trust Verification"
-
-  check_start
-  local proxy_active=0
-  for var in http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; do
-    if [[ -n "${!var:-}" ]]; then
-      proxy_active=1
-      break
-    fi
+  header "3. Proxy & TLS trust"
+  local var active=""
+  for var in https_proxy HTTPS_PROXY http_proxy HTTP_PROXY all_proxy; do
+    if [[ -n "${!var:-}" ]]; then active="${!var}"; break; fi
   done
-
-  if [[ $proxy_active -eq 1 ]]; then
-    record_pass "Corporate HTTP proxy variables active (${http_proxy:-${https_proxy:-none}})."
+  if [[ -n "$active" ]]; then
+    info "Proxy in use: $active"
   else
-    info "No HTTP proxy environment variables configured."
+    info "No proxy variables set."
   fi
 
-  # Probe HTTPS connectivity and verify certificate chain
-  check_start
-  local curl_out
-  curl_out=$(curl -s -f -I -m 5 https://archlinux.org 2>&1 || true)
-  if [[ "$curl_out" =~ "HTTP/" ]]; then
-    record_pass "HTTPS handshake and certificate verification successful."
-  elif [[ "$curl_out" =~ "certificate" || "$curl_out" =~ "SSL" ]]; then
-    record_fail "TLS Certificate verification failed: Corporate MITM proxy detected without trusted root CA!"
-    info "Run 'omarchy-ca-sync' to import Windows Enterprise Root CAs."
+  local out
+  if have curl; then
+    out=$(curl -sS -I -m 8 https://archlinux.org 2>&1) || true
+    if [[ "$out" == *HTTP/* ]]; then
+      record_pass "HTTPS to archlinux.org works (certificate chain trusted)."
+    elif [[ "$out" == *certificate* || "$out" == *SSL* ]]; then
+      record_fail "TLS verification failed: likely an inspecting proxy whose root CA Linux does not trust. Run: sudo omarchy-ca-sync"
+    else
+      record_warn "HTTPS probe failed without a TLS error (offline, blocked or timed out)."
+    fi
   else
-    record_warn "HTTPS probe encountered non-fatal timeout or connection refusal."
+    info "curl not installed; HTTPS probe not run."
   fi
 }
 
 # -----------------------------------------------------------------------------
-# 4. Pacman Mirror & Download Resilience Audit
+# 4. pacman
 # -----------------------------------------------------------------------------
-audit_pacman_resilience() {
-  header "4. Pacman & Package Repository Resilience"
-
-  check_start
-  local pacman_conf="/etc/pacman.conf"
-  if [[ -f "$pacman_conf" ]]; then
-    if grep -q "^DisableSandbox" "$pacman_conf" 2>/dev/null; then
-      record_pass "Pacman sandbox disabled (DisableSandbox) for WSL container stability."
+audit_pacman() {
+  header "4. pacman"
+  local conf="$R/etc/pacman.conf" ml="$R/etc/pacman.d/mirrorlist" n
+  if [[ -f "$conf" ]]; then
+    if grep -Eq '^[[:space:]]*DisableSandbox' "$conf"; then
+      record_warn "pacman download sandbox disabled (DisableSandbox); the image keeps it on."
     else
-      record_warn "DisableSandbox missing from $pacman_conf. May fail under seccomp."
+      record_pass "pacman download sandbox enabled$(grep -Eq '^[[:space:]]*DownloadUser' "$conf" && echo ' (DownloadUser set)')."
     fi
-
-    if grep -q "^XferCommand.*connect-timeout" "$pacman_conf" 2>/dev/null; then
-      record_pass "Pacman XferCommand configured with aggressive connection timeout."
-    else
-      record_warn "Pacman XferCommand lacks connect-timeout. Dead mirrors may hang for 5 minutes."
-    fi
-  else
-    record_fail "Pacman configuration file ($pacman_conf) not found!"
-  fi
-
-  check_start
-  local mirrorlist="/etc/pacman.d/mirrorlist"
-  if [[ -f "$mirrorlist" ]]; then
-    local server_count
-    server_count=$(grep -c "^Server" "$mirrorlist" 2>/dev/null || echo "0")
-    if [[ "$server_count" -gt 0 ]]; then
-      record_pass "Mirrorlist contains $server_count active mirror servers."
-    else
-      record_fail "CRITICAL: /etc/pacman.d/mirrorlist has 0 active Server entries! Package updates will fail."
-    fi
-  else
-    record_fail "/etc/pacman.d/mirrorlist missing!"
-  fi
-}
-
-# -----------------------------------------------------------------------------
-# 5. Container Engine Coexistence (Docker & Podman)
-# -----------------------------------------------------------------------------
-audit_container_bridges() {
-  header "5. Container Engine Coexistence (Docker & Podman)"
-
-  check_start
-  if command -v dockerd >/dev/null 2>&1 || [[ -f "/etc/docker/daemon.json" ]]; then
-    if [[ -f "/etc/docker/daemon.json" ]]; then
-      if grep -q "default-address-pools" "/etc/docker/daemon.json"; then
-        record_pass "Docker configured with isolated address pools (prevents corporate subnet collision)."
+    if grep -Eq '^[[:space:]]*XferCommand' "$conf"; then
+      if grep -Eq '^[[:space:]]*XferCommand.*--connect-timeout' "$conf"; then
+        record_pass "XferCommand sets a connect timeout."
       else
-        record_warn "Docker daemon.json lacks default-address-pools. Default 172.17.0.0/16 may collide with VPNs."
-      fi
-
-      if grep -q '"mtu": 1420' "/etc/docker/daemon.json"; then
-        record_pass "Docker MTU clamped to 1420 for VPN tunnel packet compatibility."
-      else
-        record_warn "Docker MTU not clamped. Packets larger than 1420 may be dropped on VPN tunnels."
+        record_warn "XferCommand has no --connect-timeout; a black-holed mirror can stall downloads."
       fi
     else
-      record_warn "Docker installed but /etc/docker/daemon.json not found."
+      record_pass "pacman uses its built-in downloader (no XferCommand)."
     fi
   else
-    info "Docker daemon not installed; skipping Docker check."
+    record_fail "$conf not found."
   fi
 
-  check_start
-  if command -v podman >/dev/null 2>&1; then
-    if [[ -f "/etc/containers/containers.conf" ]]; then
-      record_pass "Podman containers.conf found."
+  if [[ -f "$ml" ]]; then
+    n=$(count_matches '^Server[[:space:]]*=[[:space:]]*https?://[^[:space:]]+' "$ml")
+    if (( n > 0 )); then
+      record_pass "Mirrorlist has $n active server(s)."
     else
-      record_warn "Podman installed but hardened containers.conf not configured."
+      record_fail "Mirrorlist has no usable Server line. Run: sudo omarchy-mirror-sync restore-default"
+    fi
+    if (( $(count_matches '^Server[[:space:]]*=[[:space:]]*http://' "$ml") > 0 )); then
+      record_warn "Mirrorlist contains plain-http servers."
     fi
   else
-    info "Podman not installed; skipping Podman check."
+    record_fail "$ml is missing. Run: sudo omarchy-mirror-sync restore-default"
   fi
 }
 
 # -----------------------------------------------------------------------------
-# 6. Localhost Dual-Stack & Host Port Interop
+# 5. Containers
 # -----------------------------------------------------------------------------
-audit_localhost_interop() {
-  header "6. Localhost Dual-Stack & Host Interop"
-
-  check_start
-  # Verify IPv4 loopback
-  if ping -c 1 -W 1 127.0.0.1 >/dev/null 2>&1; then
-    record_pass "IPv4 localhost (127.0.0.1) is operational."
+audit_containers() {
+  header "5. Container engines"
+  local dj="$R/etc/docker/daemon.json" cc="$R/etc/containers/containers.conf"
+  if [[ -f "$dj" ]]; then
+    if grep -q 'default-address-pools' "$dj"; then
+      record_pass "Docker uses dedicated address pools (avoids Docker's default bridge subnet colliding with VPN routes)."
+    else
+      record_warn "Docker has no default-address-pools; its default bridge subnet may collide with VPN or corporate routes."
+    fi
+    if grep -q '127\.0\.0\.53' "$dj"; then
+      record_warn "daemon.json points containers at 127.0.0.53, but systemd-resolved is not running in this image."
+    fi
+  elif have dockerd; then
+    record_warn "dockerd is installed but /etc/docker/daemon.json is missing."
   else
-    record_fail "IPv4 localhost is down!"
+    info "Docker not installed."
   fi
-
-  # Verify IPv6 loopback
-  check_start
-  if ping -c 1 -W 1 ::1 >/dev/null 2>&1; then
-    record_pass "IPv6 localhost (::1) is operational."
+  if have podman; then
+    if [[ -f "$cc" ]]; then
+      record_pass "Podman containers.conf present."
+    else
+      record_warn "Podman installed without /etc/containers/containers.conf."
+    fi
   else
-    record_warn "IPv6 localhost (::1) is not responding. Dual-stack apps may fail to bind ::1."
-  fi
-
-  # Check Windows interop shims
-  check_start
-  if [[ -d "/usr/lib/omarchy-wsl/bin" && -x "/usr/lib/omarchy-wsl/bin/powershell.exe" ]]; then
-    record_pass "Windows interop shims installed in /usr/lib/omarchy-wsl/bin."
-  else
-    record_warn "Windows interop shims not installed. Run 'wsl-shims-setup.sh' to enable."
+    info "Podman not installed."
   fi
 }
 
 # -----------------------------------------------------------------------------
-# Automated Repair Routine
+# 6. Loopback & interop shims
 # -----------------------------------------------------------------------------
-run_repair() {
-  header "Initiating Automated Network & DNS Self-Healing"
-
-  log "1. Synchronizing Dynamic DNS & Resolver..."
-  if command -v omarchy-dns-sync >/dev/null 2>&1; then
-    omarchy-dns-sync sync || true
-  elif [[ -x "$(dirname "$0")/omarchy-dns-sync" ]]; then
-    "$(dirname "$0")/omarchy-dns-sync" sync || true
+audit_local() {
+  header "6. Loopback & Windows shims"
+  if have ping; then
+    if ping -c 1 -W 1 127.0.0.1 >/dev/null 2>&1; then
+      record_pass "IPv4 loopback answers."
+    else
+      record_fail "IPv4 loopback (127.0.0.1) does not answer."
+    fi
+    if ping -c 1 -W 1 ::1 >/dev/null 2>&1; then
+      record_pass "IPv6 loopback answers."
+    else
+      record_warn "IPv6 loopback (::1) does not answer; services bound to ::1 are unreachable."
+    fi
+  else
+    info "ping not installed; loopback probe not run."
   fi
-
-  log "2. Synchronizing Windows Enterprise Root CAs..."
-  if command -v omarchy-ca-sync >/dev/null 2>&1; then
-    omarchy-ca-sync || true
-  elif [[ -x "$(dirname "$0")/omarchy-ca-sync" ]]; then
-    "$(dirname "$0")/omarchy-ca-sync" || true
+  if [[ -e "$R/usr/lib/omarchy-wsl/bin/powershell.exe" ]]; then
+    record_pass "Windows shims installed in /usr/lib/omarchy-wsl/bin."
+  else
+    record_warn "Windows shims missing. Run as root: /usr/lib/omarchy-wsl/bin/wsl-shims-setup.sh"
   fi
-
-  log "3. Synchronizing Windows Host Proxy..."
-  if command -v omarchy-proxy-sync >/dev/null 2>&1; then
-    omarchy-proxy-sync || true
-  elif [[ -x "$(dirname "$0")/omarchy-proxy-sync" ]]; then
-    "$(dirname "$0")/omarchy-proxy-sync" || true
-  fi
-
-  log "4. Optimizing Pacman Mirrorlist..."
-  if command -v omarchy-mirror-sync >/dev/null 2>&1; then
-    omarchy-mirror-sync rank || true
-  elif [[ -x "$(dirname "$0")/omarchy-mirror-sync" ]]; then
-    "$(dirname "$0")/omarchy-mirror-sync" rank || true
-  fi
-
-  log "Self-healing completed. Re-running diagnostic audit..."
-  run_all_audits
 }
 
 run_all_audits() {
-  TOTAL_CHECKS=0
-  TOTAL_FAILS=0
-  TOTAL_WARNS=0
-
+  N_PASS=0 N_WARN=0 N_FAIL=0
   audit_wsl_mode
-  audit_dns_topology
+  audit_dns
   audit_proxy_and_tls
-  audit_pacman_resilience
-  audit_container_bridges
-  audit_localhost_interop
-
-  header "Audit Summary"
-  echo -e "  Total Checks: ${TOTAL_CHECKS}"
-  echo -e "  Passed:       ${COLOR_GREEN}$((TOTAL_CHECKS - TOTAL_FAILS - TOTAL_WARNS))${COLOR_RESET}"
-  echo -e "  Warnings:     ${COLOR_YELLOW}${TOTAL_WARNS}${COLOR_RESET}"
-  echo -e "  Failures:     ${COLOR_RED}${TOTAL_FAILS}${COLOR_RESET}"
-
-  if [[ $TOTAL_FAILS -eq 0 ]]; then
-    echo -e "\n${COLOR_GREEN}${COLOR_BOLD}[SUCCESS] Omarchy WSL network subsystem is healthy!${COLOR_RESET}\n"
+  audit_pacman
+  audit_containers
+  audit_local
+  header "Summary"
+  printf '  Checks: %d  (pass %s%d%s, warn %s%d%s, fail %s%d%s; INFO lines are not counted)\n' \
+    $((N_PASS + N_WARN + N_FAIL)) "$C_GREEN" "$N_PASS" "$C_RESET" "$C_YELLOW" "$N_WARN" "$C_RESET" "$C_RED" "$N_FAIL" "$C_RESET"
+  if (( N_FAIL == 0 )); then
+    printf '\n%s%sNo failures.%s\n' "$C_GREEN" "$C_BOLD" "$C_RESET"
     return 0
+  fi
+  printf '\n%s%s%d failure(s). Try: sudo omarchy-netdoctor --repair%s\n' "$C_RED" "$C_BOLD" "$N_FAIL" "$C_RESET"
+  return 1
+}
+
+# find_sync_tool <name>: PATH first (installed system), then the sibling copy.
+find_sync_tool() {
+  if command -v "$1" >/dev/null 2>&1; then
+    command -v "$1"
+  elif [[ -x "$SELF_DIR/$1" ]]; then
+    echo "$SELF_DIR/$1"
   else
-    echo -e "\n${COLOR_RED}${COLOR_BOLD}[ACTION REQUIRED] Encountered $TOTAL_FAILS failure(s). Run 'omarchy-netdoctor --repair' to fix.${COLOR_RESET}\n"
     return 1
   fi
 }
 
-# -----------------------------------------------------------------------------
-# Entry Point
-# -----------------------------------------------------------------------------
-case "${1:-audit}" in
-  audit|check)
-    run_all_audits
-    ;;
-  --repair|--fix-all|-r)
-    run_repair
-    ;;
-  --help|-h)
-    cat << EOF
-Usage: $(basename "$0") [OPTIONS]
+run_repair() {
+  local step tool rc
+  header "Repair"
+  (( EUID == 0 )) || log "Not running as root: the sync tools need root to write /etc (re-run with sudo)."
+  for step in "omarchy-dns-sync sync" "omarchy-ca-sync" "omarchy-proxy-sync" "omarchy-mirror-sync rank"; do
+    read -r -a argv <<<"$step"
+    if ! tool=$(find_sync_tool "${argv[0]}"); then
+      log "${argv[0]} not installed; skipped."
+      continue
+    fi
+    log "Running ${step}..."
+    rc=0
+    timeout 120 "$tool" "${argv[@]:1}" || rc=$?
+    if (( rc == 0 )); then log "${argv[0]}: ok"; else log "${argv[0]}: exit $rc"; fi
+  done
+  log "Repair finished; auditing again."
+  run_all_audits
+}
 
-Options:
-  audit, check        Run full adversarial network diagnostic audit (default)
-  --repair, -r        Automatically repair and synchronize DNS, CAs, and mirrors
-  --help, -h          Show this help message
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [audit|check|--repair|-r|--help]
+
+  audit, check   run the network audit (default)
+  --repair, -r   run omarchy-dns-sync, omarchy-ca-sync, omarchy-proxy-sync and
+                 omarchy-mirror-sync (as root), then audit again
+  --help, -h     show this help
 EOF
-    ;;
-  *)
-    echo "Unknown option: $1" >&2
-    exit 1
-    ;;
+}
+
+case "${1:-audit}" in
+  audit|check) run_all_audits ;;
+  --repair|--fix-all|-r) run_repair ;;
+  --help|-h|help) usage ;;
+  *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
 esac

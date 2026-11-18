@@ -1,14 +1,21 @@
+# /usr/lib/systemd/system/omarchy-proxy-sync.service
+# Mirrors Windows LocalMachine\Root anchors that Linux does not trust yet
+# (omarchy-ca-sync) and the Windows WinINet proxy (omarchy-proxy-sync).
+# Each step is optional ("-"): a failed Windows query leaves the previous
+# state untouched. Not ordered before network-online.target.
 [Unit]
-Description=Omarchy WSL Windows Host Proxy & CA Sync Engine
-Documentation=https://github.com/omacom-io/omarchy-wsl
-After=network.target omarchy-dns-sync.service
-Before=network-online.target
-Wants=network-online.target
+Description=Omarchy WSL: sync Windows root CAs and proxy settings
+Documentation=https://github.com/chntllh-labs/omarchy-wsl
+After=network.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c "/usr/bin/omarchy-ca-sync || true; /usr/bin/omarchy-proxy-sync || true"
+# PowerShell timeouts (seconds) per tool; together they fit TimeoutStartSec.
+Environment=OMARCHY_CA_TIMEOUT=5 OMARCHY_PROXY_TIMEOUT=3
+ExecStart=-/usr/bin/omarchy-ca-sync --quiet
+ExecStart=-/usr/bin/omarchy-proxy-sync --quiet
+TimeoutStartSec=10s
 StandardOutput=journal
 StandardError=journal
 

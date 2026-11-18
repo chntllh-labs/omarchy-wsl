@@ -1,14 +1,19 @@
+# /usr/lib/systemd/system/omarchy-dns-sync.service
+# Keeps WSL's generated /etc/resolv.conf as-is when it is healthy (and records
+# it as last-known-good); repairs it only when it is missing or has no valid
+# nameserver. Never ordered before network-online.target, so a hung Windows
+# interop call cannot delay services that wait for the network.
 [Unit]
-Description=Omarchy WSL Dynamic DNS & Resolver Sync Engine
-Documentation=https://github.com/omacom-io/omarchy-wsl
-After=systemd-resolved.service network.target
-Before=network-online.target
-Wants=network-online.target
+Description=Omarchy WSL: check /etc/resolv.conf, repair it if broken
+Documentation=https://github.com/chntllh-labs/omarchy-wsl
+After=network.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/omarchy-dns-sync sync
+ExecStart=/usr/bin/omarchy-dns-sync sync --quiet
+# The Windows DNS probe is bounded (6 s) inside the tool; this caps the rest.
+TimeoutStartSec=10s
 StandardOutput=journal
 StandardError=journal
 

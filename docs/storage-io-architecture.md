@@ -14,7 +14,7 @@ WSL historically exposes Windows NTFS drives (`C:\`, `D:\`) under `/mnt/` using 
 - `Tgetattr`: Queries POSIX metadata.
 - `Tlopen` / `Tread` / `Twrite` / `Tclunk`: Handles file open, I/O in fixed buffers (`msize=65536`), and file close.
 
-#### The Math of 9P Latency Amplification
+#### 9P latency amplification (illustrative orders of magnitude, not measurements from this project)
 | Operation | Native ext4 (DRAM Cache) | 9P DrvFs over vsock | Overhead Factor |
 | :--- | :--- | :--- | :--- |
 | **Inode/Dentry Stat** | ~50 – 100 ns | ~30 – 100 µs | **~500x – 1000x** |
@@ -38,7 +38,7 @@ Virtio-FS replaces the socket-based RPC transport with shared memory regions (DA
 #### Production Hazards in WSL (WSL 2.4+ / 3.0+):
 1. **The Silent Automount Cascade Drop**: In WSL 2.5–2.7+, if any single drive (e.g. secondary SATA drive, network mount, or USB media) returns error 22 (`EINVAL`) during virtiofs initialization, the WSL core VM silently drops *all* automounts, leaving `/mnt/c` completely missing without logging an error.
 2. **Statx EIO Failures**: POSIX extended stat translation across certain Windows metadata paths can throw `EIO`.
-3. **Filter Driver Bottleneck Unresolved**: Virtio-FS accelerates guest-to-host IPC, but it **cannot bypass host NTFS locking or Windows Defender scanning**. Accessing files on `/mnt/c` via virtiofs is still 5x–15x slower than native ext4 VHDX.
+3. **Filter Driver Bottleneck Unresolved**: Virtio-FS accelerates guest-to-host IPC, but it **cannot bypass host NTFS locking or Windows Defender scanning**, so `/mnt/c` stays much slower than the native ext4 VHDX (the factor depends on the workload; we have not benchmarked it).
 
 ---
 
@@ -56,11 +56,11 @@ options = "metadata,uid=1000,gid=1000,umask=022,fmask=011,case=off"
    - Required for `chmod 600` (SSH keys), script execution bits, and preventing Git from reporting spurious 0777 permission diffs.
    - Cost: Incurs an additional NTFS EA query during file stat.
 2. **`uid=1000,gid=1000`**:
-   - Binds files lacking metadata directly to the primary user (`aqua`).
+   - Files without stored metadata belong to the primary user (UID 1000).
    - Eliminates runtime Windows SID-to-POSIX UID lookup overhead.
 3. **`umask=022,fmask=011`**:
-   - `umask=022`: Sets directory mask to `0755` (`drwxr-xr-x`), ensuring directory traversal.
-   - `fmask=011`: Strips the executable bit from regular files (`-rw-r--r--`). Prevents plain source files, text files, and images on Windows drives from erroneously inheriting execute permissions.
+   - DrvFs ORs `umask` with `fmask` (files) or `dmask` (directories). Directories: `umask=022` → `0755` (`drwxr-xr-x`).
+   - Files: `022 | 011 = 033` → `0744` (`-rwxr--r--`): group/other execute and write are removed; the owner keeps the execute bit. Other local Linux users can *read* files on the Windows drive (not write them).
 4. **`case=off` vs. `case=dir` (The Latency Multiplier)**:
    - `case=dir`: DrvFs queries the NTFS per-directory case sensitivity attribute (`FILE_CASE_SENSITIVE_SEARCH`) on *every single directory traversal*. On large source trees, this doubles the metadata query overhead across vsock.
    - `case=off`: Standardizes case insensitivity globally across mounted drives, eliminating per-directory NTFS attribute queries and preventing Windows native tool corruption.
@@ -93,15 +93,14 @@ vm.dirty_writeback_centisecs = 250
 - **`dirty_expire_centisecs = 1000` (10s)** & **`dirty_writeback_centisecs = 250` (2.5s)**: Eliminates 30-second dirty data aging, ensuring small, steady I/O cadence.
 
 ### 3.3 Metadata Caching: `vm.vfs_cache_pressure`
-- Default: `100`.
-- In developer environments with large codebases, dentry and inode lookups dominate `git status`, `ripgrep`, and Neovim LSP indexing.
-- Setting `vm.vfs_cache_pressure = 50` prioritizes retaining dentries and inodes in guest RAM over bulk page cache. Subsequent path lookups hit DRAM instantly.
-- *Caution*: Never set to `0`, which completely disables slab reclamation and causes OOM panic.
+- Kernel default: `100`; Omarchy-WSL keeps `100` (`wsl/sysctl.d/99-zz-omarchy-wsl-stability.conf`).
+- Lowering it (e.g. `50`) keeps dentries and inodes cached longer, which helps path-heavy workloads in theory, but under container, language-server and git workloads in WSL2 the resulting slab growth was observed to starve order-0 allocations (kswapd page-allocation failures). The stability file therefore pins `100`.
+- *Caution*: never set `0`; it disables dentry/inode reclaim entirely.
 
 ### 3.4 Block Device Readahead: `read_ahead_kb`
 - Default on virtual block devices (`/dev/sd*`): `128 KB`.
 - For fast NVMe storage reading large compilation artifacts or language models, 128 KB underutilizes PCIe bandwidth.
-- Configured via `/etc/tmpfiles.d/wsl-nvme-io.conf`:
+- Configured via `/etc/tmpfiles.d/wsl-nvme-io.conf` (shipped as `wsl/tmpfiles.d/wsl-nvme-io.conf`):
   ```
   w /sys/block/sd*/queue/read_ahead_kb - - - - 1024
   w /sys/block/vd*/queue/read_ahead_kb - - - - 1024
@@ -119,7 +118,7 @@ vm.dirty_writeback_centisecs = 250
 - When projects reside under `/mnt/c/`, file modifications occur via the Windows kernel, generating `ReadDirectoryChangesW` events on the host.
 - **WSL DrvFs does not bridge host filesystem notifications to guest inotify**.
 - Tools fail to receive change notifications and fall back to polling directory trees every 200–500ms.
-- Polling 50,000 files across 9P/vsock pins all 18 CPU cores and exhausts I/O bandwidth.
+- Polling tens of thousands of files across 9P/vsock costs substantial CPU and I/O on every interval.
 
 ### 4.2 The Storage Topology Law
 ```
@@ -135,8 +134,8 @@ vm.dirty_writeback_centisecs = 250
                    [ STRICT PROHIBITION BARRIER ]
                                   v
 +-------------------------------------------------------------------+
-|   NATIVE EXT4 VHDX (/home/aqua)                                   |
-|   - All source code repositories (~/hermes/workspace)             |
+|   NATIVE EXT4 VHDX (/home/<user>)                                 |
+|   - All source code repositories (e.g. ~/src)                     |
 |   - Package manager caches (~/.cargo, ~/.npm, ~/.local/share/mise)|
 |   - Compilation outputs (target/, build/, dist/)                  |
 |   - Language server caches (clangd, rust-analyzer, gopls)         |
@@ -146,7 +145,7 @@ vm.dirty_writeback_centisecs = 250
 
 ### 4.3 Windows Access to Linux Ext4
 When Windows tools need to view Linux files:
-1. **Windows Explorer**: Access via `\\wsl.localhost\Omarchy\home\aqua\...`.
+1. **Windows Explorer**: Access via `\\wsl.localhost\Omarchy\home\<user>\...`.
 2. **VS Code / Cursor / Zed**: Use the native WSL remote server architecture. The language server and filesystem watcher run natively inside Linux ext4, streaming only UI elements across the socket.
 3. **Windows Defender Exclusion**: Exclude `wsl.exe`, `wslhost.exe`, and the `ext4.vhdx` directory from real-time scanning.
 
@@ -161,10 +160,9 @@ When Windows tools need to view Linux files:
 
 ### 5.2 The `sparseVhd=true` Data Corruption Trap
 - Setting `sparseVhd=true` enables NTFS sparse hole-punching via `FSCTL_SET_ZERO_DATA` during guest `fstrim`.
-- **Critical CVE / Stability Warning (WSL 2.5.6+)**:
-  Microsoft officially gated sparse VHD behind `--allow-unsafe` due to reproducible ext4 superblock and journal corruption caused by race conditions during parallel guest writes and host sparse punching.
-- Furthermore, sparse hole-punching creates hundreds of thousands of NTFS MFT run extents, severely degrading physical NVMe performance.
-- **Production Standard**: Keep `sparseVhd = false`.
+- **Stability warning**: current WSL releases require `--allow-unsafe` to switch a distribution to sparse mode with `wsl --manage <distro> --set-sparse true`, because of reported VHD corruption with sparse disks (no CVE is involved).
+- Hole-punching can also fragment the VHDX on the host file system.
+- **Omarchy-WSL default**: `tools/generate-wslconfig.ps1` writes `sparseVhd=false`; compact explicitly instead (5.3).
 
 ### 5.3 Deterministic Safe Compaction Protocol
 To reclaim disk space safely without corruption risk:
