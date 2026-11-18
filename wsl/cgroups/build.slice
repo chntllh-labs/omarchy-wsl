@@ -1,34 +1,32 @@
+# Omarchy-WSL build slice.
+# Installed twice from the same file:
+#   /etc/systemd/system/build.slice      system manager (root builds)
+#   /usr/lib/systemd/user/build.slice    user manager (omarchy-build runs
+#                                        `systemd-run --user --scope --slice=build.slice`)
+# Every key below is a [Slice] resource-control directive accepted by
+# `systemd-analyze verify` (systemd.resource-control(5)).
 [Unit]
-Description=Omarchy-WSL Build & Compilation Slice (Sandboxed Heavy Computes)
-Documentation=https://github.com/omacom-io/omarchy-wsl
+Description=Omarchy-WSL build and compilation slice
+Documentation=https://github.com/chntllh-labs/omarchy-wsl
 Before=slices.target
 
 [Slice]
-# --- CPU Scheduling Priority ---
-# Default user sessions have CPUWeight=1000. Build processes receive CPUWeight=100 (10x lower priority).
-# Guarantees that interactive Neovim, tmux, SSH, and Bash shells remain 100% responsive
-# even while 18 Oryon cores or 32 x86 threads are pinned at 100% utilization.
-CPUWeight=100
+# CPU and block-I/O weights are relative to sibling units of the same manager
+# (default weight 100). 20 means a saturating build gets about 1/6 of the
+# contended CPU next to one default-weight sibling such as app.slice, so
+# editors and shells in that manager stay responsive. IOWeight only takes
+# effect with a weight-aware I/O scheduler (BFQ or io.cost).
+CPUWeight=20
+IOWeight=20
 
-# --- Block I/O Prioritization ---
-# Prevents heavy compiler write streams (.o, .rlib, target/ directories) from saturating
-# the virtual disk queue ahead of interactive terminal commands.
-IOWeight=100
-
-# --- Memory High Throttling (Soft Ceiling) ---
-# When builds consume 85% of guest memory, the Linux kernel applies proportional reclaim throttling.
-# This slows down memory allocations and gives kswapd and autoMemoryReclaim time to reclaim clean page cache
-# instead of slamming directly into a hard out-of-memory state.
+# Soft ceiling: above 85% of physical memory the kernel throttles and reclaims
+# inside this slice instead of letting it push the whole VM into swap.
 MemoryHigh=85%
 
-# --- Atomic OOM Group Kill (CRITICAL RESILIENCE) ---
-# When an out-of-memory event triggers in this slice, the Linux kernel terminates ALL processes
-# in this cgroup simultaneously as a single atomic unit.
-# Prevents partial OOM kills where 1 clang/rustc process dies while 17 others keep running,
-# leaving the system stuck in swap-thrashing D-state.
-MemoryOOMGroup=yes
-
-# --- OOM Sacrifice Priority ---
-# Tells the Linux kernel OOM killer to sacrifice compilation jobs first (OOMScoreAdjust=500)
-# before ever touching user interactive shells (0), SSH sessions (-200), or tmux (-200).
-OOMScoreAdjust=500
+# systemd-oomd (when systemd-oomd.service is enabled) kills the build cgroup
+# under the highest memory pressure once pressure stays above the limit for
+# DefaultMemoryPressureDurationSec (see 10-omarchy-oomd.conf).
+# The kernel-side "kill the whole build together" behaviour is OOMPolicy=kill,
+# which omarchy-build sets on each transient build scope.
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=60%
