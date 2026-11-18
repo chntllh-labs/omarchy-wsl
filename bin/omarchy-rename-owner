@@ -1,0 +1,981 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Rename the Distro Owner (uid 1000)
+# /usr/bin/omarchy-rename-owner
+# ==============================================================================
+# Renames the account that holds uid 1000 (login, primary group, home) and
+# every piece of distro state keyed on its name: the sudoers drop-in, the
+# systemd linger marker, /etc/wsl.conf [user] default, the OOBE sentinel,
+# /etc/omarchy-user.conf, cron/mail spools and git worktree links under the
+# home. uid and gid numbers never change.
+#
+# Safety:
+#   - root only, from a root session (WSL: wsl.exe -d <distro> -u root);
+#   - refuses while uid 1000 runs anything except its systemd user manager
+#     (which it stops cleanly); it never kills user processes;
+#   - every step is journaled (/var/lib/omarchy/rename-owner.journal) after
+#     backing up the files it touches (/var/lib/omarchy/backups/), and failures
+#     or SIGINT/SIGTERM/SIGHUP roll completed steps back in reverse order;
+#   - each step checks the current state first, so a re-run resumes an
+#     interrupted rename and an already renamed account is a no-op;
+#   - never runs `rm -rf`, never touches Windows files or the registry (it
+#     prints the Windows-side follow-ups instead).
+#
+# Exit codes: 0 renamed or nothing to do · 1 failed and rolled back · 2 usage ·
+# 3 precondition (not root, name invalid or taken, sessions running, no
+# confirmation) · 4 failed and rollback incomplete (journal + backups kept) ·
+# 75 another OOBE/rename holds the lock · 128+n interrupted by signal n
+# (after rolling back).
+#
+# Test seams (besides those of account.sh): OMARCHY_ALLOW_NONROOT=1,
+# OMARCHY_PROC_ROOT, OMARCHY_SPOOL_DIR, OMARCHY_FAULT_AT=<step>,
+# OMARCHY_FAULT_UNDO=<step>, OMARCHY_PAUSE_AT=<step> (+ OMARCHY_PAUSE_FILE).
+# ==============================================================================
+# The do_*/undo_* step functions are dispatched indirectly ("$fn").
+# shellcheck disable=SC2317
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in \
+  "${OMARCHY_WSL_LIB_DIR:+$OMARCHY_WSL_LIB_DIR/omarchy-wsl-account.sh}" \
+  "${OMARCHY_WSL_LIB_DIR:+$OMARCHY_WSL_LIB_DIR/account.sh}" \
+  "${_self%/*}/../lib/omarchy-wsl-account.sh" \
+  /usr/lib/omarchy-wsl/account.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-account.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+unset _lib
+declare -F owner_name >/dev/null || { echo "omarchy-rename-owner: account library not found (expected /usr/lib/omarchy-wsl/account.sh)" >&2; exit 1; }
+# shellcheck disable=SC2034  # read by the logging functions in common.sh
+OMW_TAG="omarchy-rename-owner"
+
+# git-repair runs before compat-symlink: with /home/<old> still resolving,
+# git would consider the old worktree paths valid and leave them in place.
+STEPS=(stop-user-manager rename-login subids rename-group move-home git-repair
+       compat-symlink sudoers linger wsl-conf sentinel spool verify)
+
+# Options
+OPT_DRY=0
+OPT_YES=0
+OPT_FROM=""
+OPT_SYMLINK=1
+OPT_JSON=0
+NEW=""
+ORIG_ARGS=()
+
+# State
+OLD=""
+OLD_HOME=""
+NEW_HOME=""
+OWNER_GID=""
+LINGER_WAS=0
+MANAGER_WAS=0
+SUDO_MODE_OLD="none"
+WSL_DEFAULT_WAS=""
+RESUME=0
+BACKLINK_REMOVED=0
+GIT_REPAIRED=0
+BACKUP_DIR=""
+JOURNAL=""
+DONE_STEPS=()
+IN_ROLLBACK=0
+MUTATING=0
+RESULT=""
+PROC_ROOT="${OMARCHY_PROC_ROOT:-/proc}"
+SPOOL_DIR="${OMARCHY_SPOOL_DIR:-/var/spool}"
+ETC_DIR="${OMW_PASSWD_ROOT}/etc"
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-rename-owner [options] <new-name>
+
+Rename the distro owner (the account with uid 1000). Run it as root from a
+root session, after closing the owner's shells and tmux sessions:
+
+  wsl.exe --terminate <distro>
+  wsl.exe -d <distro> -u root -- omarchy-rename-owner <new-name>
+
+Options:
+  -n, --dry-run          Validate and print the ordered plan; change nothing
+                         (no lock, no journal, no backup directory).
+  -y, --yes              Do not ask for confirmation (required without a terminal).
+      --from NAME        Refuse unless uid 1000 is currently NAME; also completes
+                         a partial rename made outside this tool.
+      --no-compat-symlink
+                         Do not leave /home/<old> -> /home/<new>.
+      --json             Machine-readable plan/result on stdout.
+  -q, --quiet            Only print warnings and errors.
+  -h, --help             Show this help and exit.
+      --version          Print the version and exit.
+
+New names must already be valid: ^[a-z_][a-z0-9_-]*$, at most 31 characters,
+not a system name, not an existing user, group, /home entry or tenant.
+
+Exit codes: 0 done or nothing to do, 1 failed (rolled back), 2 usage,
+3 precondition, 4 failed with an incomplete rollback, 75 busy, 128+n signal.
+EOF
+}
+
+usage_error() {
+  omw_err "$*"
+  usage >&2
+  exit 2
+}
+
+parse_args() {
+  ORIG_ARGS=("$@")
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run) OPT_DRY=1; shift ;;
+      -y|--yes) OPT_YES=1; shift ;;
+      --from)
+        [[ $# -ge 2 && -n "$2" ]] || usage_error "--from requires a NAME"
+        OPT_FROM="$2"
+        shift 2 ;;
+      --from=*) OPT_FROM="${1#*=}"; [[ -n "$OPT_FROM" ]] || usage_error "--from requires a NAME"; shift ;;
+      --no-compat-symlink) OPT_SYMLINK=0; shift ;;
+      --json) OPT_JSON=1; shift ;;
+      -q|--quiet)
+        # shellcheck disable=SC2034  # read by omw_log in common.sh
+        OMW_QUIET=1
+        shift ;;
+      -h|--help) usage; exit 0 ;;
+      --version) echo "omarchy-rename-owner ${VERSION}"; exit 0 ;;
+      --) shift; break ;;
+      -*) usage_error "unknown option: $1" ;;
+      *)
+        [[ -z "$NEW" ]] || usage_error "unexpected argument: $1"
+        NEW="$1"
+        shift ;;
+    esac
+  done
+  if [[ $# -gt 0 ]]; then
+    [[ -z "$NEW" && $# -eq 1 ]] || usage_error "unexpected argument: $*"
+    NEW="$1"
+  fi
+  [[ -n "$NEW" ]] || usage_error "missing <new-name>"
+}
+
+# -----------------------------------------------------------------------------
+# Output helpers (data on stdout, logs on stderr)
+# -----------------------------------------------------------------------------
+out() { (( OPT_JSON )) || printf '%s\n' "$*"; }
+
+json_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\n'/\\n}"
+  printf '"%s"' "$s"
+}
+
+distro_name() { printf '%s\n' "${WSL_DISTRO_NAME:-Omarchy}"; }
+
+root_hint() {
+  local a q=""
+  for a in ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}; do
+    q="$q $(printf '%q' "$a")"
+  done
+  printf 'wsl.exe -d %s -u root -- omarchy-rename-owner%s' "$(distro_name)" "$q"
+}
+
+# -----------------------------------------------------------------------------
+# Inspection
+# -----------------------------------------------------------------------------
+# PIDs owned by uid 1000, one per line.
+uid_pids() {
+  local d u
+  if omw_have pgrep; then
+    pgrep -u "$OMW_OWNER_UID" 2>/dev/null || true
+    return 0
+  fi
+  for d in "$PROC_ROOT"/[0-9]*; do
+    u="$(sed -n 's/^Uid:[[:space:]]*\([0-9]*\).*/\1/p' "$d/status" 2>/dev/null || true)"
+    [[ "$u" == "$OMW_OWNER_UID" ]] && printf '%s\n' "${d##*/}"
+  done
+  return 0
+}
+
+# Processes of uid 1000 outside its systemd user manager (user@1000.service).
+foreign_pids() {
+  local pid
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    if grep -q "/user@${OMW_OWNER_UID}\.service" "$PROC_ROOT/$pid/cgroup" 2>/dev/null; then
+      continue
+    fi
+    printf '%s\n' "$pid"
+  done < <(uid_pids)
+}
+
+describe_pids() {
+  local pid comm
+  for pid in "$@"; do
+    comm="$(cat "$PROC_ROOT/$pid/comm" 2>/dev/null || echo '?')"
+    printf '%s(%s) ' "$pid" "$comm"
+  done
+}
+
+manager_active() {
+  omw_systemd_running || return 1
+  omw_have systemctl || return 1
+  _omw_bounded 10 systemctl is-active --quiet "user@${OMW_OWNER_UID}.service" 2>/dev/null
+}
+
+group_name_of_gid() {
+  local e
+  e="$(omw_getent group "$1" 2>/dev/null)" || return 1
+  printf '%s\n' "${e%%:*}"
+}
+
+# Git repositories under the new home that have linked worktrees. Bounded
+# depth, never follows symlinks, never descends into DrvFs mounts.
+worktree_repos() {
+  local base="$1" wt
+  [[ -d "$base" ]] || return 0
+  while IFS= read -r wt; do
+    printf '%s\n' "${wt%/.git/worktrees}"
+  done < <(find "$base" -xdev -maxdepth 5 -type d -path '*/.git/worktrees' -not -path '*/node_modules/*' 2>/dev/null | sort)
+}
+
+# -----------------------------------------------------------------------------
+# Journal & backups
+# -----------------------------------------------------------------------------
+journal() {
+  [[ -n "$JOURNAL" ]] || return 0
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo -)" "$*" >>"$JOURNAL"
+}
+
+backup_files() {
+  local f ts
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  BACKUP_DIR="$OMW_SENTINEL_DIR/backups/rename-owner-$ts-$$"
+  _omw_ensure_dir 0700 "$OMW_SENTINEL_DIR/backups" || return 1
+  mkdir -m 0700 -- "$BACKUP_DIR" || return 1
+  for f in "$ETC_DIR/passwd" "$ETC_DIR/shadow" "$ETC_DIR/group" "$ETC_DIR/gshadow" \
+           "$ETC_DIR/subuid" "$ETC_DIR/subgid" "$OMW_SUDOERS_DIR/10-$OLD" \
+           "$OMW_WSL_CONF" "$OMW_USER_CONF" "$OMW_SENTINEL_FILE"; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    cp -p -- "$f" "$BACKUP_DIR/$(printf '%s' "$f" | tr '/' '%')" || return 1
+  done
+  return 0
+}
+
+backup_path() { printf '%s/%s\n' "$BACKUP_DIR" "$(printf '%s' "$1" | tr '/' '%')"; }
+
+# restore_file <path> — copy the backup back (or remove the file if it had none).
+restore_file() {
+  local f="$1" b
+  b="$(backup_path "$f")"
+  if [[ -f "$b" ]]; then
+    cp -p -- "$b" "$f"
+  elif [[ -f "$f" && ! -L "$f" ]]; then
+    rm -f -- "$f"
+  fi
+}
+
+open_journal() {
+  JOURNAL="$OMW_SENTINEL_DIR/rename-owner.journal"
+  if [[ ! -f "$JOURNAL" ]]; then
+    {
+      printf '# omarchy-rename-owner journal (parsed, never sourced)\n'
+      printf 'old=%s\nnew=%s\nold_home=%s\nnew_home=%s\n' "$OLD" "$NEW" "$OLD_HOME" "$NEW_HOME"
+      printf 'linger_was=%s\nmanager_was=%s\nsudo_mode=%s\n' "$LINGER_WAS" "$MANAGER_WAS" "$SUDO_MODE_OLD"
+      printf 'wsl_default_was=%s\nsymlink=%s\nbackup=%s\n' "$WSL_DEFAULT_WAS" "$OPT_SYMLINK" "$BACKUP_DIR"
+    } | omw_atomic_write "$JOURNAL" 0600 root:root || return 1
+  fi
+  journal "run start pid=$$ resume=$RESUME"
+}
+
+# Load a previous run's journal (whitelisted keys, each value validated).
+load_journal() {
+  local j="$OMW_SENTINEL_DIR/rename-owner.journal" v
+  [[ -f "$j" ]] || return 1
+  v="$(omw_kv_get "$j" old || true)"; validate_username "$v" || omw_fail 3 "Unreadable journal $j (old=): fix or remove it."
+  OLD="$v"
+  v="$(omw_kv_get "$j" new || true)"; validate_username "$v" || omw_fail 3 "Unreadable journal $j (new=): fix or remove it."
+  if [[ "$v" != "$NEW" ]]; then
+    omw_fail 3 "An unfinished rename to '$v' is recorded in $j; run: omarchy-rename-owner --from $OLD $v"
+  fi
+  OLD_HOME="$(omw_kv_get "$j" old_home || true)"
+  NEW_HOME="$(omw_kv_get "$j" new_home || true)"
+  [[ "$NEW_HOME" == "$OMW_HOME_ROOT/$NEW" ]] || omw_fail 3 "Unreadable journal $j (new_home=)."
+  [[ "$OLD_HOME" == /* && "$OLD_HOME" != *..* ]] || omw_fail 3 "Unreadable journal $j (old_home=)."
+  v="$(omw_kv_get "$j" linger_was || true)"; [[ "$v" == 1 ]] && LINGER_WAS=1
+  v="$(omw_kv_get "$j" manager_was || true)"; [[ "$v" == 1 ]] && MANAGER_WAS=1
+  v="$(omw_kv_get "$j" sudo_mode || true)"
+  case "$v" in nopasswd|password|none) SUDO_MODE_OLD="$v" ;; *) SUDO_MODE_OLD="none" ;; esac
+  v="$(omw_kv_get "$j" wsl_default_was || true)"
+  if [[ -n "$v" ]] && validate_username "$v"; then WSL_DEFAULT_WAS="$v"; fi
+  v="$(omw_kv_get "$j" symlink || true)"; [[ "$v" == 0 ]] && OPT_SYMLINK=0
+  v="$(omw_kv_get "$j" backup || true)"
+  [[ "$v" == "$OMW_SENTINEL_DIR/backups/rename-owner-"* && -d "$v" ]] && BACKUP_DIR="$v"
+  RESUME=1
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Steps: do_<step> returns 0 (changed), 10 (nothing to do) or 1 (failed).
+# undo_<step> reverses a step that changed something in this run.
+# -----------------------------------------------------------------------------
+do_stop_user_manager() {
+  (( MANAGER_WAS || LINGER_WAS )) || return 10
+  omw_systemd_running || return 10
+  if omw_have loginctl && (( LINGER_WAS )) && linger_enabled "$OLD"; then
+    _omw_bounded 15 loginctl disable-linger "$OLD" 9>&- || return 1
+  fi
+  if omw_have systemctl; then
+    _omw_bounded 60 systemctl stop "user@${OMW_OWNER_UID}.service" 9>&- || return 1
+  fi
+  local -a left=()
+  read -r -a left <<<"$(uid_pids | tr '\n' ' ')"
+  if (( ${#left[@]} )); then
+    omw_err "uid $OMW_OWNER_UID still runs processes after stopping its user manager: $(describe_pids "${left[@]}")"
+    return 1
+  fi
+  return 0
+}
+undo_stop_user_manager() {
+  local name
+  name="$(owner_name 2>/dev/null || echo "$OLD")"
+  if (( LINGER_WAS )); then
+    configure_linger "$name" || return 1
+  elif (( MANAGER_WAS )) && omw_have systemctl; then
+    _omw_bounded 30 systemctl start "user@${OMW_OWNER_UID}.service" 9>&- || true
+  fi
+  return 0
+}
+
+do_rename_login() {
+  local cur
+  cur="$(owner_name 2>/dev/null || true)"
+  [[ "$cur" == "$NEW" ]] && return 10
+  [[ "$cur" == "$OLD" ]] || { omw_err "uid $OMW_OWNER_UID is '$cur', expected '$OLD'."; return 1; }
+  usermod -l "$NEW" "$OLD" || return 1
+}
+undo_rename_login() {
+  [[ "$(owner_name 2>/dev/null || true)" == "$NEW" ]] || return 0
+  usermod -l "$OLD" "$NEW"
+}
+
+# shadow-utils releases differ in whether `usermod -l` renames /etc/subuid and
+# /etc/subgid entries; fix whatever is left over.
+_subids_render() {
+  awk -F: -v o="$2" -v n="$3" 'BEGIN { OFS = ":" } $1 == o { $1 = n } { print }' "$1"
+}
+do_subids() {
+  local f changed=10
+  for f in "$ETC_DIR/subuid" "$ETC_DIR/subgid"; do
+    [[ -f "$f" ]] || continue
+    grep -q "^${OLD}:" "$f" || continue
+    _subids_render "$f" "$OLD" "$NEW" | omw_atomic_write "$f" "$(stat -c %a "$f")" root:root || return 1
+    changed=0
+  done
+  return "$changed"
+}
+undo_subids() {
+  local f rc=0
+  for f in "$ETC_DIR/subuid" "$ETC_DIR/subgid"; do
+    [[ -f "$f" ]] || continue
+    grep -q "^${NEW}:" "$f" || continue
+    _subids_render "$f" "$NEW" "$OLD" | omw_atomic_write "$f" "$(stat -c %a "$f")" root:root || rc=1
+  done
+  return "$rc"
+}
+
+do_rename_group() {
+  local gname
+  gname="$(group_name_of_gid "$OWNER_GID" 2>/dev/null || true)"
+  [[ "$gname" == "$NEW" ]] && return 10
+  [[ "$gname" == "$OLD" ]] || return 10
+  groupmod -n "$NEW" "$OLD" || return 1
+}
+undo_rename_group() {
+  [[ "$(group_name_of_gid "$OWNER_GID" 2>/dev/null || true)" == "$NEW" ]] || return 0
+  groupmod -n "$OLD" "$NEW"
+}
+
+do_move_home() {
+  local cur name
+  [[ "$OLD_HOME" == "$OMW_HOME_ROOT/$OLD" ]] || return 10
+  cur="$(owner_home 2>/dev/null || true)"
+  name="$(owner_name)"
+  if [[ "$cur" == "$NEW_HOME" && -d "$NEW_HOME" && ! -L "$NEW_HOME" ]]; then
+    return 10
+  fi
+  # Renaming back: /home/<new> may be the compatibility symlink an earlier
+  # rename left behind (pointing at the current home). Only that exact
+  # symlink is removed; anything else at /home/<new> is an error.
+  if [[ -L "$NEW_HOME" && "$(readlink -- "$NEW_HOME")" == "$OLD_HOME" ]]; then
+    rm -f -- "$NEW_HOME" || return 1
+    BACKLINK_REMOVED=1
+  fi
+  if [[ -e "$NEW_HOME" || -L "$NEW_HOME" ]]; then
+    omw_err "$NEW_HOME already exists."
+    return 1
+  fi
+  if [[ -d "$OLD_HOME" && ! -L "$OLD_HOME" ]]; then
+    usermod -d "$NEW_HOME" -m "$name" || return 1
+  else
+    usermod -d "$NEW_HOME" "$name" || return 1
+  fi
+}
+undo_move_home() {
+  local name
+  name="$(owner_name 2>/dev/null || true)"
+  [[ -n "$name" && "$(owner_home 2>/dev/null || true)" == "$NEW_HOME" ]] || return 0
+  if [[ -L "$OLD_HOME" ]]; then
+    undo_compat_symlink || return 1
+  fi
+  if [[ -d "$NEW_HOME" && ! -L "$NEW_HOME" && ! -e "$OLD_HOME" ]]; then
+    usermod -d "$OLD_HOME" -m "$name" || return 1
+  else
+    usermod -d "$OLD_HOME" "$name" || return 1
+  fi
+  if (( GIT_REPAIRED )); then
+    # Point the worktrees back at the old paths, or a later `git worktree
+    # prune` would drop them as dangling.
+    git_repair_under "$NEW_HOME" "$OLD_HOME" "$name" || true
+    GIT_REPAIRED=0
+  fi
+  if (( BACKLINK_REMOVED )) && [[ ! -e "$NEW_HOME" && ! -L "$NEW_HOME" ]]; then
+    ln -s -- "$OLD_HOME" "$NEW_HOME" || return 1
+    BACKLINK_REMOVED=0
+  fi
+  return 0
+}
+
+do_compat_symlink() {
+  (( OPT_SYMLINK )) || return 10
+  [[ "$OLD_HOME" == "$OMW_HOME_ROOT/$OLD" ]] || return 10
+  if [[ -L "$OLD_HOME" && "$(readlink -- "$OLD_HOME")" == "$NEW_HOME" ]]; then
+    return 10
+  fi
+  if [[ -e "$OLD_HOME" || -L "$OLD_HOME" ]]; then
+    omw_warn "$OLD_HOME still exists; not creating the compatibility symlink."
+    return 10
+  fi
+  ln -s -- "$NEW_HOME" "$OLD_HOME"
+}
+undo_compat_symlink() {
+  # Only ever removes the symlink this tool creates; never a directory.
+  if [[ -L "$OLD_HOME" && "$(readlink -- "$OLD_HOME")" == "$NEW_HOME" ]]; then
+    rm -f -- "$OLD_HOME"
+  fi
+  return 0
+}
+
+do_sudoers() {
+  local mode
+  if [[ -f "$OMW_SUDOERS_DIR/10-$OLD" ]]; then
+    mode="$(sudoers_mode_of "$OLD")"
+  elif [[ -f "$OMW_SUDOERS_DIR/10-$NEW" ]]; then
+    return 10
+  elif [[ "$SUDO_MODE_OLD" != "none" ]]; then
+    mode="$SUDO_MODE_OLD"
+  else
+    return 10
+  fi
+  configure_sudoers "$NEW" "$mode" || return 1
+  remove_sudoers "$OLD" || return 1
+  if [[ -e "$OMW_SUDOERS_DIR/10-$OLD" ]]; then
+    omw_warn "$OMW_SUDOERS_DIR/10-$OLD is not managed by omarchy-wsl; review it by hand."
+  fi
+  return 0
+}
+undo_sudoers() {
+  local b
+  b="$(backup_path "$OMW_SUDOERS_DIR/10-$OLD")"
+  if [[ -f "$b" && ! -e "$OMW_SUDOERS_DIR/10-$OLD" ]]; then
+    cp -p -- "$b" "$OMW_SUDOERS_DIR/10-$OLD" || return 1
+    chmod 0440 "$OMW_SUDOERS_DIR/10-$OLD"
+  fi
+  if [[ -f "$OMW_SUDOERS_DIR/10-$NEW" ]] && grep -qF "$OMW_MANAGED_MARKER" "$OMW_SUDOERS_DIR/10-$NEW"; then
+    rm -f -- "$OMW_SUDOERS_DIR/10-$NEW" || return 1
+  fi
+  return 0
+}
+
+do_linger() {
+  (( LINGER_WAS )) || return 10
+  if linger_enabled "$NEW" && ! linger_enabled "$OLD"; then
+    return 10
+  fi
+  configure_linger "$NEW" || return 1
+  rm -f -- "${OMW_LINGER_DIR:?}/$OLD"
+}
+undo_linger() {
+  rm -f -- "${OMW_LINGER_DIR:?}/$NEW"
+  if omw_systemd_running && omw_have loginctl; then
+    _omw_bounded 15 loginctl disable-linger "$NEW" 9>&- 2>/dev/null || true
+  fi
+  if (( LINGER_WAS )) && [[ ! -e "$OMW_LINGER_DIR/$OLD" ]]; then
+    : >"$OMW_LINGER_DIR/$OLD" || return 1
+    chmod 0644 "$OMW_LINGER_DIR/$OLD"
+  fi
+  return 0
+}
+
+do_wsl_conf() {
+  local cur
+  cur="$(wsl_conf_default_user)"
+  [[ "$cur" == "$OLD" ]] || return 10
+  update_wsl_conf_default_user "$NEW" || return 1
+}
+undo_wsl_conf() { restore_file "$OMW_WSL_CONF"; }
+
+do_sentinel() {
+  local changed=10 v
+  if [[ -f "$OMW_SENTINEL_FILE" ]]; then
+    v="$(sentinel_get PROVISIONED_USER 2>/dev/null || true)"
+    if [[ "$v" != "$NEW" ]]; then
+      write_sentinel "$NEW" omarchy-rename-owner || return 1
+      changed=0
+    fi
+  fi
+  if [[ -f "$OMW_USER_CONF" ]]; then
+    v="$(omw_kv_get "$OMW_USER_CONF" DEFAULT_USER 2>/dev/null || true)"
+    if [[ "$v" == "$OLD" ]]; then
+      write_user_conf "$NEW" || return 1
+      changed=0
+    fi
+  fi
+  return "$changed"
+}
+undo_sentinel() {
+  restore_file "$OMW_SENTINEL_FILE" || return 1
+  restore_file "$OMW_USER_CONF"
+}
+
+do_spool() {
+  local d changed=10
+  for d in "$SPOOL_DIR/cron" "$SPOOL_DIR/mail"; do
+    [[ -e "$d/$OLD" && ! -L "$d/$OLD" ]] || continue
+    if [[ -e "$d/$NEW" ]]; then
+      omw_warn "$d/$NEW already exists; leaving $d/$OLD in place."
+      continue
+    fi
+    mv -- "$d/$OLD" "$d/$NEW" || return 1
+    changed=0
+  done
+  return "$changed"
+}
+undo_spool() {
+  local d rc=0
+  for d in "$SPOOL_DIR/cron" "$SPOOL_DIR/mail"; do
+    if [[ -e "$d/$NEW" && ! -e "$d/$OLD" ]]; then
+      mv -- "$d/$NEW" "$d/$OLD" || rc=1
+    fi
+  done
+  return "$rc"
+}
+
+# git_repair_under <from-home> <to-home> <run-as>: for every repository under
+# <to-home> whose linked worktrees are recorded under <from-home>, run
+# `git worktree repair` with their paths under <to-home> (as the owner, so no
+# root-owned files appear in the home). Worktrees outside the home are passed
+# unchanged so their .git files learn the new location of the main repository.
+# Returns 0 if something was repaired, 10 if there was nothing to repair.
+git_repair_under() {
+  local from="$1" to="$2" runas="$3" repo gd p changed=10
+  local -a paths
+  omw_have git || return 10
+  while IFS= read -r repo; do
+    paths=()
+    for gd in "$repo"/.git/worktrees/*/gitdir; do
+      [[ -f "$gd" ]] || continue
+      p="$(head -n 1 "$gd")"
+      p="${p%/.git}"
+      case "$p" in
+        "$from"/*) paths+=("$to/${p#"$from"/}") ;;
+        /*) paths+=("$p") ;;
+      esac
+    done
+    (( ${#paths[@]} )) || continue
+    omw_step "git worktree repair in $repo (${#paths[@]} worktree(s))"
+    if _omw_bounded 60 runuser -u "$runas" -- git -C "$repo" worktree repair "${paths[@]}" </dev/null 9>&-; then
+      changed=0
+    else
+      omw_warn "git worktree repair failed in $repo; check it with 'git worktree list'."
+    fi
+  done < <(worktree_repos "$to")
+  return "$changed"
+}
+
+# No separate undo: undo_move_home repairs back to the old paths once the home
+# is back in place (GIT_REPAIRED).
+do_git_repair() {
+  [[ "$OLD_HOME" == "$OMW_HOME_ROOT/$OLD" ]] || return 10
+  local rc=0
+  git_repair_under "$OLD_HOME" "$NEW_HOME" "$NEW" || rc=$?
+  (( rc == 0 )) && GIT_REPAIRED=1
+  return "$rc"
+}
+
+do_verify() {
+  local bad=0 v
+  [[ "$(owner_name 2>/dev/null || true)" == "$NEW" ]] || { omw_err "verify: uid $OMW_OWNER_UID is not '$NEW'."; bad=1; }
+  [[ "$(_omw_passwd_field "$NEW" 3 2>/dev/null || true)" == "$OMW_OWNER_UID" ]] || { omw_err "verify: '$NEW' does not have uid $OMW_OWNER_UID."; bad=1; }
+  if [[ "$OLD_HOME" == "$OMW_HOME_ROOT/$OLD" ]]; then
+    [[ "$(owner_home 2>/dev/null || true)" == "$NEW_HOME" && -d "$NEW_HOME" ]] || { omw_err "verify: home is not $NEW_HOME."; bad=1; }
+  fi
+  if [[ "$SUDO_MODE_OLD" != "none" ]]; then
+    [[ -f "$OMW_SUDOERS_DIR/10-$NEW" ]] || { omw_err "verify: $OMW_SUDOERS_DIR/10-$NEW is missing."; bad=1; }
+    if omw_have visudo; then
+      if [[ -f "$OMW_SUDOERS_MAIN" ]]; then
+        visudo -cqf "$OMW_SUDOERS_MAIN" >/dev/null 2>&1 || { omw_err "verify: visudo -c failed for $OMW_SUDOERS_MAIN."; bad=1; }
+      elif [[ -f "$OMW_SUDOERS_DIR/10-$NEW" ]]; then
+        visudo -cqf "$OMW_SUDOERS_DIR/10-$NEW" >/dev/null 2>&1 || { omw_err "verify: visudo rejected 10-$NEW."; bad=1; }
+      fi
+    fi
+  fi
+  if [[ "$WSL_DEFAULT_WAS" == "$OLD" ]]; then
+    [[ "$(wsl_conf_default_user)" == "$NEW" ]] || { omw_err "verify: $OMW_WSL_CONF [user] default is not '$NEW'."; bad=1; }
+  fi
+  if [[ -f "$OMW_SENTINEL_FILE" ]]; then
+    v="$(sentinel_get PROVISIONED_USER 2>/dev/null || true)"
+    [[ "$v" == "$NEW" ]] || { omw_err "verify: the sentinel records '$v'."; bad=1; }
+  fi
+  if [[ "${OMARCHY_FAULT_AT:-}" == "verify" ]]; then
+    omw_err "verify: fault injected (OMARCHY_FAULT_AT=verify)."
+    bad=1
+  fi
+  (( bad == 0 )) || return 1
+  return 10
+}
+
+# -----------------------------------------------------------------------------
+# Plan, execution, rollback
+# -----------------------------------------------------------------------------
+step_summary() {
+  case "$1" in
+    stop-user-manager)
+      if (( MANAGER_WAS || LINGER_WAS )) && omw_systemd_running; then
+        printf 'loginctl disable-linger %s; systemctl stop user@%s.service; require no uid-%s processes' "$OLD" "$OMW_OWNER_UID" "$OMW_OWNER_UID"
+      else printf 'skip (no systemd user manager running)'; fi ;;
+    rename-login) printf 'usermod -l %s %s' "$NEW" "$OLD" ;;
+    subids) printf 'rename %s: entries in %s/subuid and %s/subgid if usermod left them' "$OLD" "$ETC_DIR" "$ETC_DIR" ;;
+    rename-group)
+      if [[ "$(group_name_of_gid "$OWNER_GID" 2>/dev/null || true)" == "$OLD" ]]; then printf 'groupmod -n %s %s' "$NEW" "$OLD"
+      else printf 'skip (primary group is not named %s)' "$OLD"; fi ;;
+    move-home)
+      if [[ "$OLD_HOME" == "$OMW_HOME_ROOT/$OLD" ]]; then printf 'usermod -d %s -m %s' "$NEW_HOME" "$NEW"
+      else printf 'skip (home %s is not %s)' "$OLD_HOME" "$OMW_HOME_ROOT/$OLD"; fi ;;
+    compat-symlink)
+      if (( OPT_SYMLINK )) && [[ "$OLD_HOME" == "$OMW_HOME_ROOT/$OLD" ]]; then printf 'ln -s %s %s' "$NEW_HOME" "$OLD_HOME"
+      else printf 'skip'; fi ;;
+    sudoers)
+      if [[ "$SUDO_MODE_OLD" != "none" ]]; then printf '%s/10-%s -> 10-%s (%s, visudo -cf)' "$OMW_SUDOERS_DIR" "$OLD" "$NEW" "$SUDO_MODE_OLD"
+      else printf 'skip (no omarchy-managed drop-in for %s)' "$OLD"; fi ;;
+    linger)
+      if (( LINGER_WAS )); then printf '%s/%s -> %s' "$OMW_LINGER_DIR" "$OLD" "$NEW"
+      else printf 'skip (lingering not enabled)'; fi ;;
+    wsl-conf)
+      if [[ "$WSL_DEFAULT_WAS" == "$OLD" ]]; then printf '%s [user] default = %s' "$OMW_WSL_CONF" "$NEW"
+      else printf 'skip ([user] default is %s)' "${WSL_DEFAULT_WAS:-unset}"; fi ;;
+    sentinel) printf '%s PROVISIONED_USER=%s; %s DEFAULT_USER=%s' "$OMW_SENTINEL_FILE" "$NEW" "$OMW_USER_CONF" "$NEW" ;;
+    spool) printf 'mv %s/{cron,mail}/%s -> %s (when present)' "$SPOOL_DIR" "$OLD" "$NEW" ;;
+    git-repair) printf 'git worktree repair for repositories under %s (as %s, bounded)' "$NEW_HOME" "$NEW" ;;
+    verify) printf 'getent, home, visudo -c, wsl.conf, sentinel' ;;
+  esac
+}
+
+print_plan() {
+  local i=0 s
+  if (( OPT_JSON )); then
+    printf '{"version":1,"dry_run":%s,"old":%s,"new":%s,"uid":%s,"steps":[' \
+      "$([[ $OPT_DRY == 1 ]] && echo true || echo false)" "$(json_str "$OLD")" "$(json_str "$NEW")" "$OMW_OWNER_UID"
+    for s in "${STEPS[@]}"; do
+      (( i++ > 0 )) && printf ','
+      printf '{"name":%s,"action":%s}' "$(json_str "$s")" "$(json_str "$(step_summary "$s")")"
+    done
+    printf '],"result":%s}\n' "$(json_str "${RESULT:-planned}")"
+    return 0
+  fi
+  out "Plan: rename uid $OMW_OWNER_UID '$OLD' -> '$NEW'$( (( RESUME )) && echo ' (resuming an interrupted rename)')"
+  for s in "${STEPS[@]}"; do
+    i=$((i + 1))
+    out "$(printf '  %2d. %-18s %s' "$i" "$s" "$(step_summary "$s")")"
+  done
+  out "Backups: $OMW_SENTINEL_DIR/backups/rename-owner-<timestamp>/   Journal: $OMW_SENTINEL_DIR/rename-owner.journal"
+}
+
+windows_followups() {
+  local d
+  d="$(distro_name)"
+  out ""
+  out "Windows-side follow-ups (this tool never changes Windows):"
+  out "  1. Restart the distro so WSL re-reads /etc/wsl.conf:  wsl.exe --terminate $d"
+  out "  2. Update shortcuts and scripts that use 'wsl.exe -u $OLD' or '--cd /home/$OLD'."
+  out "  3. Windows Terminal: fix profile 'commandline'/'startingDirectory' entries that name $OLD."
+  out "  4. Explorer: re-pin \\\\wsl.localhost\\$d\\home\\$NEW (omarchy-sync-dirs --pin-quick-access) and unpin ...\\home\\$OLD."
+  out "  5. .wslconfig needs no change (it holds no user names)."
+}
+
+run_step() {
+  local step="$1" fn rc=0
+  fn="do_${step//-/_}"
+  journal "step $step begin"
+  # Registered BEFORE it runs: a signal is only handled once the current
+  # command returns, so a step may have changed things before its function
+  # returns. Every undo_* checks the current state, so undoing a step that
+  # did not finish is safe.
+  DONE_STEPS+=("$step")
+  "$fn" || rc=$?
+  case "$rc" in
+    0)
+      journal "step $step done"
+      omw_log "$step: done" ;;
+    10)
+      unset 'DONE_STEPS[${#DONE_STEPS[@]}-1]'
+      journal "step $step unchanged"
+      if [[ "$step" == "verify" ]]; then omw_log "verify: ok"; else omw_log "$step: nothing to do"; fi ;;
+    *)
+      journal "step $step failed rc=$rc"
+      omw_err "Step '$step' failed."
+      return 1 ;;
+  esac
+  if [[ "${OMARCHY_FAULT_AT:-}" == "$step" && "$step" != "verify" ]]; then
+    omw_err "Fault injected after step '$step' (OMARCHY_FAULT_AT)."
+    return 1
+  fi
+  if [[ "${OMARCHY_PAUSE_AT:-}" == "$step" ]]; then
+    [[ -n "${OMARCHY_PAUSE_FILE:-}" ]] && : >"$OMARCHY_PAUSE_FILE"
+    sleep 30 &
+    wait $! || true
+  fi
+  return 0
+}
+
+# Undo completed steps in reverse order. Returns 0 if everything was undone.
+rollback() {
+  local i step fn failed=0
+  IN_ROLLBACK=1
+  trap '' INT TERM HUP
+  for (( i=${#DONE_STEPS[@]}-1; i>=0; i-- )); do
+    step="${DONE_STEPS[$i]}"
+    fn="undo_${step//-/_}"
+    declare -F "$fn" >/dev/null || continue
+    if [[ "${OMARCHY_FAULT_UNDO:-}" == "$step" ]] || ! "$fn"; then
+      journal "step $step undo-failed"
+      omw_err "Rollback of '$step' failed."
+      failed=1
+    else
+      journal "step $step undone"
+      omw_log "Rolled back: $step"
+    fi
+  done
+  DONE_STEPS=()
+  return "$failed"
+}
+
+finish_journal() {
+  local suffix="$1"
+  [[ -n "$JOURNAL" && -f "$JOURNAL" ]] || return 0
+  if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
+    mv -f -- "$JOURNAL" "$BACKUP_DIR/journal.$suffix" 2>/dev/null || true
+  fi
+}
+
+fail_and_rollback() {
+  local why="$1"
+  if rollback; then
+    journal "run rolled-back"
+    finish_journal rolled-back
+    RESULT="rolled-back"
+    omw_err "$why Every completed step was rolled back. Backups: $BACKUP_DIR"
+    (( OPT_JSON )) && print_plan
+    exit 1
+  fi
+  journal "run rollback-incomplete"
+  RESULT="rollback-incomplete"
+  omw_err "$why ROLLBACK INCOMPLETE. Journal: $JOURNAL  Backups: $BACKUP_DIR"
+  omw_err "Re-run 'omarchy-rename-owner --from $OLD $NEW' to complete the rename, or restore from the backups."
+  (( OPT_JSON )) && print_plan
+  exit 4
+}
+
+on_exit() {
+  local rc=$?
+  omw_cleanup_tmp
+  exit "$rc"
+}
+
+on_signal() {
+  local sig="$1" num="$2"
+  trap - EXIT
+  trap '' INT TERM HUP
+  omw_cleanup_tmp
+  if (( IN_ROLLBACK )); then
+    exit $((128 + num))
+  fi
+  if (( MUTATING )); then
+    omw_err "Interrupted by SIG${sig}; rolling back."
+    if rollback; then
+      journal "run rolled-back signal=$sig"
+      finish_journal rolled-back
+      omw_err "Rolled back. Nothing was renamed."
+    else
+      journal "run rollback-incomplete signal=$sig"
+      omw_err "ROLLBACK INCOMPLETE. Journal: $JOURNAL  Backups: $BACKUP_DIR"
+    fi
+  fi
+  exit $((128 + num))
+}
+
+confirm() {
+  local ans=""
+  (( OPT_YES )) && return 0
+  if ! omw_have_tty; then
+    omw_fail 3 "Refusing to rename without confirmation: pass --yes (no terminal attached)."
+  fi
+  printf "Rename uid %s '%s' to '%s'? Type the new name to confirm: " "$OMW_OWNER_UID" "$OLD" "$NEW" >/dev/tty
+  IFS= read -r ans </dev/tty || ans=""
+  [[ "$ans" == "$NEW" ]] || omw_fail 3 "Not confirmed; nothing changed."
+}
+
+# Fill OLD, homes and the state snapshot; enforce preconditions (exit 3).
+preflight() {
+  local cur
+  local -a pids=()
+  if load_journal; then
+    omw_warn "Found an unfinished rename '$OLD' -> '$NEW'; resuming it."
+    if [[ -n "$OPT_FROM" && "$OPT_FROM" != "$OLD" ]]; then
+      omw_fail 3 "--from $OPT_FROM does not match the journal (old=$OLD)."
+    fi
+  else
+    validate_username "$NEW" || omw_fail 3 "Invalid new name: $OMW_ACCT_REASON"
+    cur="$(owner_name 2>/dev/null || true)"
+    [[ -n "$cur" ]] || omw_fail 3 "No account has uid $OMW_OWNER_UID (run the OOBE first)."
+    if [[ "$cur" == "$NEW" ]]; then
+      if [[ -z "$OPT_FROM" || "$OPT_FROM" == "$NEW" ]]; then
+        already_renamed_check
+      fi
+      OLD="$OPT_FROM"
+      validate_username "$OLD" || omw_fail 3 "Invalid --from name: $OMW_ACCT_REASON"
+      RESUME=1
+      omw_warn "uid $OMW_OWNER_UID is already '$NEW'; completing the remaining steps of '$OLD' -> '$NEW'."
+    else
+      if [[ -n "$OPT_FROM" && "$OPT_FROM" != "$cur" ]]; then
+        omw_fail 3 "uid $OMW_OWNER_UID is '$cur', not '$OPT_FROM' (--from)."
+      fi
+      OLD="$cur"
+      if omw_name_conflict "$NEW" rename; then
+        omw_fail 3 "Cannot rename to '$NEW': $OMW_ACCT_REASON."
+      fi
+    fi
+    OLD_HOME="$(owner_home 2>/dev/null || true)"
+    if (( RESUME )); then
+      OLD_HOME="$OMW_HOME_ROOT/$OLD"
+    fi
+    NEW_HOME="$OMW_HOME_ROOT/$NEW"
+    linger_enabled "$OLD" && LINGER_WAS=1
+    if (( RESUME )) && linger_enabled "$NEW"; then LINGER_WAS=1; fi
+    manager_active && MANAGER_WAS=1
+    SUDO_MODE_OLD="$(sudoers_mode_of "$OLD")"
+    WSL_DEFAULT_WAS="$(wsl_conf_default_user)"
+  fi
+  OWNER_GID="$(_omw_passwd_field "$OMW_OWNER_UID" 4 2>/dev/null || true)"
+
+  # Processes: the systemd user manager is stopped by the tool; anything else
+  # (shells, tmux, editors, bridges started from a session) must be closed.
+  read -r -a pids <<<"$(foreign_pids | tr '\n' ' ')"
+  if (( ${#pids[@]} )); then
+    omw_fail 3 "uid $OMW_OWNER_UID ($OLD) is running: $(describe_pids "${pids[@]}")
+Close those sessions (exit shells, 'tmux kill-server'), then from Windows run:
+  wsl.exe --terminate $(distro_name)
+  $(root_hint)"
+  fi
+}
+
+# uid 1000 already has the requested name and no journal exists: succeed when
+# the distro state agrees, otherwise explain how to complete it.
+already_renamed_check() {
+  local issues="" v
+  v="$(wsl_conf_default_user)"
+  [[ -z "$v" || "$v" == "$NEW" ]] || issues="$issues $OMW_WSL_CONF:[user]default=$v"
+  if [[ -f "$OMW_SENTINEL_FILE" ]]; then
+    v="$(sentinel_get PROVISIONED_USER 2>/dev/null || true)"
+    [[ -z "$v" || "$v" == "$NEW" ]] || issues="$issues sentinel:PROVISIONED_USER=$v"
+  fi
+  v="$(omw_kv_get "$OMW_USER_CONF" DEFAULT_USER 2>/dev/null || true)"
+  [[ -z "$v" || "$v" == "$NEW" ]] || issues="$issues $OMW_USER_CONF:DEFAULT_USER=$v"
+  if [[ -z "$issues" ]]; then
+    OLD="$NEW"
+    RESULT="nothing-to-do"
+    if (( OPT_JSON )); then
+      printf '{"version":1,"dry_run":%s,"old":%s,"new":%s,"uid":%s,"steps":[],"result":"nothing-to-do"}\n' \
+        "$([[ $OPT_DRY == 1 ]] && echo true || echo false)" "$(json_str "$NEW")" "$(json_str "$NEW")" "$OMW_OWNER_UID"
+    else
+      out "uid $OMW_OWNER_UID is already '$NEW'; nothing to do."
+    fi
+    exit 0
+  fi
+  omw_fail 3 "uid $OMW_OWNER_UID is already '$NEW' but state still names the old account:${issues}. Re-run with --from <old-name> to complete it."
+}
+
+main() {
+  parse_args "$@"
+  if ! omw_is_root && [[ "${OMARCHY_ALLOW_NONROOT:-}" != "1" ]] && (( ! OPT_DRY )); then
+    omw_fail 3 "Must run as root, from a root session. From Windows:
+  $(root_hint)"
+  fi
+  trap on_exit EXIT
+  trap 'on_signal INT 2' INT
+  trap 'on_signal TERM 15' TERM
+  trap 'on_signal HUP 1' HUP
+
+  if (( OPT_DRY )); then
+    preflight
+    RESULT="planned"
+    print_plan
+    (( OPT_JSON )) || out "(dry run: nothing was changed)"
+    exit 0
+  fi
+
+  local rc=0
+  omw_acct_lock || rc=$?
+  if (( rc == 75 )); then
+    omw_fail 75 "Another omarchy-rename-owner or OOBE is running (lock $OMW_LOCK_FILE)."
+  elif (( rc != 0 )); then
+    omw_die "Cannot take the account lock $OMW_LOCK_FILE."
+  fi
+
+  preflight
+  if (( ! OPT_JSON )) && [[ -z "${OMW_QUIET:-}" ]]; then
+    print_plan
+  fi
+  confirm
+
+  if [[ -z "$BACKUP_DIR" ]]; then
+    backup_files || omw_die "Could not back up the account files; nothing changed."
+  fi
+  open_journal || omw_die "Could not write the journal; nothing changed."
+  MUTATING=1
+
+  local step
+  for step in "${STEPS[@]}"; do
+    if ! run_step "$step"; then
+      fail_and_rollback "Renaming '$OLD' to '$NEW' failed at step '$step'."
+    fi
+  done
+  MUTATING=0
+  journal "run complete"
+  finish_journal "done"
+  RESULT="renamed"
+
+  if (( OPT_JSON )); then
+    print_plan
+  else
+    out ""
+    out "Renamed uid $OMW_OWNER_UID: '$OLD' -> '$NEW' (home $NEW_HOME). Backups: $BACKUP_DIR"
+    windows_followups
+  fi
+  exit 0
+}
+
+main "$@"
