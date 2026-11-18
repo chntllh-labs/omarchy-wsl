@@ -1,118 +1,104 @@
 #!/bin/bash
 # ==============================================================================
-# Omarchy WSL: Rootfs Adversarial Sanitization & Stripping Engine
+# Omarchy WSL: root filesystem sanitiser (last step of the image build)
 # ==============================================================================
-# Eliminates all host secrets, build user artifacts, non-reproducible states,
-# package manager caches, and bloat to guarantee a zero-leak, <800MB rootfs.
+# Removes build users, credentials, per-machine identity, caches and logs, and
+# documentation that predates the NoExtract rules. Everything else is left
+# exactly as pacman installed it:
+#   - static archives are NOT removed: libc.so links libc_nonshared.a and gcc
+#     needs libgcc.a / libssp_nonshared.a, so `gcc` and makepkg keep working;
+#   - /usr/share/doc/omarchy-wsl ships (the docs the image refers to);
+#   - fonts, man pages and Python bytecode are untouched (pacman owns them).
+# Timestamps are normalised later, when the export is archived.
+#
+# Safe to re-run. ROOT=/path sanitises a mounted tree instead of / (tests).
 # ==============================================================================
 
 set -euo pipefail
 
-echo "==> [sanitizer] Initiating adversarial rootfs sanitization..."
+ROOT="${ROOT:-}"
+ROOT="${ROOT%/}"
+r() { printf '%s%s' "$ROOT" "$1"; }
+log() { echo "==> [sanitizer] $*"; }
+# clear_dir <path>: empty a directory, keeping the directory itself.
+clear_dir() {
+  local d
+  d=$(r "$1")
+  [[ -n $1 && $1 != / && -d $d ]] || return 0
+  find "$d" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+}
 
-# 1. Eliminate Build Users & Temporary Privileges
-echo "==> [sanitizer] Purging temporary build users and sudoers..."
-for user in builder makepkg guest aur; do
-  if id "$user" >/dev/null 2>&1; then
-    userdel -r "$user" 2>/dev/null || true
+# find over the root filesystem only (never /proc, /sys, /dev or bind mounts).
+find_root() {
+  find "$(r /)" -xdev \( -path "$(r /proc)" -o -path "$(r /sys)" -o -path "$(r /dev)" -o -path "$(r /run)" \) -prune -o "$@"
+}
+
+log "removing build users and their sudo rules"
+for user in omarchy-builder builder makepkg aur; do
+  if [[ -z $ROOT ]] && id "$user" >/dev/null 2>&1; then
+    userdel --remove "$user" 2>/dev/null || userdel "$user" 2>/dev/null || true
   fi
+  rm -f "$(r /etc/sudoers.d/)"{90-,}"$user" 2>/dev/null || true
 done
-rm -f /etc/sudoers.d/builder /etc/sudoers.d/makepkg /etc/sudoers.d/aur 2>/dev/null || true
-rm -rf /home/builder /home/makepkg /home/aur 2>/dev/null || true
+rm -rf "$(r /var/lib/omarchy-builder)" "$(r /home/builder)" "$(r /home/makepkg)" "$(r /home/aur)"
 
-# 2. Eliminate Leaked Host Secrets, SSH Keys, Shell History, and Interactive State
-echo "==> [sanitizer] Scrubbing host secrets, credentials, and interactive history..."
-find /root /home /etc -name ".ssh" -type d -exec rm -rf {} + 2>/dev/null || true
-find /root /home -name ".gnupg" -type d ! -path "/etc/pacman.d/gnupg*" -exec rm -rf {} + 2>/dev/null || true
-find /root /home -name ".claude" -type d -exec rm -rf {} + 2>/dev/null || true
-find /root /home -name ".hermes" -type d ! -path "*/hermes/workspace" ! -path "*/hermes/worktrees" ! -path "*/hermes/scratch" -exec rm -rf {} + 2>/dev/null || true
-find /root /home -name ".aws" -type d -exec rm -rf {} + 2>/dev/null || true
-find /root /home -name ".docker" -type d -exec rm -rf {} + 2>/dev/null || true
-find /root /home -name ".config/gh" -type d -exec rm -rf {} + 2>/dev/null || true
-find /root /home -name ".gitconfig" -type f -exec rm -f {} + 2>/dev/null || true
+log "removing credentials and interactive state from /root and /home"
+for home in "$(r /root)" "$(r /home)"; do
+  [[ -d $home ]] || continue
+  find "$home" -xdev \( \
+    -path '*/.ssh' -o -path '*/.gnupg' -o -path '*/.aws' -o -path '*/.azure' -o \
+    -path '*/.kube' -o -path '*/.docker' -o -path '*/.claude' -o -path '*/.config/gh' -o \
+    -path '*/.config/gcloud' -o -path '*/.config/hub' -o -path '*/.config/op' -o \
+    -path '*/.local/share/keyrings' -o -path '*/.password-store' -o -path '*/.cache' -o \
+    -path '*/.npm' -o -path '*/.cargo/registry' -o -path '*/go/pkg' \
+    \) -prune -exec rm -rf {} + 2>/dev/null || true
+  find "$home" -xdev -type f \( \
+    -name '.netrc' -o -name '.npmrc' -o -name '.pypirc' -o -name '.git-credentials' -o \
+    -name '.gitconfig' -o -name '.claude.json' -o -name 'credentials' -o -name 'credentials.toml' -o \
+    -name '.vault-token' -o -name '*.pem' -o -name '*.key' -o -name 'id_rsa*' -o -name 'id_ed25519*' -o \
+    -name 'id_ecdsa*' \) -delete 2>/dev/null || true
+done
 
-# Purge history and shada/swap
-find / -name "*_history" -type f -exec rm -f {} + 2>/dev/null || true
-find / -name ".lesshst" -type f -exec rm -f {} + 2>/dev/null || true
-find / -name ".viminfo" -type f -exec rm -f {} + 2>/dev/null || true
-find / -name "*.swp" -type f -exec rm -f {} + 2>/dev/null || true
-find / -name "*.swo" -type f -exec rm -f {} + 2>/dev/null || true
-find / -type d -name "shada" -exec rm -rf {} + 2>/dev/null || true
+log "removing shell history and editor state"
+find_root -type f \( -name '.*_history' -o -name '.lesshst' -o -name '.viminfo' -o \
+  -name '.wget-hsts' -o -name '*.swp' -o -name '*.swo' \) -print0 2>/dev/null |
+  xargs -0 rm -f 2>/dev/null || true
+find_root -type d -path '*/nvim/shada' -print0 2>/dev/null | xargs -0 rm -rf 2>/dev/null || true
 
-# 3. Purge Package Manager Caches, Sync DBs, and Stale Locks
-echo "==> [sanitizer] Purging pacman package cache and locks..."
-rm -rf /var/cache/pacman/pkg/* 2>/dev/null || true
-rm -f /var/lib/pacman/db.lck 2>/dev/null || true
-# Clean pacman cache via paccache if available
-if command -v paccache >/dev/null 2>&1; then
-  paccache -rk0 2>/dev/null || true
+log "removing per-machine identity"
+# /etc/machine-id must exist and be empty: systemd treats an empty file as
+# "first boot" and generates the id; a missing file breaks some units.
+: >"$(r /etc/machine-id)"
+chmod 0444 "$(r /etc/machine-id)"
+rm -f "$(r /var/lib/dbus/machine-id)"
+ln -sf /etc/machine-id "$(r /var/lib/dbus/machine-id)" 2>/dev/null || true
+rm -f "$(r /var/lib/systemd/random-seed)" "$(r /var/lib/urandom/random-seed)"
+rm -f "$(r /etc/ssh/)"ssh_host_* 2>/dev/null || true
+rm -f "$(r /etc/omarchy-user.conf)" "$(r /var/lib/omarchy/oobe_completed)"
+# WSL generates these per instance. The container runtime keeps them bind
+# mounted during RUN, so removal can fail here; the exporter removes them too.
+rm -f "$(r /etc/resolv.conf)" "$(r /etc/hostname)" 2>/dev/null || true
+
+log "removing the pacman keyring, caches, sync databases and locks"
+gpgconf --homedir "$(r /etc/pacman.d/gnupg)" --kill all 2>/dev/null || true
+rm -rf "$(r /etc/pacman.d/gnupg)"
+clear_dir /var/cache/pacman/pkg
+clear_dir /var/lib/pacman/sync
+rm -f "$(r /var/lib/pacman/db.lck)"
+
+log "truncating logs and clearing temporary directories"
+find "$(r /var/log)" -xdev -type f -exec truncate -s 0 {} + 2>/dev/null || true
+clear_dir /var/log/journal
+find "$(r /tmp)" "$(r /var/tmp)" -xdev -mindepth 1 -delete 2>/dev/null || true
+chmod 1777 "$(r /tmp)" "$(r /var/tmp)"
+
+log "removing documentation and translations unpacked before NoExtract applied"
+find "$(r /usr/share/doc)" -mindepth 1 -maxdepth 1 ! -name omarchy-wsl -exec rm -rf {} + 2>/dev/null || true
+clear_dir /usr/share/gtk-doc
+clear_dir /usr/share/help
+clear_dir /usr/share/info
+if [[ -d $(r /usr/share/locale) ]]; then
+  find "$(r /usr/share/locale)" -mindepth 1 -maxdepth 1 ! -name 'en*' ! -name locale.alias -exec rm -rf {} + 2>/dev/null || true
 fi
 
-# 4. Cleanse Non-Reproducible Identity & System Entropy
-echo "==> [sanitizer] Cleansing system identity, random seeds, and logs..."
-# /etc/machine-id MUST be empty (0 bytes), NOT deleted or populated
-truncate -s 0 /etc/machine-id
-chmod 0444 /etc/machine-id
-rm -f /var/lib/dbus/machine-id 2>/dev/null || true
-ln -sf /etc/machine-id /var/lib/dbus/machine-id
-
-# Random seed MUST be purged
-rm -f /var/lib/systemd/random-seed 2>/dev/null || true
-rm -f /var/lib/urandom/random-seed 2>/dev/null || true
-
-# Purge logs
-find /var/log -type f -exec truncate -s 0 {} + 2>/dev/null || true
-rm -rf /var/log/journal/* 2>/dev/null || true
-
-# Purge ephemeral runtime and temp directories
-rm -rf /tmp/* /tmp/.* /var/tmp/* /var/tmp/.* 2>/dev/null || true
-rm -rf /var/run/* /run/* 2>/dev/null || true
-
-# 5. Sanitize Pacman Keyring & GPG Sockets
-echo "==> [sanitizer] Sanitizing GPG sockets in /etc/pacman.d/gnupg..."
-GNUPG_DIR="/etc/pacman.d/gnupg"
-if [[ -d "$GNUPG_DIR" ]]; then
-  gpgconf --homedir "$GNUPG_DIR" --kill all 2>/dev/null || true
-  rm -f "${GNUPG_DIR}/S."* "${GNUPG_DIR}/"*.lock "${GNUPG_DIR}/random_seed" 2>/dev/null || true
-  chmod 0700 "$GNUPG_DIR"
-  find "$GNUPG_DIR" -type f -exec chmod 0600 {} + 2>/dev/null || true
-fi
-
-# 6. Deep Footprint Stripping (Enforcing <800MB Budget)
-echo "==> [sanitizer] Stripping redundant documentation, manpages, and locales..."
-# Strip docs, man, and info
-rm -rf /usr/share/doc/* /usr/share/gtk-doc/* /usr/share/help/* 2>/dev/null || true
-rm -rf /usr/share/man/* /usr/share/info/* 2>/dev/null || true
-
-# Strip unused locales (retain only en and locale.alias)
-if [[ -d /usr/share/locale ]]; then
-  find /usr/share/locale -mindepth 1 -maxdepth 1 ! -name 'en*' ! -name 'locale.alias' -exec rm -rf {} + 2>/dev/null || true
-fi
-
-# Prune Python bytecode
-echo "==> [sanitizer] Pruning Python __pycache__ and bytecode..."
-find /usr -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-find /usr -name "*.pyc" -type f -delete 2>/dev/null || true
-find /usr -name "*.pyo" -type f -delete 2>/dev/null || true
-
-# Prune TTF Font Bloat (Leave only essential regular Nerd Font variant)
-echo "==> [sanitizer] Pruning oversized font families..."
-if [[ -d /usr/share/fonts/TTF ]]; then
-  find /usr/share/fonts/TTF -type f ! -name "*Regular*.ttf" ! -name "*JetBrainsMono*Nerd*Regular*.ttf" -delete 2>/dev/null || true
-fi
-
-# Strip unneeded static libraries and debug symbols
-echo "==> [sanitizer] Stripping unneeded static archives..."
-find /usr/lib /usr/local/lib -name "*.a" ! -name "libc.a" ! -name "libpthread.a" -type f -delete 2>/dev/null || true
-
-# Remove unwanted firmware and kernel modules if accidentally pulled
-echo "==> [sanitizer] Verifying exclusion of host kernel/firmware..."
-rm -rf /usr/lib/modules/* /usr/lib/firmware/* 2>/dev/null || true
-
-# 7. Clamping Timestamps for Reproducible Builds
-if [[ -n "${SOURCE_DATE_EPOCH:-}" ]]; then
-  echo "==> [sanitizer] Clamping filesystem timestamps to SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}..."
-  find / -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + 2>/dev/null || true
-fi
-
-echo "==> [sanitizer] Rootfs sanitization complete. Zero-leak posture verified."
+log "done"

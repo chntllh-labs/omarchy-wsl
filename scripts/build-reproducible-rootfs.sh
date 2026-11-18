@@ -1,159 +1,177 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ==============================================================================
-# Omarchy WSL: Reproducible Distro Build & Packaging Pipeline
+# Omarchy WSL: build the image and export a deterministic, audited .wsl file
 # ==============================================================================
-# Builds multi-stage container, exports rootfs, enforces deterministic archiving,
-# runs adversarial leak tests, and verifies compressed size <800MB.
+#   scripts/build-reproducible-rootfs.sh <arm64|x86_64> [options]
+#
+#   --skip-build            reuse the already built image omarchy-wsl:<arch>
+#   --verify-determinism    normalise the export twice, in two separate
+#                           containers, and require byte-identical output
+#   --self-test-leak        normalise once more with seeded leaks and require
+#                           the audit to fail closed (no artifact written)
+#   --keep-export           keep dist/.export-<arch>.tar
+#   --output DIR            output directory (default: dist/)
+#   -h, --help
+#
+# Environment: CONTAINER_ENGINE (docker|podman), SOURCE_DATE_EPOCH (default:
+# last commit time), OMARCHY_WSL_GIT_SHA, NORMALIZE_IMAGE (default
+# debian:bookworm-slim: GNU tar + gzip), MAX_SIZE_MB (default 800),
+# PACMAN_MIRROR, MAKE_JOBS, AUDIT_EXTRA_PATTERNS.
+#
+# Outputs dist/Omarchy-arm64.wsl or dist/Omarchy-x86_64.wsl plus .sha256.
+# Archiving runs as root inside a Linux container (scripts/normalize-rootfs.sh):
+# the host never extracts the rootfs, so setuid/sticky bits, numeric uids and
+# security.capability survive on any host, including macOS.
 # ==============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-ARCH="${1:-$(uname -m)}"
-case "$ARCH" in
-  x86_64|amd64)   ARCH="amd64" ;;
-  aarch64|arm64)  ARCH="arm64" ;;
-  *)
-    echo "[-] ERROR: Unsupported architecture '$ARCH'" >&2
-    exit 1
-    ;;
+usage() { sed -n '5,13p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+die() {
+  echo "[build] ERROR: $*" >&2
+  exit 1
+}
+log() { echo "[build] $*"; }
+
+ARCH_ARG=""
+SKIP_BUILD=0 VERIFY_DETERMINISM=0 SELF_TEST_LEAK=0 KEEP_EXPORT=0
+DIST_DIR="$ROOT_DIR/dist"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-build) SKIP_BUILD=1 ;;
+    --verify-determinism) VERIFY_DETERMINISM=1 ;;
+    --self-test-leak) SELF_TEST_LEAK=1 ;;
+    --keep-export) KEEP_EXPORT=1 ;;
+    --output)
+      DIST_DIR="${2:?--output needs a directory}"
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "[build] unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *) ARCH_ARG="$1" ;;
+  esac
+  shift
+done
+
+case "${ARCH_ARG:-$(uname -m)}" in
+  arm64 | aarch64) ARCH=arm64 PLATFORM=linux/arm64 ASSET=Omarchy-arm64.wsl ;;
+  x86_64 | amd64) ARCH=amd64 PLATFORM=linux/amd64 ASSET=Omarchy-x86_64.wsl ;;
+  *) die "unsupported architecture '$ARCH_ARG' (arm64 or x86_64)" ;;
 esac
 
-# 1. Determine SOURCE_DATE_EPOCH for reproducible builds
-if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
-  if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    SOURCE_DATE_EPOCH=$(git -C "$ROOT_DIR" log -1 --pretty=%ct)
-  else
-    SOURCE_DATE_EPOCH=1775000000 # Deterministic fallback
-  fi
+if [[ -z ${SOURCE_DATE_EPOCH:-} ]]; then
+  SOURCE_DATE_EPOCH=$(git -C "$ROOT_DIR" log -1 --format=%ct 2>/dev/null || echo 0)
 fi
 export SOURCE_DATE_EPOCH
+OMARCHY_WSL_GIT_SHA="${OMARCHY_WSL_GIT_SHA:-$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)}"
+NORMALIZE_IMAGE="${NORMALIZE_IMAGE:-docker.io/library/debian:bookworm-slim}"
+MAX_SIZE_MB="${MAX_SIZE_MB:-800}"
 
-# 2. Select Container Engine (podman, docker, wslc)
-if command -v podman >/dev/null 2>&1; then
-  ENGINE="podman"
-elif command -v docker >/dev/null 2>&1; then
-  ENGINE="docker"
-elif command -v wslc.exe >/dev/null 2>&1; then
-  ENGINE="wslc.exe"
-else
-  echo "[-] ERROR: No container engine found (podman, docker, or wslc.exe required)." >&2
-  exit 1
+ENGINE="${CONTAINER_ENGINE:-}"
+if [[ -z $ENGINE ]]; then
+  if command -v docker >/dev/null 2>&1; then ENGINE=docker
+  elif command -v podman >/dev/null 2>&1; then ENGINE=podman
+  else die "docker or podman is required"; fi
 fi
 
-DIST_DIR="${ROOT_DIR}/dist"
+IMAGE_TAG="omarchy-wsl:$ARCH"
 mkdir -p "$DIST_DIR"
+DIST_DIR="$(cd "$DIST_DIR" && pwd)"
+EXPORT_TAR="$DIST_DIR/.export-$ARCH.tar"
+OUTPUT="$DIST_DIR/$ASSET"
 
-IMAGE_TAG="omarchy-wsl:${ARCH}-${SOURCE_DATE_EPOCH}"
-OUTPUT_WSL="${DIST_DIR}/Omarchy-${ARCH}.wsl"
-
-echo "========================================================================"
-echo " Omarchy-WSL Reproducible Build Engine"
-echo "========================================================================"
-echo " Target Architecture : $ARCH"
-echo " Container Engine    : $ENGINE"
-echo " SOURCE_DATE_EPOCH   : $SOURCE_DATE_EPOCH"
-echo " Output Package      : $OUTPUT_WSL"
-echo "========================================================================"
-
-# 3. Build Container Image
-echo "[+] Step 1: Building multi-stage container image..."
-$ENGINE build \
-  --build-arg ARCH="$ARCH" \
-  --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-  -t "$IMAGE_TAG" \
-  -f "${ROOT_DIR}/Containerfile" \
-  "$ROOT_DIR"
-
-# 4. Export Rootfs
-echo "[+] Step 2: Exporting rootfs container layer..."
-CONTAINER_ID=$($ENGINE create "$IMAGE_TAG")
-TMP_TAR="${DIST_DIR}/.tmp-rootfs.tar"
-$ENGINE export "$CONTAINER_ID" -o "$TMP_TAR"
-$ENGINE rm "$CONTAINER_ID" >/dev/null
-
-# 5. Adversarial Leak & Integrity Verification on Raw Archive
-echo "[+] Step 3: Executing adversarial leak & integrity audit on export archive..."
-AUDIT_FAILED=0
-
-check_forbidden_path() {
-  local pattern="$1"
-  local desc="$2"
-  if tar -tf "$TMP_TAR" | grep -E "$pattern" >/dev/null 2>&1; then
-    echo "  [!] FAIL: Leak detected: $desc ($pattern)" >&2
-    AUDIT_FAILED=1
-  else
-    echo "  [✓] PASS: No $desc found"
-  fi
+file_size() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1"; }
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
-check_forbidden_path "^(root|home/[^/]+)/\.ssh/" "leaked SSH keys"
-check_forbidden_path "^(root|home/[^/]+)/\.gnupg/" "leaked personal GPG keys"
-check_forbidden_path "^(root|home/[^/]+)/\.claude/" "leaked Claude credentials"
-check_forbidden_path ".*_history$" "leaked shell history"
-check_forbidden_path "^var/cache/pacman/pkg/.+" "unpurged pacman package caches"
-check_forbidden_path "^var/lib/systemd/random-seed" "non-reproducible random seed"
-check_forbidden_path "^etc/pacman\.d/gnupg/S\." "stale GPG agent sockets"
-check_forbidden_path "^etc/sudoers\.d/(builder|makepkg|aur)" "residual build-user sudoers"
-check_forbidden_path "^usr/lib/wsl/" "leaked host GPU driver mounts"
-
-# Check machine-id is empty (0 bytes)
-MACHINE_ID_SIZE=$(tar -tvf "$TMP_TAR" etc/machine-id 2>/dev/null | awk '{print $3}' || echo "missing")
-if [[ "$MACHINE_ID_SIZE" == "0" ]]; then
-  echo "  [✓] PASS: /etc/machine-id is clean and exactly 0 bytes"
-else
-  echo "  [!] FAIL: /etc/machine-id is size '$MACHINE_ID_SIZE' (expected 0 bytes)" >&2
-  AUDIT_FAILED=1
-fi
-
-if (( AUDIT_FAILED != 0 )); then
-  echo "[-] ERROR: Adversarial audit failed! Aborting packaging." >&2
-  rm -f "$TMP_TAR"
-  exit 1
-fi
-
-# 6. Compress with Reproducible Flags
-echo "[+] Step 4: Compressing reproducible distribution package..."
-COMPRESSOR="gzip -n -9"
-if command -v pigz >/dev/null 2>&1; then
-  COMPRESSOR="pigz -n -9"
-fi
-
-# Re-tar with strict reproducible ordering and timestamps
-mkdir -p "${DIST_DIR}/.repro-unpack"
-tar -xf "$TMP_TAR" -C "${DIST_DIR}/.repro-unpack"
-rm -f "$TMP_TAR"
-
-(
-  cd "${DIST_DIR}/.repro-unpack"
-  tar \
-    --sort=name \
-    --mtime="@${SOURCE_DATE_EPOCH}" \
-    --owner=0 \
-    --group=0 \
-    --numeric-owner \
-    -cf - . | $COMPRESSOR > "$OUTPUT_WSL"
-)
-
-rm -rf "${DIST_DIR}/.repro-unpack"
-
-# 7. Footprint Budget Verification (<800MB)
-FILE_SIZE_BYTES=$(stat -f "%z" "$OUTPUT_WSL" 2>/dev/null || stat -c "%s" "$OUTPUT_WSL")
-FILE_SIZE_MB=$(( FILE_SIZE_BYTES / 1024 / 1024 ))
-MAX_BUDGET_MB=800
+CID=""
+cleanup() {
+  [[ -n $CID ]] && $ENGINE rm -f "$CID" >/dev/null 2>&1 || true
+  if ((KEEP_EXPORT == 0)); then rm -f "$EXPORT_TAR"; fi
+  rm -f "$DIST_DIR/.determinism-"*.wsl "$DIST_DIR/.leaktest.wsl"
+}
+trap cleanup EXIT
 
 echo "========================================================================"
-echo " Distribution Artifact Built Successfully"
-echo " Artifact Path : $OUTPUT_WSL"
-echo " Package Size  : ${FILE_SIZE_MB} MB (Budget: < ${MAX_BUDGET_MB} MB)"
-echo " SHA256 Hash   : $(sha256sum "$OUTPUT_WSL" | awk '{print $1}')"
+echo " Omarchy WSL reproducible build"
+echo "   architecture     $ARCH ($PLATFORM)"
+echo "   engine           $ENGINE"
+echo "   SOURCE_DATE_EPOCH $SOURCE_DATE_EPOCH"
+echo "   git              $OMARCHY_WSL_GIT_SHA"
+echo "   output           $OUTPUT"
 echo "========================================================================"
 
-if (( FILE_SIZE_MB > MAX_BUDGET_MB )); then
-  echo "[-] WARNING: Artifact size (${FILE_SIZE_MB}MB) exceeds 800MB budget!" >&2
-  exit 1
-else
-  echo "[+] SUCCESS: Artifact strictly within footprint budget."
+if ((SKIP_BUILD == 0)); then
+  log "building $IMAGE_TAG"
+  $ENGINE build --platform "$PLATFORM" \
+    --build-arg ARCH="$ARCH" \
+    --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+    --build-arg OMARCHY_WSL_GIT_SHA="$OMARCHY_WSL_GIT_SHA" \
+    --build-arg PACMAN_MIRROR="${PACMAN_MIRROR:-}" \
+    --build-arg MAKE_JOBS="${MAKE_JOBS:-}" \
+    -t "$IMAGE_TAG" -f "$ROOT_DIR/Containerfile" "$ROOT_DIR"
 fi
+
+log "exporting the root filesystem"
+CID=$($ENGINE create --platform "$PLATFORM" "$IMAGE_TAG" /bin/true)
+$ENGINE export -o "$EXPORT_TAR" "$CID"
+$ENGINE rm -f "$CID" >/dev/null
+CID=""
+
+normalize() {
+  local out="$1" seed="${2:-0}"
+  $ENGINE run --rm \
+    -v "$DIST_DIR:/work" \
+    -v "$ROOT_DIR/scripts:/scripts:ro" \
+    -v "$ROOT_DIR/tests:/tests:ro" \
+    -e SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+    -e SEED_LEAK="$seed" \
+    -e AUDIT_EXTRA_PATTERNS="${AUDIT_EXTRA_PATTERNS:-}" \
+    -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+    "$NORMALIZE_IMAGE" bash /scripts/normalize-rootfs.sh "/work/$(basename "$EXPORT_TAR")" "/work/$(basename "$out")"
+}
+
+log "normalising, auditing and packing (inside $NORMALIZE_IMAGE)"
+normalize "$OUTPUT"
+SUM=$(sha256 "$OUTPUT")
+
+if ((VERIFY_DETERMINISM)); then
+  log "determinism: second independent normalisation of the same export"
+  normalize "$DIST_DIR/.determinism-2.wsl"
+  SUM2=$(sha256 "$DIST_DIR/.determinism-2.wsl")
+  if [[ $SUM2 != "$SUM" ]]; then
+    die "non-deterministic archive: $SUM vs $SUM2"
+  fi
+  log "determinism: PASS (both runs sha256 $SUM)"
+fi
+
+if ((SELF_TEST_LEAK)); then
+  log "leak self-test: seeded leaks must make the audit fail closed"
+  if normalize "$DIST_DIR/.leaktest.wsl" 1; then
+    die "leak self-test: the audit PASSED a rootfs with seeded leaks"
+  fi
+  [[ ! -e $DIST_DIR/.leaktest.wsl ]] || die "leak self-test: an artifact was written despite the failed audit"
+  log "leak self-test: PASS (audit failed closed, no artifact)"
+fi
+
+SIZE_BYTES=$(file_size "$OUTPUT")
+SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+printf '%s  %s\n' "$SUM" "$ASSET" >"$OUTPUT.sha256"
+
+echo "========================================================================"
+echo " $ASSET"
+echo "   size    $SIZE_BYTES bytes (${SIZE_MB} MiB, budget < ${MAX_SIZE_MB} MiB)"
+echo "   sha256  $SUM"
+echo "========================================================================"
+((SIZE_MB < MAX_SIZE_MB)) || die "$ASSET is ${SIZE_MB} MiB, over the ${MAX_SIZE_MB} MiB budget"

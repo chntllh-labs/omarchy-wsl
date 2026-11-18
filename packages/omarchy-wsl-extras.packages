@@ -1,0 +1,17 @@
+# Not installed in the image (they would push the .wsl past its 800 MB budget
+# or are not redistributable). Install what you need after setup:
+#
+#   sudo pacman -S --needed $(grep -v '^#' /usr/share/omarchy-wsl/packages/omarchy-wsl-extras.packages)
+#
+# Heavier toolchains
+clang
+llvm
+lld
+ruby
+go
+rust
+cmake
+ninja
+# Anthropic's Claude Code CLI, published in [omarchy]; proprietary, so it is
+# installed on demand rather than redistributed inside the image.
+claude-code

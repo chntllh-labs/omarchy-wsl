@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1
+#
+# Test environment for the unit and integration suites (not the product image).
+# glibc + GNU coreutils/tar/awk, bash 5, python3 + pytest, socat, inotify-tools,
+# shellcheck, systemd tooling and PowerShell 7 (parses and runs the generated
+# PowerShell). Builds natively on linux/arm64 and linux/amd64.
+#
+#   docker build -t omarchy-wsl-test -f tests/ci/Containerfile .
+#   docker run --rm -v "$PWD:/src" -w /src omarchy-wsl-test tests/run-all.sh
+#
+# Every optional tool a suite can use is installed, so tests/run-all.sh runs
+# with OMW_STRICT=1: a skipped check counts as a failure.
+
+FROM docker.io/library/ubuntu:24.04
+
+ARG PWSH_VERSION=7.6.10
+ARG PWSH_SHA256_ARM64=439432cdecf4418413b9a8f547e3ab4d9b40e8e4258913ec3d15fc92c67a9235
+ARG PWSH_SHA256_X64=e261cabc91c78a9afe8d1e5f24731ab0d38204735ab2ec94b0af55102652e10d
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      bash ca-certificates coreutils curl diffutils file findutils gawk git gnupg \
+      inotify-tools iproute2 jq libicu74 make openssh-client procps python3 \
+      python3-pytest shellcheck socat sudo systemd tar util-linux xxd zstd && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    case "$(uname -m)" in \
+      aarch64) arch=arm64; sum="$PWSH_SHA256_ARM64" ;; \
+      x86_64) arch=x64; sum="$PWSH_SHA256_X64" ;; \
+      *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_VERSION}/powershell-${PWSH_VERSION}-linux-${arch}.tar.gz"; \
+    curl -fsSL --retry 3 -o /tmp/pwsh.tar.gz "$url"; \
+    echo "${sum}  /tmp/pwsh.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/microsoft/powershell/7; \
+    tar -xzf /tmp/pwsh.tar.gz -C /opt/microsoft/powershell/7; \
+    chmod 0755 /opt/microsoft/powershell/7/pwsh; \
+    ln -s /opt/microsoft/powershell/7/pwsh /usr/local/bin/pwsh; \
+    rm -f /tmp/pwsh.tar.gz; \
+    pwsh -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+
+# The suites must also pass as an unprivileged user (they never need root;
+# root-only paths are exercised through sandbox seams).
+RUN useradd --create-home --uid 1000 --shell /bin/bash tester 2>/dev/null || \
+    useradd --create-home --shell /bin/bash tester
+
+WORKDIR /src
+CMD ["bash", "tests/run-all.sh"]

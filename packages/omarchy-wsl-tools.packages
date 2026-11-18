@@ -1,30 +1,43 @@
-# Omarchy-WSL Tools & Runtimes Manifest
-# Essential developer toolchains and terminal enhancements
+# CLI tooling Omarchy ships on the desktop, minus everything graphical.
+# Installed by build/02-omarchy-repo.sh once [omarchy] is trusted.
 
-bat
+# Shell experience
 btop
 eza
-fastfetch
-fd
+bat
 fzf
-gum
-jq
+ripgrep
+fd
+fastfetch
+starship
+zoxide
+dust
+dua-cli
+tealdeer
+plocate
+usage
+git-delta
 lazygit
-neovim
+github-cli
+whois
+
+# Toolchains (gcc/make come with base-devel; mise and uv install the rest per user)
 nodejs
 npm
-python
+uv
 python-pip
-ripgrep
-starship
-tmux
 tree-sitter-cli
-unzip
-zip
-zoxide
+lua51
+luarocks
 
-# Windows integration & QoL (docs/WINDOWS-INTEGRATION-QOL.md)
-socat
-wl-clipboard
-libpulse
-alsa-plugins
+# Containers (docker.socket is enabled; the daemon starts on first use)
+docker
+docker-buildx
+docker-compose
+lazydocker
+
+# Fonts for WSLg applications and anything that rasterises text inside the
+# distro. Windows Terminal renders with Windows-side fonts.
+fontconfig
+ttf-dejavu
+noto-fonts-emoji
