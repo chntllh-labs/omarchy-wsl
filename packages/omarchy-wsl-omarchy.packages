@@ -1,0 +1,9 @@
+# Installed from Omarchy's own signed repository ([omarchy],
+# https://pkgs.omarchy.org/stable/$arch), which publishes all of these for both
+# aarch64 and x86_64. build/02-omarchy-repo.sh asserts each one resolves to
+# [omarchy], so nothing here is built from the AUR or from source.
+omarchy-keyring
+omarchy-nvim
+yay
+mise-bin
+ttf-jetbrains-mono-nerd-basic

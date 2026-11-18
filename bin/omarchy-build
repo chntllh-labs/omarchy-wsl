@@ -1,44 +1,59 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # /usr/bin/omarchy-build
-# Omarchy-WSL Cgroup Resource Governor & Sandboxed Build Engine
+# Omarchy-WSL cgroup-governed build runner
 # ==============================================================================
-# Safely executes resource-intensive builds (cargo, rustc, clang, gcc, cmake,
-# ninja, node, esbuild, bun) inside an isolated cgroup v2 slice.
+# Runs a resource-intensive build (cargo, make, cmake, ninja, npm, bun, ...) in
+# build.slice of the systemd user manager, with a RAM-safe parallelism:
 #
-# Prevents:
-# 1. Interactive terminal & Neovim UI stuttering (enforces CPUWeight=100 vs 1000).
-# 2. Block I/O starvation of user tasks (enforces IOWeight=100).
-# 3. High-core low-memory compilation crashes (computes safe -j thread limits).
-# 4. Partial zombie OOM failure states (enforces atomic MemoryOOMGroup=yes).
-# 5. Sacrifices builds first during acute memory pressure (OOMScoreAdjust=500).
-# 6. Battery drain & thermal throttling on laptops (omarchy-power-governor).
-# 7. Accidental builds on Windows drives (DrvFs/9P) — refused unless allowed.
+# 1. -j = min(CPUs, RAM GiB / 2), at least 2, exported as CARGO_BUILD_JOBS,
+#    MAKEFLAGS and CMAKE_BUILD_PARALLEL_LEVEL (an explicit -j always wins).
+# 2. omarchy-power-governor scales the computed -j on battery / Energy Saver /
+#    thermal limits (never an explicit -j).
+# 3. `systemd-run --user --scope --slice=build.slice` places the build in a
+#    transient scope: CPUWeight/IOWeight below interactive work, OOMPolicy=kill
+#    (the kernel kills the whole build together instead of one rustc at a time;
+#    systemd sets memory.oom.group). A scope (not a service) keeps the caller's
+#    full environment (PATH, CC, RUSTFLAGS, the -j variables), terminal, signals
+#    and exit status, and needs no user D-Bus session.
+# 4. The build's oom_score_adj is raised to 500 so the kernel OOM killer picks
+#    it before shells and editors (raising needs no privilege).
+# 5. Builds on Windows drives (DrvFs over 9p or virtiofs) are refused.
+# Without a reachable user manager the same limits are applied directly
+# (nice 10, oom_score_adj 500).
 # ==============================================================================
 
 set -euo pipefail
 
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_is_drvfs >/dev/null || { echo "omarchy-build: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-build"
+
 usage() {
   cat <<'EOF'
-Usage: omarchy-build [options] <command> [args...]
+Usage: omarchy-build [options] [--] <command> [args...]
 
 Options:
-  -j, --jobs <N>       Explicitly set maximum parallel compilation jobs
-  --slice <name>       Custom systemd slice (default: build.slice)
-  --no-cgroup          Bypass cgroup isolation; apply nice/oom_score_adj directly
+  -j, --jobs <N>       Maximum parallel jobs (default: min(CPUs, RAM GiB / 2))
+  --slice <name>       systemd user slice (default: build.slice)
+  --no-cgroup          Skip systemd; apply nice 10 + oom_score_adj 500 directly
   --no-power           Ignore battery/thermal state (skip omarchy-power-governor)
   --notify             Raise a Windows toast when the build finishes (omarchy-notify)
   --allow-drvfs        Permit building inside a Windows drive (/mnt/<drive>)
-  --dry-run            Print the computed parallelism and command, then exit
-  -h, --help           Display this help message
+  --dry-run            Print the computed parallelism and the exact command, then exit
+  -h, --help           Show this help
+
+Exit status: the command's own status; 2 usage error; 3 refused (Windows drive).
 
 Examples:
   omarchy-build cargo build --release
-  omarchy-build ninja -C build
-  omarchy-build npm run build
-  omarchy-build make -j8
+  omarchy-build -j 4 make
+  omarchy-build --notify npm run build
 EOF
-  exit 1
 }
 
 CUSTOM_JOBS=""
@@ -48,82 +63,78 @@ NO_POWER=0
 NOTIFY=0
 ALLOW_DRVFS=0
 DRY_RUN=0
-SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+SELF_DIR="$(dirname "$_self")"
+
+usage_error() {
+  omw_err "$*"
+  usage >&2
+  exit 2
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -j|--jobs)
+      [[ $# -ge 2 ]] || usage_error "$1 requires a value"
       CUSTOM_JOBS="$2"
       shift 2
       ;;
+    -j[0-9]*) CUSTOM_JOBS="${1#-j}"; shift ;;
+    --jobs=*) CUSTOM_JOBS="${1#*=}"; shift ;;
     --slice)
+      [[ $# -ge 2 ]] || usage_error "--slice requires a value"
       TARGET_SLICE="$2"
       shift 2
       ;;
-    --no-cgroup)
-      BYPASS_CGROUP=1
-      shift
-      ;;
-    --no-power)
-      NO_POWER=1
-      shift
-      ;;
-    --notify)
-      NOTIFY=1
-      shift
-      ;;
-    --allow-drvfs)
-      ALLOW_DRVFS=1
-      shift
-      ;;
-    --dry-run)
-      DRY_RUN=1
-      shift
-      ;;
-    -h|--help)
-      usage
-      ;;
-    --)
-      shift
-      break
-      ;;
-    -*)
-      echo "[omarchy-build] Unknown option: $1" >&2
-      usage
-      ;;
-    *)
-      break
-      ;;
+    --slice=*) TARGET_SLICE="${1#*=}"; shift ;;
+    --no-cgroup) BYPASS_CGROUP=1; shift ;;
+    --no-power) NO_POWER=1; shift ;;
+    --notify) NOTIFY=1; shift ;;
+    --allow-drvfs) ALLOW_DRVFS=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) usage_error "Unknown option: $1" ;;
+    *) break ;;
   esac
 done
 
-if [[ $# -eq 0 ]]; then
-  usage
+[[ $# -gt 0 ]] || usage_error "No command given."
+if [[ -n "$CUSTOM_JOBS" ]] && ! [[ "$CUSTOM_JOBS" =~ ^[1-9][0-9]{0,3}$ ]]; then
+  usage_error "--jobs expects a positive integer, got '$CUSTOM_JOBS'"
+fi
+[[ "$TARGET_SLICE" =~ ^[A-Za-z0-9:_.-]+\.slice$ ]] || usage_error "Invalid slice name '$TARGET_SLICE'"
+BUILD_NAME="${1##*/}"
+
+# -----------------------------------------------------------------------------
+# 1. DrvFs boundary: builds on /mnt/<drive> are slow and break file watchers.
+#    omw_is_drvfs recognises 9p, drvfs and virtiofs-backed Windows drives.
+# -----------------------------------------------------------------------------
+if (( ALLOW_DRVFS == 0 )) && [[ "${OMARCHY_DRVFS_GUARD:-block}" != "off" ]] && omw_is_drvfs "$PWD"; then
+  if [[ "${OMARCHY_DRVFS_GUARD:-block}" == "warn" ]]; then
+    omw_warn "Building on a Windows drive ($PWD) is slow; prefer ~/src (ext4)."
+  else
+    omw_err "Refusing to build on a Windows drive ($PWD)."
+    omw_err "Move the project to ~/src (ext4), or pass --allow-drvfs."
+    exit 3
+  fi
 fi
 
 # -----------------------------------------------------------------------------
-# 1. Compute Safe Parallelism (-j) based on RAM & Cores
+# 2. Safe parallelism (-j) from RAM and cores
 # -----------------------------------------------------------------------------
-# Compilers (rustc, clang++) and linkers (lld, gold) consume up to 2GB RAM per thread.
-# On high-core architectures with limited RAM (e.g. 18 Oryon cores on 16GB RAM),
-# unconstrained -j18 triggers instantaneous OOM panics during linking.
+# Compilers and linkers (rustc, clang++, lld) use up to ~2 GiB per job; an
+# unconstrained -j on a high-core, low-RAM machine OOMs while linking.
 TOTAL_CPUS=$(nproc 2>/dev/null || echo 2)
 MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 8388608)
-MEM_GB=$(( MEM_KB / 1024 / 1024 ))
-
-# Heuristic: 2GB RAM budget per concurrent compile/link job
-MAX_SAFE_BY_RAM=$(( MEM_GB / 2 ))
-[[ $MAX_SAFE_BY_RAM -lt 2 ]] && MAX_SAFE_BY_RAM=2
+MAX_SAFE_BY_RAM=$(( MEM_KB / 1024 / 1024 / 2 ))
+(( MAX_SAFE_BY_RAM < 2 )) && MAX_SAFE_BY_RAM=2
 
 if [[ -n "$CUSTOM_JOBS" ]]; then
   JOBS="$CUSTOM_JOBS"
+elif (( TOTAL_CPUS < MAX_SAFE_BY_RAM )); then
+  JOBS="$TOTAL_CPUS"
 else
-  # Clamp to smaller of total CPUs or safe RAM limit
-  if (( TOTAL_CPUS < MAX_SAFE_BY_RAM )); then
-    JOBS="$TOTAL_CPUS"
-  else
-    JOBS="$MAX_SAFE_BY_RAM"
-  fi
+  JOBS="$MAX_SAFE_BY_RAM"
 fi
 
 # Sibling tools first (repo checkout), then PATH (installed system).
@@ -135,10 +146,7 @@ find_tool() {
   fi
 }
 
-# -----------------------------------------------------------------------------
-# 1b. Power & Thermal Governance (battery, Energy Saver, throttling)
-# -----------------------------------------------------------------------------
-# An explicit -j is always honoured; only the computed default is governed.
+# Power & thermal governance: only the computed default is governed.
 POWER_NOTE=""
 if [[ -z "$CUSTOM_JOBS" && $NO_POWER -eq 0 && "${OMARCHY_POWER_GOVERNOR:-auto}" != "off" ]]; then
   if GOVERNOR=$(find_tool omarchy-power-governor); then
@@ -150,92 +158,73 @@ if [[ -z "$CUSTOM_JOBS" && $NO_POWER -eq 0 && "${OMARCHY_POWER_GOVERNOR:-auto}" 
   fi
 fi
 
-# -----------------------------------------------------------------------------
-# 1c. DrvFs Boundary: builds on /mnt/<drive> are slow and break file watchers
-# -----------------------------------------------------------------------------
-if (( ALLOW_DRVFS == 0 )) && [[ "${OMARCHY_DRVFS_GUARD:-block}" == "block" ]]; then
-  case "$(stat -f -c %T . 2>/dev/null)" in
-    v9fs|9p|drvfs)
-      echo "[omarchy-build] Refusing to build on a Windows drive ($PWD)." >&2
-      echo "[omarchy-build] Move the project to ~/src (ext4), or pass --allow-drvfs." >&2
-      exit 2
-      ;;
-  esac
-fi
-
 if (( NOTIFY == 1 )); then
   if NOTIFIER=$(find_tool omarchy-notify); then
     set -- "$NOTIFIER" --wrap --min-seconds "${OMARCHY_NOTIFY_MIN_SECONDS:-0}" -- "$@"
   else
-    echo "[omarchy-build] --notify requested but omarchy-notify is not installed." >&2
+    omw_warn "--notify requested but omarchy-notify is not installed."
   fi
-fi
-
-[[ -n "$POWER_NOTE" && -t 2 ]] && echo "[omarchy-build] ${POWER_NOTE}" >&2
-
-if (( DRY_RUN == 1 )); then
-  echo "jobs=${JOBS}"
-  [[ -n "$POWER_NOTE" ]] && echo "note=${POWER_NOTE}"
-  printf 'command='
-  printf '%q ' "$@"
-  printf '\n'
-  exit 0
 fi
 
 export CARGO_BUILD_JOBS="$JOBS"
 export MAKEFLAGS="-j$JOBS"
 export CMAKE_BUILD_PARALLEL_LEVEL="$JOBS"
-export NINJA_STATUS="[%f/%t %s] "
+export NINJA_STATUS="${NINJA_STATUS:-[%f/%t %s] }"
 
 # -----------------------------------------------------------------------------
-# 2. Execution Engine (systemd-run cgroup isolation vs procfs fallback)
+# 3. Execution engine
 # -----------------------------------------------------------------------------
-IS_SYSTEMD=0
-if [[ $(ps -p 1 -o comm= 2>/dev/null) == "systemd" ]]; then
-  IS_SYSTEMD=1
+# Transient scope properties. Every name is valid for a scope unit on
+# systemd >= 253 (tests/test_build_governance.sh cross-checks the list with
+# systemd-analyze). OOMScoreAdjust is an exec setting and is NOT accepted on a
+# scope, so the score is raised on this process before exec instead.
+SCOPE_PROPERTIES=(
+  "CPUWeight=${OMARCHY_BUILD_CPU_WEIGHT:-20}"
+  "IOWeight=${OMARCHY_BUILD_IO_WEIGHT:-20}"
+  "OOMPolicy=kill"
+)
+
+user_manager_ok() {
+  [[ -n "${OMARCHY_BUILD_FORCE_SYSTEMD:-}" ]] && return 0
+  [[ -d /run/systemd/system ]] || return 1
+  omw_have systemd-run || return 1
+  systemctl --user is-active basic.target >/dev/null 2>&1
+}
+
+ENGINE="direct"
+if (( BYPASS_CGROUP == 0 )) && user_manager_ok; then
+  ENGINE="systemd"
 fi
 
-# Check if systemd user manager is responsive
-CAN_SYSTEMD_RUN=0
-if (( IS_SYSTEMD == 1 && BYPASS_CGROUP == 0 )) && command -v systemd-run >/dev/null 2>&1; then
-  if systemctl --user is-active basic.target >/dev/null 2>&1; then
-    CAN_SYSTEMD_RUN=1
-  fi
+RUN=()
+if [[ "$ENGINE" == "systemd" ]]; then
+  RUN=(systemd-run --user --scope --quiet --collect "--slice=${TARGET_SLICE}"
+       "--description=omarchy-build: ${BUILD_NAME}")
+  for _p in "${SCOPE_PROPERTIES[@]}"; do
+    RUN+=("--property=${_p}")
+  done
+  RUN+=(--)
 fi
 
-if (( CAN_SYSTEMD_RUN == 1 )); then
-  # Determine if terminal is interactive TTY
-  PTY_FLAG="--pipe"
-  if [[ -t 0 && -t 1 ]]; then
-    PTY_FLAG="--pty"
-  fi
+[[ -n "$POWER_NOTE" && -t 2 ]] && omw_log "${POWER_NOTE}"
 
-  exec systemd-run \
-    --user \
-    --slice="$TARGET_SLICE" \
-    --property="MemoryOOMGroup=yes" \
-    --property="OOMScoreAdjust=500" \
-    --property="CPUWeight=100" \
-    --property="IOWeight=100" \
-    --same-dir \
-    $PTY_FLAG \
-    --quiet \
-    -- "$@"
-else
-  # Fallback: Apply direct kernel process governance
-  # 1. Lower scheduler priority (nice +10) so interactive shells take precedence
-  renice -n 10 -p $$ >/dev/null 2>&1 || true
-
-  # 2. Demote OOM score adjustment so kernel OOM killer sacrifices this build first
-  if [[ -w /proc/$$/oom_score_adj ]]; then
-    echo 500 > /proc/$$/oom_score_adj 2>/dev/null || true
-  fi
-
-  # 3. If direct cgroup v2 is accessible, join build cgroup
-  CGROUP_PATH="/sys/fs/cgroup/build.slice"
-  if [[ -d "$CGROUP_PATH" && -w "$CGROUP_PATH/cgroup.procs" ]]; then
-    echo $$ > "$CGROUP_PATH/cgroup.procs" 2>/dev/null || true
-  fi
-
-  exec "$@"
+if (( DRY_RUN == 1 )); then
+  echo "jobs=${JOBS}"
+  [[ -n "$POWER_NOTE" ]] && echo "note=${POWER_NOTE}"
+  echo "engine=${ENGINE}"
+  printf 'command='
+  printf '%q ' "${RUN[@]}" "$@"
+  printf '\n'
+  exit 0
 fi
+
+# Raise our own OOM score (inherited by the build); lowering would need root.
+echo 500 >"/proc/$$/oom_score_adj" 2>/dev/null || true
+
+if [[ "$ENGINE" == "systemd" ]]; then
+  exec "${RUN[@]}" "$@"
+fi
+
+# Fallback without a user manager: lower CPU priority directly.
+renice -n 10 -p $$ >/dev/null 2>&1 || true
+exec "$@"

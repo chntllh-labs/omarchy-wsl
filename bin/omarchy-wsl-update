@@ -1,150 +1,276 @@
-#!/bin/bash
-# /usr/bin/omarchy-wsl-update
+#!/usr/bin/env bash
+# ==============================================================================
+# /usr/bin/omarchy-wsl-update (also reached as `omarchy update`)
+# Omarchy WSL update engine
+# ==============================================================================
+# One pacman transaction for the system, then per-user steps, never editing
+# live configuration with sed:
+#   1. preflight: disk space, pacman lock, trust in the pinned Omarchy key
+#      (fingerprint from /usr/share/omarchy-wsl/upstream.lock), [omarchy] wiring
+#   2. sudo pacman -Syu (updates omarchy-keyring, omarchy-nvim, yay, mise-bin
+#      from [omarchy] and the Arch packages from the mirrors)
+#   3. optional AUR updates (--aur), migrations through the WSL migration gate,
+#      mise tools, Neovim plugins, the user's post-update hook
+#   4. verification: omarchy-version, foreign packages, keyring
 #
-# Omarchy WSL In-Place Rolling Update Engine
-# Zero-data-loss, transactional system and configuration update runner.
+# The omarchy-wsl package itself is not published in a binary repository;
+# --self rebuilds it from a tagged release of this repository with makepkg
+# (the same pinned, checksum-verified build the image uses).
+# ==============================================================================
 
-set -eEo pipefail
+set -euo pipefail
 
-log() { echo -e "\e[32m[omarchy-wsl-update]\e[0m $*"; }
-warn() { echo -e "\e[33m[omarchy-wsl-update:WARN]\e[0m $*"; }
-err() { echo -e "\e[31m[omarchy-wsl-update:ERROR]\e[0m $*"; }
+PROG=omarchy-wsl-update
+LOCK_FILE="${OMARCHY_WSL_LOCK:-/usr/share/omarchy-wsl/upstream.lock}"
+PACMAN_CONF="${OMARCHY_PACMAN_CONF:-/etc/pacman.conf}"
+REPO_URL=https://github.com/chntllh-labs/omarchy-wsl
 
-ARCH="$(uname -m)"
-OMARCHY_DIR="${OMARCHY_PATH:-$HOME/.local/share/omarchy}"
-
-log "Starting in-place rolling update (Architecture: $ARCH)..."
-
-# -----------------------------------------------------------------------------
-# 1. Pre-flight Checks
-# -----------------------------------------------------------------------------
-if ! sudo -v 2>/dev/null; then
-  err "Sudo privileges required for package and system updates."
+if [[ -t 2 && -z ${NO_COLOR:-} ]]; then
+  c_step=$'\e[32m' c_warn=$'\e[33m' c_err=$'\e[31m' c_off=$'\e[0m'
+else
+  c_step='' c_warn='' c_err='' c_off=''
+fi
+step() { printf '\n%s==> %s%s\n' "$c_step" "$*" "$c_off" >&2; }
+warn() { printf '%s[%s] WARNING:%s %s\n' "$c_warn" "$PROG" "$c_off" "$*" >&2; }
+die() {
+  printf '%s[%s] ERROR:%s %s\n' "$c_err" "$PROG" "$c_off" "$*" >&2
   exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: omarchy-wsl-update [options]
+       omarchy update [options]
+
+  -y, --yes            pass --noconfirm to pacman and yay
+      --aur            also update AUR packages with yay
+      --no-nvim        skip the Neovim plugin sync
+      --no-mise        skip mise tool upgrades
+      --no-migrations  skip upstream migrations
+      --sync-network   refresh DNS/CA/proxy from Windows first (bounded)
+      --check          report trust, repository wiring and pending updates; change nothing
+      --repair-pacman  restore /etc/pacman.conf and the mirrorlist from the shipped
+                       templates (backups are kept), then exit
+      --self [TAG]     rebuild the omarchy-wsl package from a release tag of
+                       https://github.com/chntllh-labs/omarchy-wsl (default: newest v* tag)
+  -h, --help           show this help
+EOF
+}
+
+NOCONFIRM=() AUR=0 NVIM=1 MISE=1 MIGRATIONS=1 SYNC_NETWORK=0 CHECK=0 REPAIR=0 SELF=0 SELF_TAG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y | --yes) NOCONFIRM=(--noconfirm) ;;
+    --aur) AUR=1 ;;
+    --no-nvim) NVIM=0 ;;
+    --no-mise) MISE=0 ;;
+    --no-migrations) MIGRATIONS=0 ;;
+    --sync-network) SYNC_NETWORK=1 ;;
+    --check) CHECK=1 ;;
+    --repair-pacman) REPAIR=1 ;;
+    --self)
+      SELF=1
+      if [[ ${2:-} =~ ^v[0-9][0-9.]*(-[0-9]+)?$ ]]; then
+        SELF_TAG="$2"
+        shift
+      fi
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "$PROG: unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+lock_value() {
+  [[ -r $LOCK_FILE ]] || return 1
+  awk -F= -v k="$1" '$0 ~ /^[A-Z0-9_]+=[^[:space:]]*$/ && $1 == k { print substr($0, length(k) + 2) }' "$LOCK_FILE"
+}
+
+# Root only for the system transaction; per-user steps run as the invoking user.
+if ((EUID == 0)); then
+  SUDO=()
+  TARGET_USER="${SUDO_USER:-$(getent passwd 1000 | cut -d: -f1)}"
+else
+  command -v sudo >/dev/null || die "sudo is required"
+  SUDO=(sudo)
+  TARGET_USER="$(id -un)"
+fi
+as_target() {
+  if [[ $(id -un) == "$TARGET_USER" ]]; then
+    "$@"
+  elif [[ -n $TARGET_USER ]]; then
+    local home
+    home=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+    runuser -u "$TARGET_USER" -- env HOME="$home" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
+      PATH=/usr/local/bin:/usr/bin OMARCHY_PATH=/usr/share/omarchy "$@"
+  fi
+}
+
+KEY_FPR="$(lock_value OMARCHY_KEY_FPR || true)"
+KEY_FPR="${KEY_FPR:-40DFB630FF42BCFFB047046CF0134EE680CAC571}"
+
+check_trust() {
+  local keyring=/usr/share/pacman/keyrings/omarchy.gpg
+  if [[ -r $keyring ]] && command -v gpg >/dev/null &&
+    ! gpg --homedir "$(mktemp -d)" --batch --show-keys --with-colons "$keyring" 2>/dev/null | grep -q "^fpr:::::::::${KEY_FPR}:"; then
+    die "$keyring does not carry the pinned Omarchy key $KEY_FPR; refusing to update"
+  fi
+  if ! "${SUDO[@]}" pacman-key --list-keys "$KEY_FPR" >/dev/null 2>&1; then
+    if ((CHECK)); then
+      warn "Omarchy key $KEY_FPR is not in the pacman keyring (run: sudo pacman-key --populate omarchy)"
+      return 1
+    fi
+    warn "Omarchy key missing from the pacman keyring; populating it from omarchy-keyring"
+    "${SUDO[@]}" /usr/lib/omarchy-wsl/pacman-init.sh
+    "${SUDO[@]}" pacman-key --populate omarchy
+  fi
+  echo "trust: Omarchy package key $KEY_FPR"
+}
+
+check_wiring() {
+  if grep -q '^\[omarchy\]' "$PACMAN_CONF" &&
+    grep -qE '^Server[[:space:]]*=[[:space:]]*https://pkgs\.omarchy\.org/(stable|rc|edge)/\$arch' "$PACMAN_CONF"; then
+    echo "repository: [omarchy] $(grep -oE 'https://pkgs\.omarchy\.org/[a-z]+/\$arch' "$PACMAN_CONF" | head -n 1)"
+    return 0
+  fi
+  warn "[omarchy] is missing from $PACMAN_CONF (fix: omarchy-wsl-update --repair-pacman)"
+  return 1
+}
+
+repair_pacman() {
+  local arch ts
+  arch=$(uname -m)
+  ts=$(date +%Y%m%d-%H%M%S)
+  for pair in "pacman.conf.$arch:$PACMAN_CONF" "mirrorlist.$arch:/etc/pacman.d/mirrorlist"; do
+    local src="/usr/share/omarchy-wsl/pacman/${pair%%:*}" dest="${pair#*:}"
+    [[ -r $src ]] || die "missing template $src"
+    if [[ -f $dest ]] && ! cmp -s "$src" "$dest"; then
+      "${SUDO[@]}" cp -a "$dest" "$dest.omarchy-bak-$ts"
+      echo "backup: $dest.omarchy-bak-$ts"
+    fi
+    "${SUDO[@]}" install -m 0644 "$src" "$dest"
+    echo "restored: $dest"
+  done
+}
+
+sync_network() {
+  local tool
+  for tool in omarchy-dns-sync omarchy-ca-sync omarchy-proxy-sync; do
+    command -v "$tool" >/dev/null || continue
+    timeout 30 "${SUDO[@]}" "$tool" >/dev/null 2>&1 || warn "$tool did not complete (continuing)"
+  done
+}
+
+self_update() {
+  ((EUID != 0)) || die "--self runs makepkg, which refuses root; run it as your user"
+  command -v makepkg >/dev/null || die "makepkg (base-devel) is required for --self"
+  local tag="$SELF_TAG" work src upstream commit sum
+  if [[ -z $tag ]]; then
+    tag=$(git ls-remote --tags --refs "$REPO_URL" 'v*' | awk -F/ '{print $3}' | sort -V | tail -n 1)
+    [[ -n $tag ]] || die "no release tags found at $REPO_URL"
+  fi
+  work=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-wsl-self.XXXXXX")
+  trap 'rm -rf "$work"' EXIT
+  src="$work/omarchy-wsl"
+  step "Fetching omarchy-wsl $tag"
+  git clone -q --depth 1 --branch "$tag" "$REPO_URL" "$src"
+  commit=$(awk -F= '$1 == "OMARCHY_COMMIT" {print $2}' "$src/upstream.lock")
+  upstream="$work/omarchy"
+  step "Fetching upstream Omarchy ${commit:0:12}"
+  git init -q "$upstream"
+  git -C "$upstream" fetch -q --depth 1 "$(awk -F= '$1 == "OMARCHY_SOURCE_URL" {print $2}' "$src/upstream.lock")" "$commit"
+  git -C "$upstream" -c advice.detachedHead=false checkout -q FETCH_HEAD
+  sum=$(git -C "$upstream" -c core.abbrev=no archive --format tar "$commit" | sha256sum | cut -d' ' -f1)
+  [[ $sum == "$(awk -F= '$1 == "OMARCHY_SOURCE_SHA256" {print $2}' "$src/upstream.lock")" ]] ||
+    die "upstream tree checksum mismatch ($sum)"
+  step "Building and installing omarchy-wsl $tag"
+  (cd "$src/packages/PKGBUILDs/omarchy-wsl" &&
+    OMARCHY_SRC="$upstream" OMARCHY_WSL_SRC="$src" OMARCHY_WSL_GIT_SHA="$(git -C "$src" rev-parse HEAD)" \
+      makepkg --syncdeps --install --needed --cleanbuild "${NOCONFIRM[@]}")
+  "${SUDO[@]}" /usr/lib/omarchy-wsl/install-manifest --verify / >/dev/null && echo "manifest: verified"
+}
+
+if ((REPAIR)); then
+  repair_pacman
+  exit 0
 fi
 
-DISK_AVAIL_MB=$(df -m / | awk 'NR==2 {print $4}')
-if [[ $DISK_AVAIL_MB -lt 2048 ]]; then
-  warn "Low disk space on root filesystem (${DISK_AVAIL_MB}MB available)."
-  warn "Consider expanding your WSL disk or running 'pacman -Scc'."
+if ((SELF)); then
+  self_update
+  exit 0
 fi
 
-# Ensure pacman container/WSL sandbox compatibility is preserved
-sudo sed -i 's/^DownloadUser/#DownloadUser/' /etc/pacman.conf 2>/dev/null || true
-if ! grep -q '^DisableSandbox' /etc/pacman.conf 2>/dev/null; then
-  sudo sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf 2>/dev/null || true
+step "Preflight"
+avail=$(df -Pm / | awk 'NR == 2 {print $4}')
+if [[ $avail =~ ^[0-9]+$ ]] && ((avail < 2048)); then
+  warn "only ${avail} MB free on /; large upgrades may fail"
+fi
+if [[ -e /var/lib/pacman/db.lck ]] && ! pgrep -x pacman >/dev/null; then
+  die "/var/lib/pacman/db.lck exists but no pacman is running (remove it after checking)"
+fi
+trust_ok=1 wiring_ok=1
+check_trust || trust_ok=0
+check_wiring || wiring_ok=0
+
+if ((CHECK)); then
+  echo "omarchy: $(omarchy-version 2>/dev/null || echo unknown) ($(pacman -Q omarchy-wsl 2>/dev/null || echo 'omarchy-wsl not installed'))"
+  if command -v checkupdates >/dev/null; then
+    pending=$(checkupdates 2>/dev/null || true)
+    echo "pending updates: $(grep -c . <<<"$pending" || true)"
+    [[ -z $pending ]] || printf '%s\n' "$pending" | sed 's/^/  /'
+  fi
+  ((trust_ok && wiring_ok))
+  exit $?
+fi
+((wiring_ok)) || die "fix the [omarchy] repository first (omarchy-wsl-update --repair-pacman)"
+
+if ((SYNC_NETWORK)); then
+  step "Refreshing DNS, CA and proxy settings from Windows"
+  sync_network
 fi
 
-# -----------------------------------------------------------------------------
-# 1.1 Network, DNS & Enterprise Proxy Pre-flight Synchronization
-# -----------------------------------------------------------------------------
-log "Synchronizing DNS, corporate proxies, and TLS trust anchors..."
-if command -v omarchy-dns-sync >/dev/null 2>&1; then
-  sudo omarchy-dns-sync sync 2>/dev/null || true
-elif [[ -x "$(dirname "$0")/omarchy-dns-sync" ]]; then
-  sudo "$(dirname "$0")/omarchy-dns-sync" sync 2>/dev/null || true
+step "Updating system packages"
+"${SUDO[@]}" pacman -Syu "${NOCONFIRM[@]}"
+
+if ((AUR)) && command -v yay >/dev/null && [[ -n $TARGET_USER ]]; then
+  step "Updating AUR packages"
+  as_target yay -Sua "${NOCONFIRM[@]}"
 fi
 
-if command -v omarchy-ca-sync >/dev/null 2>&1; then
-  sudo omarchy-ca-sync 2>/dev/null || true
-elif [[ -x "$(dirname "$0")/omarchy-ca-sync" ]]; then
-  sudo "$(dirname "$0")/omarchy-ca-sync" 2>/dev/null || true
+if ((MIGRATIONS)) && [[ -x /usr/lib/omarchy-wsl/migration-gate && -n $TARGET_USER ]]; then
+  step "Running Omarchy migrations (WSL migration gate)"
+  as_target /usr/lib/omarchy-wsl/migration-gate || warn "some migrations did not complete; see the output above"
 fi
 
-if command -v omarchy-proxy-sync >/dev/null 2>&1; then
-  sudo omarchy-proxy-sync 2>/dev/null || true
-elif [[ -x "$(dirname "$0")/omarchy-proxy-sync" ]]; then
-  sudo "$(dirname "$0")/omarchy-proxy-sync" 2>/dev/null || true
-fi
-
-# Verify mirrorlist is non-empty before pacman sync
-if [[ ! -s /etc/pacman.d/mirrorlist ]] || ! grep -q "^Server" /etc/pacman.d/mirrorlist 2>/dev/null; then
-  warn "Pacman mirrorlist is empty or missing! Restoring resilient fallback mirrors..."
-  if command -v omarchy-mirror-sync >/dev/null 2>&1; then
-    sudo omarchy-mirror-sync restore-default 2>/dev/null || true
-  elif [[ -x "$(dirname "$0")/omarchy-mirror-sync" ]]; then
-    sudo "$(dirname "$0")/omarchy-mirror-sync" restore-default 2>/dev/null || true
+if ((MISE)) && command -v mise >/dev/null && [[ -n $TARGET_USER ]]; then
+  if command -v omarchy-update-mise >/dev/null; then
+    as_target omarchy-update-mise || warn "mise upgrade failed"
+  else
+    as_target mise up || warn "mise upgrade failed"
   fi
 fi
 
-# -----------------------------------------------------------------------------
-# 2. Pacman Keyring & System Rolling Upgrade
-# -----------------------------------------------------------------------------
-log "Refreshing pacman keyrings..."
-if [[ "$ARCH" == "aarch64" ]]; then
-  sudo pacman -Sy --noconfirm --needed archlinuxarm-keyring omarchy-wsl-keyring 2>/dev/null || {
-    warn "Keyring refresh encountered warnings, attempting key re-init..."
-    sudo pacman-key --init && sudo pacman-key --populate archlinuxarm omarchy-wsl
-    sudo pacman -Sy --noconfirm archlinuxarm-keyring omarchy-wsl-keyring 2>/dev/null || true
-  }
-else
-  sudo pacman -Sy --noconfirm --needed archlinux-keyring omarchy-keyring omarchy-wsl-keyring 2>/dev/null || {
-    warn "Keyring refresh encountered warnings, attempting key re-init..."
-    sudo pacman-key --init && sudo pacman-key --populate archlinux omarchy-wsl
-    sudo pacman -Sy --noconfirm archlinux-keyring omarchy-keyring omarchy-wsl-keyring 2>/dev/null || true
-  }
-fi
-
-log "Performing system rolling upgrade (pacman -Su)..."
-sudo pacman -Su --noconfirm
-
-if command -v yay >/dev/null 2>&1; then
-  log "Updating AUR packages..."
-  yay -Sua --noconfirm || warn "AUR package update had non-fatal warnings."
-fi
-
-# -----------------------------------------------------------------------------
-# 3. Upstream Omarchy Git Sync
-# -----------------------------------------------------------------------------
-if [[ -d "$OMARCHY_DIR/.git" ]]; then
-  log "Syncing upstream Omarchy sources at $OMARCHY_DIR..."
-  git -C "$OMARCHY_DIR" fetch --tags origin
-  
-  CURRENT_BRANCH="$(git -C "$OMARCHY_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
-  if [[ "$CURRENT_BRANCH" != "HEAD" ]]; then
-    git -C "$OMARCHY_DIR" pull --ff-only origin "$CURRENT_BRANCH" || {
-      warn "Fast-forward pull failed; keeping local tree unchanged."
-    }
+if ((NVIM)) && command -v nvim >/dev/null && [[ -n $TARGET_USER ]]; then
+  home=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+  if [[ -d $home/.config/nvim ]]; then
+    step "Updating Neovim plugins"
+    as_target timeout 600 nvim --headless "+Lazy! sync" +qa || warn "Neovim plugin sync failed or timed out"
   fi
 fi
 
-# -----------------------------------------------------------------------------
-# 4. Safe Migration Execution
-# -----------------------------------------------------------------------------
-MIGRATION_GATE="/usr/lib/omarchy-wsl/migration-gate"
-if [[ -x "$MIGRATION_GATE" ]]; then
-  log "Invoking Omarchy WSL Migration Safety Gate..."
-  bash "$MIGRATION_GATE"
-elif [[ -f "$(dirname "$0")/../lib/omarchy-wsl-migration-gate" ]]; then
-  bash "$(dirname "$0")/../lib/omarchy-wsl-migration-gate"
-else
-  warn "Migration gate not found; skipping upstream migrations."
+if command -v omarchy-hook >/dev/null && [[ -n $TARGET_USER ]]; then
+  as_target omarchy-hook post-update || warn "post-update hook failed"
 fi
 
-# -----------------------------------------------------------------------------
-# 5. Developer Toolchain & Editor Updates
-# -----------------------------------------------------------------------------
-if command -v mise >/dev/null 2>&1; then
-  log "Upgrading mise toolchains..."
-  mise upgrade -y 2>/dev/null || true
-fi
-
-if command -v nvim >/dev/null 2>&1; then
-  log "Syncing Neovim plugins (headless)..."
-  nvim --headless "+Lazy! sync" +qa 2>/dev/null || true
-fi
-
-# -----------------------------------------------------------------------------
-# 6. Post-Update Hygiene & Verification
-# -----------------------------------------------------------------------------
-log "Cleaning package caches..."
-sudo pacman -Sc --noconfirm 2>/dev/null || true
-
-log "Verifying memory stability parameters..."
-VFS_CACHE=$(sysctl -n vm.vfs_cache_pressure 2>/dev/null || echo "0")
-if [[ "$VFS_CACHE" -ne 100 ]]; then
-  warn "vm.vfs_cache_pressure is $VFS_CACHE (expected 100). Re-applying stability config..."
-  sudo sysctl -w vm.vfs_cache_pressure=100 >/dev/null 2>&1 || true
-fi
-
-log "Update completed successfully! Zero data lost."
+step "Verifying"
+echo "omarchy: $(omarchy-version 2>/dev/null || echo unknown)"
+foreign=$(pacman -Qmq 2>/dev/null | grep -vx omarchy-wsl || true)
+[[ -z $foreign ]] || echo "foreign (AUR/local) packages: $(tr '\n' ' ' <<<"$foreign")"
+step "Omarchy WSL is up to date"

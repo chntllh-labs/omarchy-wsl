@@ -1,0 +1,185 @@
+# Maintainer: omarchy-wsl contributors <https://github.com/chntllh-labs/omarchy-wsl>
+#
+# Omarchy for WSL: upstream Basecamp Omarchy's command suite, themes and
+# defaults from the release pinned in upstream.lock, without the Hyprland,
+# SDDM, Limine and Snapper desktop stack that upstream's `omarchy` package
+# depends on, plus this repository's WSL layer (installed from rootfs.manifest
+# by `make install-pkg`, so pacman owns every file the image ships).
+#
+# Built by build/03-omarchy-wsl.sh, which exports OMARCHY_WSL_SRC (this
+# repository's checkout) and verifies that _commit/_tag/sha256sums below match
+# upstream.lock. Bump with scripts/bump-upstream, never by hand-editing one side.
+
+pkgname=omarchy-wsl
+_tag='v4.5.0'
+_commit='a948d8a6871f446b335258c827648ac5f4e9428b'
+pkgver=4.5.0
+pkgrel=1
+pkgdesc='Omarchy command suite, themes and defaults for Windows Subsystem for Linux'
+arch=('any')
+url='https://github.com/chntllh-labs/omarchy-wsl'
+license=('MIT')
+provides=("omarchy=${pkgver}")
+conflicts=('omarchy' 'omarchy-dev' 'omarchy-settings')
+depends=(
+  'bash' 'coreutils' 'curl' 'fakeroot' 'git' 'gum' 'inotify-tools' 'jq'
+  'neovim' 'omarchy-keyring' 'omarchy-nvim' 'openssh' 'pacman-contrib' 'perl'
+  'python' 'socat' 'sudo' 'systemd' 'tmux'
+)
+optdepends=(
+  'btop: themed system monitor'
+  'docker: native container engine (omarchy-docker-bridge)'
+  'lazygit: themed git TUI'
+  'mise: per-user toolchains (omarchy-update-mise)'
+  'slirp4netns: isolated tenant networking (omarchy-tenant)'
+  'starship: Omarchy prompt'
+  'yay: AUR updates in omarchy-update'
+  'zoxide: smarter cd'
+)
+makedepends=('git' 'make')
+install=omarchy-wsl.install
+# Configuration users are expected to edit: pacman keeps local changes and
+# writes .pacnew files on upgrade instead of overwriting them.
+backup=(
+  'etc/alsa/conf.d/99-omarchy-wslg-pulse.conf'
+  'etc/containers/containers.conf'
+  'etc/docker/daemon.json'
+  'etc/profile.d/00-omarchy-firstboot.sh'
+  'etc/profile.d/10-omarchy-wsl-path.sh'
+  'etc/profile.d/20-omarchy-browser.sh'
+  'etc/profile.d/20-omarchy-wslg-audio.sh'
+  'etc/profile.d/30-omarchy-ssh-agent.sh'
+  'etc/profile.d/40-omarchy-drvfs-guard.sh'
+  'etc/profile.d/50-omarchy-docker.sh'
+  'etc/profile.d/60-omarchy-cgroup-governance.sh'
+  'etc/pulse/client.conf.d/wslg.conf'
+  'etc/sysctl.d/99-omarchy-wsl.conf'
+  'etc/sysctl.d/99-zz-omarchy-wsl-network.conf'
+  'etc/sysctl.d/99-zz-omarchy-wsl-stability.conf'
+  'etc/systemd/logind.conf.d/10-omarchy-linger.conf'
+  'etc/systemd/oomd.conf.d/10-omarchy-oomd.conf'
+  'etc/systemd/resolved.conf.d/10-omarchy-wsl.conf'
+  'etc/systemd/system/build.slice'
+  'etc/systemd/system/user-.slice.d/10-interactive-protection.conf'
+  'etc/tmpfiles.d/wsl-nvme-io.conf'
+  'etc/tmpfiles.d/x11.conf'
+  'etc/wsl-distribution.conf'
+  'etc/wsl.conf'
+)
+# makepkg checksum of the git source: sha256 of `git archive --format tar _commit`.
+_source_sha256='bf3220fcc7b9d883a86f1c59efd79ce675fe137cdbb1324e9785c3cc45d01de7'
+
+# OMARCHY_SRC=/path/to/checkout builds from a local clone of _commit instead of
+# mirror-cloning the 1.2 GB upstream history (upstream's PKGBUILD has the same
+# switch). The image build fetches only _commit (depth 1); prepare() applies
+# the same checksum makepkg would.
+if [[ -n ${OMARCHY_SRC:-} ]]; then
+  source=()
+  sha256sums=()
+else
+  source=("omarchy::git+https://github.com/omacom/omarchy.git#commit=${_commit}")
+  sha256sums=("$_source_sha256")
+fi
+
+_wsl_src() {
+  local src="${OMARCHY_WSL_SRC:-$startdir/../../..}"
+  if [[ ! -f $src/rootfs.manifest || ! -f $src/upstream.lock ]]; then
+    echo "OMARCHY_WSL_SRC must point at the omarchy-wsl checkout (got '$src')" >&2
+    return 1
+  fi
+  realpath "$src"
+}
+
+prepare() {
+  local src lock_commit lock_sum sum
+  src=$(_wsl_src)
+  lock_commit=$(sed -n 's/^OMARCHY_COMMIT=//p' "$src/upstream.lock")
+  lock_sum=$(sed -n 's/^OMARCHY_SOURCE_SHA256=//p' "$src/upstream.lock")
+  if [[ $lock_commit != "$_commit" || $lock_sum != "$_source_sha256" ]]; then
+    echo "PKGBUILD pin ($_commit, $_source_sha256) does not match upstream.lock ($lock_commit, $lock_sum)" >&2
+    return 1
+  fi
+
+  if [[ -n ${OMARCHY_SRC:-} ]]; then
+    if [[ $(git -C "$OMARCHY_SRC" rev-parse HEAD) != "$_commit" ]]; then
+      echo "OMARCHY_SRC is not at $_commit" >&2
+      return 1
+    fi
+    sum=$(git -C "$OMARCHY_SRC" -c core.abbrev=no archive --format tar "$_commit" | sha256sum | cut -d' ' -f1)
+    if [[ $sum != "$_source_sha256" ]]; then
+      echo "OMARCHY_SRC tree checksum $sum does not match $_source_sha256" >&2
+      return 1
+    fi
+    rm -rf "$srcdir/omarchy"
+    mkdir -p "$srcdir/omarchy"
+    git -C "$OMARCHY_SRC" archive --format tar "$_commit" | tar -x -C "$srcdir/omarchy"
+  else
+    [[ $(git -C "$srcdir/omarchy" rev-parse HEAD) == "$_commit" ]]
+  fi
+}
+
+package() {
+  local src
+  src=$(_wsl_src)
+  cd "$srcdir/omarchy"
+
+  # Upstream tree. Theme wallpapers (~150 MB) are dropped: nothing in a
+  # terminal-only system can show them. shell/ (Quickshell), applications/
+  # (desktop entries) and the libalpm hooks (Hyprland reloads, the update
+  # guard that blocks plain pacman upgrades) are desktop-only.
+  install -d "$pkgdir/usr/share/omarchy"
+  cp -a bin default config install migrations themes "$pkgdir/usr/share/omarchy/"
+  rm -rf "$pkgdir"/usr/share/omarchy/themes/*/backgrounds
+  find "$pkgdir/usr/share/omarchy/bin" -type f -exec chmod 755 {} +
+  install -m644 version logo.txt logo.svg icon.txt icon.png "$pkgdir/usr/share/omarchy/"
+
+  # Every upstream command on PATH. rootfs.manifest installs the WSL
+  # replacements (omarchy-update, -doctor, -theme-set, -version) over these.
+  install -d "$pkgdir/usr/bin"
+  local bin
+  for bin in bin/*; do
+    [[ -f $bin ]] || continue
+    ln -s "/usr/share/omarchy/bin/${bin##*/}" "$pkgdir/usr/bin/${bin##*/}"
+  done
+
+  # Per-user defaults for new users: the terminal-relevant part of upstream's
+  # config/ tree. The WSL skel overlay (tmux dual prefix, Neovim clipboard hook)
+  # comes from rootfs.manifest. /etc/skel/.bashrc belongs to the bash package,
+  # so Omarchy's is staged and copied in by omarchy-wsl.install, the same way
+  # upstream's omarchy-settings does it.
+  install -d "$pkgdir/etc/skel/.config/omarchy"
+  cp -a config/btop config/git config/lazygit config/starship.toml "$pkgdir/etc/skel/.config/"
+  cp -a config/omarchy/hooks config/omarchy/themed "$pkgdir/etc/skel/.config/omarchy/"
+  install -Dm644 default/bashrc "$pkgdir/usr/share/omarchy-wsl/etc-overrides/dot.bashrc"
+
+  # Users created from this skel already match the shipped migrations.
+  install -d "$pkgdir/etc/skel/.local/state/omarchy/migrations"
+  local migration
+  for migration in migrations/*.sh; do
+    [[ -f $migration ]] && touch "$pkgdir/etc/skel/.local/state/omarchy/migrations/${migration##*/}"
+  done
+
+  # Upstream system drop-ins that apply to a terminal-only system.
+  install -Dm644 etc/profile.d/omarchy.sh "$pkgdir/etc/profile.d/omarchy.sh"
+  install -Dm644 etc/fastfetch/config.jsonc "$pkgdir/etc/fastfetch/config.jsonc"
+  install -Dm644 etc/mise/conf.d/omarchy.toml "$pkgdir/etc/mise/conf.d/omarchy.toml"
+  if [[ -f etc/mise/conf.d/omarchy-tools.toml ]]; then
+    install -Dm644 etc/mise/conf.d/omarchy-tools.toml "$pkgdir/etc/mise/conf.d/omarchy-tools.toml"
+  fi
+  install -Dm644 etc/sysctl.d/90-omarchy-file-watchers.conf "$pkgdir/etc/sysctl.d/90-omarchy-file-watchers.conf"
+  install -Dm644 etc/systemd/system.conf.d/10-faster-shutdown.conf "$pkgdir/etc/systemd/system.conf.d/10-faster-shutdown.conf"
+  install -Dm644 etc/systemd/system.conf.d/20-omarchy-nofile.conf "$pkgdir/etc/systemd/system.conf.d/20-omarchy-nofile.conf"
+  install -Dm644 etc/systemd/user.conf.d/20-omarchy-nofile.conf "$pkgdir/etc/systemd/user.conf.d/20-omarchy-nofile.conf"
+  install -Dm644 etc/systemd/system/user@.service.d/10-faster-shutdown.conf "$pkgdir/etc/systemd/system/user@.service.d/10-faster-shutdown.conf"
+  install -Dm644 etc/systemd/system/docker.service.d/no-block-boot.conf "$pkgdir/etc/systemd/system/docker.service.d/no-block-boot.conf"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE.omarchy"
+
+  # The WSL layer: every runtime file of this repository (rootfs.manifest).
+  make -C "$src" --no-print-directory install-pkg DESTDIR="$pkgdir" \
+    OMARCHY_WSL_PKGVER="$pkgver-$pkgrel"
+
+  # /etc/sudoers.d must stay 0750 (sudo package convention).
+  if [[ -d $pkgdir/etc/sudoers.d ]]; then
+    chmod 0750 "$pkgdir/etc/sudoers.d"
+  fi
+}

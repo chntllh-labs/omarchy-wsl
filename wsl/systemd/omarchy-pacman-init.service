@@ -1,0 +1,17 @@
+[Unit]
+Description=Initialize the pacman keyring for this Omarchy WSL install
+Documentation=man:pacman-key(8) https://github.com/chntllh-labs/omarchy-wsl
+# The image ships without a keyring so every install gets its own local master
+# key; this runs once, on the first boot.
+ConditionPathExists=!/etc/pacman.d/gnupg/trustdb.gpg
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/omarchy-wsl/pacman-init.sh
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

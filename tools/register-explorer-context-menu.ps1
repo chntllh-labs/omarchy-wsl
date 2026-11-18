@@ -15,7 +15,7 @@
     Shift+right-click). Top-level placement requires an IExplorerCommand handler
     shipped in a signed sparse package, which is out of scope for a script.
 
-    Path quoting: the directory is passed as "%V." — a bare "%V" breaks on drive
+    Path quoting: the directory is passed as "%V.": a bare "%V" breaks on drive
     roots because C:\" escapes the closing quote (microsoft/terminal#4571);
     Win32 path normalisation strips the trailing dot from every other path.
 
@@ -39,13 +39,15 @@
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [ValidatePattern('^[A-Za-z0-9._-]{1,64}$')]
+    # \z, not $: in .NET regex $ also matches before a trailing newline, which
+    # would let "Omarchy`n" through into the registered command line.
+    [ValidatePattern('^[A-Za-z0-9._-]{1,64}\z')]
     [string]$Distro = 'Omarchy',
 
-    [ValidatePattern('^[A-Za-z0-9 ._()-]{1,64}$')]
+    [ValidatePattern('^[A-Za-z0-9 ._()-]{1,64}\z')]
     [string]$TerminalProfile = '',
 
-    [ValidatePattern('^[^"%&|<>^]{1,80}$')]
+    [ValidatePattern('^[^"%&|<>^\x00-\x1f]{1,80}\z')]
     [string]$Label = 'Open in Omarchy Terminal',
 
     [switch]$Extended,
@@ -100,7 +102,7 @@ function Resolve-Icon {
 function Get-HomeUnc {
     # Ask the distro for the default user's home rather than guessing it.
     $linuxHome = (& wsl.exe -d $Distro --exec sh -c 'printf %s "$HOME"' 2>$null)
-    if (-not $linuxHome -or $linuxHome -notmatch '^/[A-Za-z0-9._/@-]+$') { throw "Could not determine the $Distro home directory." }
+    if (-not $linuxHome -or $linuxHome -notmatch '^/[A-Za-z0-9._/@-]+\z') { throw "Could not determine the $Distro home directory." }
     return "\\wsl.localhost\$Distro" + ($linuxHome -replace '/', '\')
 }
 

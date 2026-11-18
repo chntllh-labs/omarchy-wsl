@@ -1,0 +1,29 @@
+name: CI
+
+# Every suite in the strict test environment on both architectures. The full
+# image build runs in release.yml (tags and manual dispatch).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the test environment
+        run: docker build -t omarchy-wsl-test -f tests/ci/Containerfile tests/ci
+      - name: Run every suite (strict, skips fail)
+        run: |
+          docker run --rm --network host -v "$PWD:/repo:ro" -e OMW_STRICT=1 omarchy-wsl-test \
+            bash -c 'cp -a /repo /tmp/src && cd /tmp/src && tests/run-all.sh'

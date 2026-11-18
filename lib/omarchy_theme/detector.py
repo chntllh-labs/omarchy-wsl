@@ -427,12 +427,13 @@ class HostDetector:
         return targets
 
     def find_linux_terminal_targets(self) -> List[TargetConfig]:
-        """Locate native Linux terminal emulator configs in user home."""
+        """Locate native Linux terminal emulator configs ($XDG_CONFIG_HOME aware)."""
         targets: List[TargetConfig] = []
-        home = Path.home()
+        xdg = os.environ.get("XDG_CONFIG_HOME", "")
+        config = Path(xdg) if xdg.startswith("/") else Path.home() / ".config"
 
         # Ghostty
-        ghostty_cfg = home / ".config" / "ghostty" / "config"
+        ghostty_cfg = config / "ghostty" / "config"
         targets.append(
             TargetConfig(
                 target_type="ghostty",
@@ -445,7 +446,7 @@ class HostDetector:
         )
 
         # Alacritty
-        alacritty_toml = home / ".config" / "alacritty" / "alacritty.toml"
+        alacritty_toml = config / "alacritty" / "alacritty.toml"
         targets.append(
             TargetConfig(
                 target_type="alacritty",
@@ -458,7 +459,7 @@ class HostDetector:
         )
 
         # Kitty
-        kitty_cfg = home / ".config" / "kitty" / "current-theme.conf"
+        kitty_cfg = config / "kitty" / "current-theme.conf"
         targets.append(
             TargetConfig(
                 target_type="kitty",
@@ -471,7 +472,7 @@ class HostDetector:
         )
 
         # WezTerm
-        wezterm_lua = home / ".config" / "wezterm" / "wezterm.lua"
+        wezterm_lua = config / "wezterm" / "wezterm.lua"
         targets.append(
             TargetConfig(
                 target_type="wezterm",

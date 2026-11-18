@@ -1,101 +1,276 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Omarchy WSL: Enterprise Root CA Synchronization Engine
+# Omarchy WSL: Windows Root CA Synchronization
 # /usr/bin/omarchy-ca-sync
 # ==============================================================================
-# Automatically extracts Windows Enterprise Root CAs (Zscaler, Netskope,
-# Palo Alto, Active Directory Enterprise PKI) and injects them into the
-# Arch Linux system trust store (/etc/ca-certificates/trust-source/anchors/).
-# Eliminates SSL/TLS MITM certificate validation errors across pacman, curl, git.
+# Imports the Windows machine trust anchors that Linux does not already trust
+# (typically a corporate root or a TLS-inspection proxy root) into the system
+# trust store, so pacman, curl and git work behind SSL inspection.
+#
+# Policy (explicit, no name heuristics):
+#   * Source: Cert:\LocalMachine\Root only. Cert:\CurrentUser\Root (roots any
+#     Windows user process can add) only with --include-user-store.
+#     Intermediate stores (LocalMachine\CA) are never used as anchors.
+#   * Skipped: certificates in the Windows Disallowed stores, expired ones, and
+#     every certificate already present in the Linux bundle (compared by
+#     SHA-256 fingerprint of the DER encoding).
+#   * --thumbprint X (repeatable; SHA-1 Windows thumbprint or SHA-256
+#     fingerprint) restricts the import to an explicit allowlist.
+#   * Managed anchors are named omarchy-wsl-<sha256>.crt and are pruned when
+#     they disappear from the Windows selection. Anchors written by older
+#     versions of this tool (win-ca-*.crt) are pruned too.
+#   * PowerShell only prints base64 DER on stdout; files are written on the
+#     Linux side (no Linux path is ever interpolated into PowerShell).
+#   * A failed or incomplete Windows query changes nothing.
+#
+# Config (parsed, never sourced): /etc/omarchy/ca-sync.conf
+#   INCLUDE_USER_STORE=1
+#   THUMBPRINTS=<hex>[,<hex>...]
+#
+# Exit status: 0 in sync; 1 query failed / not permitted; 2 usage.
 # ==============================================================================
 
 set -euo pipefail
 
-ANCHORS_DIR="/etc/ca-certificates/trust-source/anchors"
-EXPORT_DIR="/run/omarchy/ca-export"
-POWERSHELL_BIN="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+_self="$(readlink -f "${BASH_SOURCE[0]}")"
+for _lib in "${OMARCHY_WSL_LIB:-}" "${_self%/*}/../lib/omarchy-wsl-interop.sh" /usr/lib/omarchy-wsl/interop.sh; do
+  # shellcheck source=SCRIPTDIR/../lib/omarchy-wsl-interop.sh
+  [[ -n "$_lib" && -r "$_lib" ]] && { source "$_lib"; break; }
+done
+declare -F omw_ps_run >/dev/null || { echo "omarchy-ca-sync: interop library not found" >&2; exit 1; }
+OMW_TAG="omarchy-ca-sync"
 
-log() { echo -e "\e[32m[omarchy-ca-sync]\e[0m $*"; }
-warn() { echo -e "\e[33m[omarchy-ca-sync:WARN]\e[0m $*"; }
-err() { echo -e "\e[31m[omarchy-ca-sync:ERROR]\e[0m $*"; }
+ANCHORS_DIR="${OMARCHY_CA_ANCHORS_DIR:-/etc/ca-certificates/trust-source/anchors}"
+BUNDLE="${OMARCHY_CA_BUNDLE:-/etc/ssl/certs/ca-certificates.crt}"
+CONF="${OMARCHY_CA_CONF:-/etc/omarchy/ca-sync.conf}"
+PREFIX="omarchy-wsl-"
+DRY_RUN=0
+INCLUDE_USER=0
+ALLOW=()
 
-mkdir -p "$ANCHORS_DIR" "$EXPORT_DIR"
+usage() {
+  cat <<'EOF'
+Usage: omarchy-ca-sync [options]
 
-if [[ ! -x "$POWERSHELL_BIN" ]]; then
-  warn "Windows PowerShell interop not available at $POWERSHELL_BIN. Skipping CA extraction."
-  exit 0
+Import Windows LocalMachine\Root anchors that Linux does not trust yet.
+  --include-user-store   also import Cert:\CurrentUser\Root
+  --thumbprint HEX       only import this certificate (SHA-1 thumbprint or
+                         SHA-256 fingerprint); repeatable
+  --dry-run              print the plan; change nothing
+  -q, --quiet            only print warnings and errors
+  -h, --help             show this help
+EOF
+}
+
+add_allow() {
+  local t="${1//[: ]/}"
+  t="${t^^}"
+  [[ "$t" =~ ^([0-9A-F]{40}|[0-9A-F]{64})$ ]] || { omw_err "Invalid thumbprint '$1' (40 or 64 hex digits)."; exit 2; }
+  ALLOW+=("$t")
+}
+
+# Config: whitelisted keys only.
+if [[ -r "$CONF" ]]; then
+  while IFS='=' read -r key value; do
+    value="${value//[\"\' ]/}"
+    case "$key" in
+      INCLUDE_USER_STORE) [[ "$value" == 1 ]] && INCLUDE_USER=1 ;;
+      THUMBPRINTS)
+        IFS=',' read -r -a _tps <<<"$value"
+        for _t in "${_tps[@]}"; do [[ -n "$_t" ]] && add_allow "$_t"; done
+        ;;
+    esac
+  done <"$CONF"
 fi
 
-log "Auditing Windows Certificate Store for corporate Root and Intermediate CAs..."
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --include-user-store) INCLUDE_USER=1; shift ;;
+    --thumbprint)
+      [[ $# -ge 2 ]] || { omw_err "--thumbprint requires a value"; exit 2; }
+      add_allow "$2"; shift 2 ;;
+    --thumbprint=*) add_allow "${1#*=}"; shift ;;
+    --dry-run|-n) DRY_RUN=1; shift ;;
+    -q|--quiet) OMW_QUIET=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) omw_err "Unknown option: $1"; usage >&2; exit 2 ;;
+  esac
+done
 
-# Export non-standard / enterprise root certificates from Windows Certificate Store
-# Filters out common public CAs to avoid duplicating the Mozilla bundle,
-# extracting only enterprise, internal, and SSL-inspection roots.
-EXPORT_SCRIPT='
-$ErrorActionPreference = "SilentlyContinue"
-$exportDir = "'$EXPORT_DIR'"
-New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
+if (( ! DRY_RUN )); then
+  mkdir -p -- "$ANCHORS_DIR" 2>/dev/null || true
+  [[ -w "$ANCHORS_DIR" ]] || { omw_err "$ANCHORS_DIR is not writable (run as root, or use --dry-run)."; exit 1; }
+fi
+if ! omw_is_wsl || ! omw_interop_enabled; then
+  omw_warn "Windows interop unavailable; trust store left unchanged."
+  exit 1
+fi
 
-$certs = @()
-$certs += Get-ChildItem -Path Cert:\LocalMachine\Root
-$certs += Get-ChildItem -Path Cert:\LocalMachine\CA
-$certs += Get-ChildItem -Path Cert:\CurrentUser\Root
-
-# Filter for certificates likely to be enterprise interception proxies or corporate PKI
-$enterpriseCAs = $certs | Where-Object {
-  $issuer = $_.Issuer
-  $subject = $_.Subject
-  $issuer -match "(Zscaler|Netskope|Palo Alto|Fortinet|BlueCoat|Cisco|Enterprise|Corporate|Internal|Root CA|Proxy)" -or
-  $subject -match "(Zscaler|Netskope|Palo Alto|Fortinet|BlueCoat|Cisco|Enterprise|Corporate|Internal|Root CA|Proxy)"
+# -----------------------------------------------------------------------------
+# Windows side: one line per certificate, base64 DER. The only variable part
+# is a boolean chosen here, never user data.
+# -----------------------------------------------------------------------------
+read -r -d '' CA_QUERY <<'PS' || true
+$now = Get-Date
+$dis = @{}
+foreach ($p in @('Cert:\LocalMachine\Disallowed', 'Cert:\CurrentUser\Disallowed')) {
+  try { Get-ChildItem -Path $p -ErrorAction Stop | ForEach-Object { $dis[$_.Thumbprint.ToUpperInvariant()] = 1 } } catch {}
 }
-
-$count = 0
-foreach ($cert in $enterpriseCAs) {
-  $thumb = $cert.Thumbprint
-  $subjectClean = ($cert.Subject -replace "[^a-zA-Z0-9_-]", "_").Substring(0, [Math]::Min(30, $cert.Subject.Length))
-  $outPath = Join-Path $exportDir "win-ca-${subjectClean}-${thumb}.crt"
-  
-  $pem = "-----BEGIN CERTIFICATE-----`n" + `
-    [System.Convert]::ToBase64String($cert.RawData, [System.Base64FormattingOptions]::InsertLineBreaks) + `
-    "`n-----END CERTIFICATE-----`n"
-    
-  [System.IO.File]::WriteAllText($outPath, $pem, [System.Text.Encoding]::ASCII)
-  $count++
+$stores = @('Cert:\LocalMachine\Root')
+if ($includeUser) { $stores += 'Cert:\CurrentUser\Root' }
+$seen = @{}
+$n = 0
+foreach ($s in $stores) {
+  foreach ($c in @(Get-ChildItem -Path $s -ErrorAction Stop)) {
+    $t = $c.Thumbprint.ToUpperInvariant()
+    if ($seen.ContainsKey($t)) { continue }
+    $seen[$t] = 1
+    if ($dis.ContainsKey($t)) { [Console]::Out.WriteLine('DISALLOWED ' + $t); continue }
+    if ($c.NotAfter -lt $now) { [Console]::Out.WriteLine('EXPIRED ' + $t); continue }
+    [Console]::Out.WriteLine('CERT ' + $t + ' ' + [Convert]::ToBase64String($c.RawData))
+    $n++
+  }
 }
-Write-Output $count
-'
-
-IMPORTED_COUNT=$("$POWERSHELL_BIN" -NoProfile -NonInteractive -Command "$EXPORT_SCRIPT" 2>/dev/null | tr -d '\r' | tail -n 1 || echo "0")
-
-if [[ "$IMPORTED_COUNT" -gt 0 ]]; then
-  log "Discovered and exported $IMPORTED_COUNT corporate CA certificates from Windows host."
-
-  # Copy exported certs into Arch Linux trust anchors
-  COPIED=0
-  for cert in "$EXPORT_DIR"/*.crt; do
-    if [[ -f "$cert" ]]; then
-      DEST="${ANCHORS_DIR}/$(basename "$cert")"
-      if ! cmp -s "$cert" "$DEST" 2>/dev/null; then
-        cp -f "$cert" "$DEST"
-        COPIED=1
-      fi
-    fi
-  done
-
-  if [[ $COPIED -eq 1 ]]; then
-    log "Updating Arch Linux system trust store (update-ca-trust)..."
-    if command -v update-ca-trust >/dev/null 2>&1; then
-      update-ca-trust extract
-    elif command -v trust >/dev/null 2>&1; then
-      trust extract-compat
-    fi
-    log "Successfully updated system trust store with Windows Enterprise CAs."
-  else
-    log "Enterprise CA certificates already synchronized; no update needed."
-  fi
+[Console]::Out.WriteLine('END ' + $n)
+PS
+if (( INCLUDE_USER )); then
+  CA_QUERY='$includeUser = $true'$'\n'"$CA_QUERY"
 else
-  log "No corporate interception certificates detected in Windows store (standard public network)."
+  CA_QUERY='$includeUser = $false'$'\n'"$CA_QUERY"
 fi
 
-# Clean up ephemeral export directory
-rm -rf "$EXPORT_DIR"
+raw=$(OMW_TIMEOUT="${OMARCHY_CA_TIMEOUT:-20}" omw_ps_run "$CA_QUERY") || {
+  omw_err "Windows certificate query failed or timed out; trust store left unchanged."
+  exit 1
+}
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-ca-sync.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+
+# -----------------------------------------------------------------------------
+# Linux side
+# -----------------------------------------------------------------------------
+# SHA-256 fingerprints of every certificate in a PEM file (lowercase hex).
+pem_fingerprints() {
+  [[ -r "$1" ]] || return 0
+  if omw_have python3; then
+    python3 - "$1" <<'PY'
+import base64, binascii, hashlib, re, sys
+data = open(sys.argv[1], "rb").read().decode("ascii", "replace")
+for m in re.finditer(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", data, re.S):
+    try:
+        der = base64.b64decode("".join(m.group(1).split()), validate=True)
+    except (binascii.Error, ValueError):
+        continue
+    print(hashlib.sha256(der).hexdigest())
+PY
+    return
+  fi
+  awk '/-----BEGIN CERTIFICATE-----/ { inb = 1; b = ""; next }
+       /-----END CERTIFICATE-----/ { if (inb) print b; inb = 0; next }
+       inb { gsub(/[ \t\r]/, ""); b = b $0 }' "$1" |
+  while IFS= read -r b64; do
+    printf '%s' "$b64" | base64 -d 2>/dev/null | sha256sum | cut -d' ' -f1
+  done
+}
+
+write_pem() {  # <der-file> <dest>
+  {
+    echo "-----BEGIN CERTIFICATE-----"
+    base64 -w 64 "$1"
+    echo "-----END CERTIFICATE-----"
+  } >"$2"
+}
+
+declare -A MANAGED_FP=() BASE_FP=() WANT=() ALLOWED=()
+for t in "${ALLOW[@]+"${ALLOW[@]}"}"; do ALLOWED["${t,,}"]=1; done
+
+shopt -s nullglob
+for f in "$ANCHORS_DIR/${PREFIX}"*.crt; do
+  fp=$(pem_fingerprints "$f" | head -n 1)
+  [[ -n "$fp" ]] && MANAGED_FP["$fp"]=1
+done
+while IFS= read -r fp; do
+  [[ -n "$fp" && -z "${MANAGED_FP[$fp]:-}" ]] && BASE_FP["$fp"]=1
+done < <(pem_fingerprints "$BUNDLE")
+
+end_count="" certs=0 disallowed=0 expired=0 rejected=0
+while IFS=' ' read -r kind thumb b64 rest; do
+  case "$kind" in
+    CERT)
+      if [[ -n "$rest" || ! "$thumb" =~ ^[0-9A-F]{40}$ || ! "$b64" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+        rejected=$((rejected + 1)); continue
+      fi
+      certs=$((certs + 1))
+      der="$WORK/$thumb.der"
+      printf '%s' "$b64" | base64 -d >"$der" 2>/dev/null || { rejected=$((rejected + 1)); continue; }
+      # The thumbprint is the SHA-1 of the DER: a mismatch means corruption.
+      if [[ "$(sha1sum "$der" | cut -d' ' -f1)" != "${thumb,,}" ]]; then
+        omw_warn "Thumbprint mismatch for $thumb; skipped."
+        rejected=$((rejected + 1)); continue
+      fi
+      fp=$(sha256sum "$der" | cut -d' ' -f1)
+      if (( ${#ALLOWED[@]} )) && [[ -z "${ALLOWED[${thumb,,}]:-}" && -z "${ALLOWED[$fp]:-}" ]]; then
+        continue
+      fi
+      [[ -n "${BASE_FP[$fp]:-}" ]] && continue   # Linux already trusts it
+      WANT["$fp"]="$der"
+      ;;
+    DISALLOWED) disallowed=$((disallowed + 1)) ;;
+    EXPIRED) expired=$((expired + 1)) ;;
+    END) [[ "$thumb" =~ ^[0-9]+$ ]] && end_count="$thumb" ;;
+  esac
+done <<<"$raw"
+
+if [[ -z "$end_count" || "$end_count" -ne "$certs" ]]; then
+  omw_err "Incomplete certificate list from Windows (got $certs, expected ${end_count:-?}); trust store left unchanged."
+  exit 1
+fi
+(( rejected )) && omw_warn "$rejected malformed certificate record(s) ignored."
+
+changed=0
+for fp in "${!WANT[@]}"; do
+  dest="$ANCHORS_DIR/${PREFIX}${fp}.crt"
+  [[ -f "$dest" && "$(pem_fingerprints "$dest" | head -n 1)" == "$fp" ]] && continue
+  if (( DRY_RUN )); then
+    echo "add    $dest"
+  else
+    write_pem "${WANT[$fp]}" "$dest.tmp.$$"
+    chmod 0644 "$dest.tmp.$$"
+    mv -f -- "$dest.tmp.$$" "$dest"
+  fi
+  changed=1
+done
+
+# Prune managed anchors no longer selected, and legacy win-ca-*.crt files.
+for f in "$ANCHORS_DIR/${PREFIX}"*.crt "$ANCHORS_DIR"/win-ca-*.crt; do
+  base="${f##*/}"
+  fp="${base#"$PREFIX"}"
+  fp="${fp%.crt}"
+  if [[ "$base" == "$PREFIX"* && -n "${WANT[$fp]:-}" ]]; then
+    continue
+  fi
+  if (( DRY_RUN )); then
+    echo "remove $f"
+  else
+    rm -f -- "$f"
+  fi
+  changed=1
+done
+
+omw_log "Windows roots: ${certs} usable, ${disallowed} disallowed, ${expired} expired; managed anchors: ${#WANT[@]}."
+if (( changed && ! DRY_RUN )); then
+  if [[ -n "${OMARCHY_CA_UPDATE_CMD:-}" ]]; then
+    read -r -a _upd <<<"$OMARCHY_CA_UPDATE_CMD"
+    "${_upd[@]}"
+  elif omw_have update-ca-trust; then
+    update-ca-trust extract
+  elif omw_have trust; then
+    trust extract-compat
+  else
+    omw_warn "No update-ca-trust found; anchors written but the bundle was not rebuilt."
+  fi
+  omw_log "System trust store updated."
+elif (( ! changed )); then
+  omw_log "Trust store already in sync."
+fi

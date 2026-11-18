@@ -210,3 +210,209 @@ def test_cli_execution_adversarial_flows() -> None:
     res = subprocess.run([sys.executable, str(cli_bin), "--theme", "tokyo-night", "--dry-run"], capture_output=True, text=True)
     assert res.returncode == 0
     assert "[DRY-RUN]" in res.stdout or "Tokyo Night" in res.stdout
+
+
+# ---------------------------------------------------------------------------
+# Linux terminal adapters (#27, #50) and CLI packaging
+# ---------------------------------------------------------------------------
+import os
+import shutil
+import tomllib
+from dataclasses import replace
+
+from omarchy_theme.adapters.linux_terminals import (
+    BEGIN_MARK,
+    END_MARK,
+    sync_alacritty,
+    sync_all_linux_terminals,
+    sync_ghostty,
+    sync_kitty,
+)
+from omarchy_theme.models import sanitize_theme_name
+
+USER_ALACRITTY = """# my alacritty config
+[general]
+live_config_reload = true
+
+[[keyboard.bindings]]
+key = "N"
+mods = "Control|Shift"
+action = "CreateNewWindow"
+
+[[keyboard.bindings]]
+key = "Q"
+mods = "Control"
+action = "Quit"
+
+[colors.primary]
+background = "#000000"
+foreground = "#ffffff"
+
+[font]
+size = 12.0
+"""
+
+
+@pytest.fixture()
+def xdg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Sandboxed XDG_CONFIG_HOME/HOME and a PATH holding no terminal binaries."""
+    home = tmp_path / "home"
+    (home / ".config").mkdir(parents=True)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("PATH", str(bindir))
+    return home / ".config"
+
+
+def _fake_binary(cfg: Path, name: str) -> None:
+    exe = Path(os.environ["PATH"]) / name
+    exe.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    exe.chmod(0o755)
+
+
+def test_alacritty_keeps_bindings_and_never_duplicates_colors(xdg: Path) -> None:
+    conf = xdg / "alacritty" / "alacritty.toml"
+    conf.parent.mkdir(parents=True)
+    conf.write_text(USER_ALACRITTY, encoding="utf-8")
+
+    for theme in (NORD, TOKYO_NIGHT, TOKYO_NIGHT):
+        res = sync_alacritty(theme)
+        assert res.success, res.message
+
+    text = conf.read_text(encoding="utf-8")
+    data = tomllib.loads(text)  # still valid TOML
+    assert text.count("[[keyboard.bindings]]") == 2
+    assert [b["action"] for b in data["keyboard"]["bindings"]] == ["CreateNewWindow", "Quit"]
+    assert text.count("[colors.primary]") == 1
+    assert data["colors"]["primary"]["background"] == "#000000"
+    assert data["general"]["live_config_reload"] is True
+    assert data["general"]["import"] == ["~/.config/alacritty/omarchy-theme.toml"]
+    theme_file = tomllib.loads((conf.parent / "omarchy-theme.toml").read_text(encoding="utf-8"))
+    assert theme_file["colors"]["primary"]["background"] == TOKYO_NIGHT.background
+    assert "own [colors]" in res.message  # user colors still win; the user is told
+
+
+def test_alacritty_import_appended_to_existing_arrays(xdg: Path) -> None:
+    conf = xdg / "alacritty" / "alacritty.toml"
+    conf.parent.mkdir(parents=True)
+    conf.write_text('import = ["~/.config/alacritty/keys.toml"]\n\n[font]\nsize = 11.0\n', encoding="utf-8")
+    assert sync_alacritty(NORD).success
+    data = tomllib.loads(conf.read_text(encoding="utf-8"))
+    assert data["import"] == ["~/.config/alacritty/keys.toml", "~/.config/alacritty/omarchy-theme.toml"]
+    assert data["font"]["size"] == 11.0
+
+    conf.write_text('[general]\nimport = [\n  "a.toml",\n]\n', encoding="utf-8")
+    assert sync_alacritty(NORD).success
+    assert sync_alacritty(NORD).success  # idempotent
+    data = tomllib.loads(conf.read_text(encoding="utf-8"))
+    assert sorted(data["general"]["import"]) == ["a.toml", "~/.config/alacritty/omarchy-theme.toml"]
+
+
+def test_alacritty_legacy_block_is_removed_exactly(xdg: Path) -> None:
+    from omarchy_theme.adapters.linux_terminals import alacritty_theme_toml
+
+    conf = xdg / "alacritty" / "alacritty.toml"
+    conf.parent.mkdir(parents=True)
+    c = NORD.to_alacritty_dict()["colors"]
+    legacy = "\n".join(
+        [f"# Omarchy theme: {NORD.name}", "[colors.primary]",
+         f'background = "{c["primary"]["background"]}"', f'foreground = "{c["primary"]["foreground"]}"', "",
+         "[colors.cursor]", f'cursor = "{c["cursor"]["cursor"]}"', f'text = "{c["cursor"]["text"]}"', "",
+         "[colors.selection]", f'background = "{c["selection"]["background"]}"', f'text = "{c["selection"]["text"]}"', "",
+         "[colors.normal]"] + [f'{k} = "{c["normal"][k]}"' for k in ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")]
+        + ["", "[colors.bright]"] + [f'{k} = "{c["bright"][k]}"' for k in ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")]
+    ) + "\n"
+    conf.write_text("[font]\nsize = 10.0\n\n" + legacy, encoding="utf-8")
+    assert sync_alacritty(TOKYO_NIGHT).success
+    text = conf.read_text(encoding="utf-8")
+    assert "# Omarchy theme:" not in text and "[colors." not in text
+    assert tomllib.loads(text)["font"]["size"] == 10.0
+    assert "[colors.primary]" in alacritty_theme_toml(TOKYO_NIGHT)
+
+
+def test_alacritty_invalid_toml_fails_closed(xdg: Path) -> None:
+    conf = xdg / "alacritty" / "alacritty.toml"
+    conf.parent.mkdir(parents=True)
+    broken = "[font\nsize = = 3\n"
+    conf.write_text(broken, encoding="utf-8")
+    res = sync_alacritty(NORD)
+    assert res.success is False
+    assert conf.read_text(encoding="utf-8") == broken
+
+
+def test_ghostty_managed_block_is_replaced_not_duplicated(xdg: Path) -> None:
+    conf = xdg / "ghostty" / "config"
+    conf.parent.mkdir(parents=True)
+    legacy = NORD.to_ghostty_config()  # unmarked block written by older versions
+    conf.write_text("font-size = 13\nkeybind = ctrl+t=new_tab\n\n" + legacy, encoding="utf-8")
+    for theme in (TOKYO_NIGHT, CATPPUCCIN_MOCHA, CATPPUCCIN_MOCHA):
+        assert sync_ghostty(theme).success
+    text = conf.read_text(encoding="utf-8")
+    assert text.count(BEGIN_MARK) == 1 and text.count(END_MARK) == 1
+    assert text.count("palette = 0=") == 1
+    assert "# Omarchy theme: Nord" not in text
+    assert text.startswith("font-size = 13\nkeybind = ctrl+t=new_tab\n")
+    assert f"background = {CATPPUCCIN_MOCHA.background}" in text
+
+
+def test_kitty_include_added_once(xdg: Path) -> None:
+    kitty = xdg / "kitty"
+    kitty.mkdir()
+    (kitty / "kitty.conf").write_text("font_size 12\n", encoding="utf-8")
+    for _ in range(3):
+        assert sync_kitty(NORD).success
+    main = (kitty / "kitty.conf").read_text(encoding="utf-8")
+    assert main.count("include current-theme.conf") == 1
+    assert main.startswith("font_size 12\n")
+    assert f"background            {NORD.background}" in (kitty / "current-theme.conf").read_text(encoding="utf-8")
+
+
+def test_uninstalled_terminals_are_not_touched(xdg: Path) -> None:
+    results = sync_all_linux_terminals(NORD)
+    assert all(r.success and r.skipped for r in results)
+    assert list(xdg.iterdir()) == []  # nothing created
+
+
+def test_dry_run_never_creates_directories(xdg: Path) -> None:
+    for name in ("ghostty", "kitty", "alacritty"):
+        _fake_binary(xdg, name)
+    results = sync_all_linux_terminals(NORD, dry_run=True)
+    assert all(r.success for r in results), [r.message for r in results]
+    assert list(xdg.iterdir()) == []
+    results = sync_all_linux_terminals(NORD)  # installed -> configs are created
+    assert all(r.success for r in results), [r.message for r in results]
+    assert (xdg / "ghostty" / "config").exists() and (xdg / "alacritty" / "omarchy-theme.toml").exists()
+
+
+def test_theme_name_cannot_inject_config_lines(xdg: Path) -> None:
+    evil = replace(NORD, name="Evil\ncommand = /bin/sh -c 'touch /tmp/x' more")
+    assert "\n" not in evil.name and " " not in evil.name
+    conf = xdg / "ghostty" / "config"
+    conf.parent.mkdir(parents=True)
+    conf.write_text("", encoding="utf-8")
+    assert sync_ghostty(evil).success
+    lines = conf.read_text(encoding="utf-8").splitlines()
+    assert not any(line.startswith("command") for line in lines)
+    assert sanitize_theme_name("  a\tb\x00c  ") == "a b c"
+    with pytest.raises(ValueError):
+        replace(NORD, name="\n\n")
+
+
+def test_cli_finds_installed_library(tmp_path: Path) -> None:
+    """/usr/bin/omarchy-theme-sync loads /usr/lib/omarchy-wsl/python."""
+    prefix = tmp_path / "usr"
+    (prefix / "bin").mkdir(parents=True)
+    pylib = prefix / "lib" / "omarchy-wsl" / "python"
+    pylib.mkdir(parents=True)
+    repo = Path(__file__).resolve().parent.parent
+    shutil.copy2(repo / "bin" / "omarchy-theme-sync", prefix / "bin" / "omarchy-theme-sync")
+    shutil.copytree(repo / "lib" / "omarchy_theme", pylib / "omarchy_theme")
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "OMARCHY_THEME_LIB")}
+    res = subprocess.run(
+        [sys.executable, str(prefix / "bin" / "omarchy-theme-sync"), "--list-themes"],
+        capture_output=True, text=True, env=env, cwd=str(tmp_path),
+    )
+    assert res.returncode == 0, res.stderr
+    assert "tokyo-night" in res.stdout

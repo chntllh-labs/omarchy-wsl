@@ -1,0 +1,19 @@
+{
+    "ModernDistributions": {
+        "Omarchy": [
+            {
+                "Name": "Omarchy",
+                "FriendlyName": "Omarchy",
+                "Default": true,
+                "Amd64Url": {
+                    "Url": "https://github.com/chntllh-labs/omarchy-wsl/releases/download/v4.5.0/Omarchy-x86_64.wsl",
+                    "Sha256": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                "Arm64Url": {
+                    "Url": "https://github.com/chntllh-labs/omarchy-wsl/releases/download/v4.5.0/Omarchy-arm64.wsl",
+                    "Sha256": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                }
+            }
+        ]
+    }
+}

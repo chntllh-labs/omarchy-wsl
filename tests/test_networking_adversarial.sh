@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Omarchy WSL: Automated Adversarial Networking & DNS Test Suite
-# /tests/test_networking_adversarial.sh
+# Omarchy WSL: Networking & DNS Configuration Test Suite
+# tests/test_networking_adversarial.sh
 # ==============================================================================
-# Tests resilience across NAT, Mirrored mode, DNS tunneling, corporate proxies,
-# container bridge collisions, and pacman mirror failover.
+# Shipped networking configuration: the .wslconfig generator (run under pwsh),
+# sysctl drop-ins (validated against the running kernel's /proc/sys), the
+# resolver model (systemd-resolved masked, WSL-generated resolv.conf, dormant
+# resolved drop-in), container engine configs and the shims/PATH wiring.
+# Behaviour of the sync tools themselves is covered by tests/test_network_sync.sh.
+# OMW_STRICT=1 turns every skip into a failing exit status.
 # ==============================================================================
 
-set -euo pipefail
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -15,255 +19,144 @@ ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TESTS_RUN=0
 TESTS_PASSED=0
 TESTS_FAILED=0
+TESTS_SKIPPED=0
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_OK=$'\e[32m' C_BAD=$'\e[31m' C_SKIP=$'\e[33m' C_HDR=$'\e[1;36m' C_END=$'\e[0m'
+else
+  C_OK="" C_BAD="" C_SKIP="" C_HDR="" C_END=""
+fi
+pass() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_PASSED=$((TESTS_PASSED + 1)); printf '  %s[PASS]%s %s\n' "$C_OK" "$C_END" "$*"; }
+fail() { TESTS_RUN=$((TESTS_RUN + 1)); TESTS_FAILED=$((TESTS_FAILED + 1)); printf '  %s[FAIL]%s %s\n' "$C_BAD" "$C_END" "$*"; }
+skip() { TESTS_SKIPPED=$((TESTS_SKIPPED + 1)); printf '  %s[SKIP]%s %s\n' "$C_SKIP" "$C_END" "$*"; }
+header() { printf '\n%s>>> %s%s\n' "$C_HDR" "$*" "$C_END"; }
+check() { local desc="$1"; shift; if "$@"; then pass "$desc"; else fail "$desc"; fi; }
 
-pass() {
-  TESTS_RUN=$((TESTS_RUN + 1))
-  TESTS_PASSED=$((TESTS_PASSED + 1))
-  echo -e "  \e[32m[PASS]\e[0m $*"
-}
+T=$(mktemp -d "${TMPDIR:-/tmp}/omw-netcfg.XXXXXX")
+# shellcheck disable=SC2317  # invoked by the EXIT trap
+cleanup() { rm -rf "$T"; }
+trap cleanup EXIT
+PWSH="${PWSH:-$(command -v pwsh || true)}"
 
-fail() {
-  TESTS_RUN=$((TESTS_RUN + 1))
-  TESTS_FAILED=$((TESTS_FAILED + 1))
-  echo -e "  \e[31m[FAIL]\e[0m $*"
-}
-
-header() {
-  echo -e "\n\e[1m\e[36m>>> TEST SUITE: $*\e[0m"
-}
-
-# -----------------------------------------------------------------------------
-# 1. Test: Host .wslconfig Generator (Mirrored vs NAT)
 # -----------------------------------------------------------------------------
 test_wslconfig_generator() {
-  header "1. Host .wslconfig Generator Matrix"
+  header "1. .wslconfig generator (tools/generate-wslconfig.ps1, run under pwsh)"
+  local gen="$ROOT_DIR/tools/generate-wslconfig.ps1" out
+  if [[ -z "$PWSH" ]]; then skip "pwsh not installed: generator not run"; return; fi
+  out=$(cd "$T" && "$PWSH" -NoLogo -NoProfile -File "$gen" -DryRun -Quiet -HostMemoryGB 64 \
+        -HostLogicalProcessors 16 -HostArch arm64 -HostBuild 26100 -WslConfigPath "$T/a.wslconfig" 2>&1 | tr -d '\r')
+  section_of() { awk -v k="$1" '/^\[/ { s = $0; next } index($0, k "=") == 1 { print s; exit }' <<<"$2"; }
+  check "Windows 11: mirrored networking, DNS tunneling and autoProxy" \
+    bash -c "grep -qx 'networkingMode=mirrored' <<<\"\$1\" && grep -qx 'dnsTunneling=true' <<<\"\$1\" && grep -qx 'autoProxy=true' <<<\"\$1\"" _ "$out"
+  check "hostAddressLoopback is written under [experimental]" test "$(section_of hostAddressLoopback "$out")" = "[experimental]"
+  check "networkingMode is written under [wsl2]" test "$(section_of networkingMode "$out")" = "[wsl2]"
+  out=$(cd "$T" && "$PWSH" -NoLogo -NoProfile -File "$gen" -DryRun -Quiet -ForceNAT -HostMemoryGB 16 \
+        -HostLogicalProcessors 8 -HostArch x64 -HostBuild 19045 -WslConfigPath "$T/b.wslconfig" 2>&1 | tr -d '\r')
+  check "-ForceNAT: NAT without DNS tunneling" \
+    bash -c "grep -qx 'networkingMode=NAT' <<<\"\$1\" && grep -qx 'dnsTunneling=false' <<<\"\$1\"" _ "$out"
+}
 
-  local gen_script="${ROOT_DIR}/tools/generate-wslconfig.sh"
-  [[ -x "$gen_script" ]] || { fail "generate-wslconfig.sh missing or not executable"; return; }
-
-  # Test 1.1: Default generation (Mirrored mode)
-  local out_mirrored
-  out_mirrored=$("$gen_script" -d)
-  if echo "$out_mirrored" | grep -q "networkingMode=mirrored" && \
-     echo "$out_mirrored" | grep -q "dnsTunneling=true" && \
-     echo "$out_mirrored" | grep -q "autoProxy=true" && \
-     echo "$out_mirrored" | grep -q "hostAddressLoopback=true"; then
-    pass "Default .wslconfig enables mirrored mode, DNS tunneling, and auto-proxy."
+# -----------------------------------------------------------------------------
+test_sysctl() {
+  header "2. Kernel sysctl drop-ins"
+  local net="$ROOT_DIR/wsl/sysctl.d/99-zz-omarchy-wsl-network.conf" f key bad=0 missing=0
+  check "Privileged ports stay privileged (ip_unprivileged_port_start = 1024)" \
+    grep -qx 'net.ipv4.ip_unprivileged_port_start = 1024' "$net"
+  check "route_localnet is not enabled" bash -c "! grep -Eq '^[^#]*route_localnet[[:space:]]*=[[:space:]]*1' '$net'"
+  check "IPv6 forwarding is not enabled (keeps router advertisements working)" \
+    bash -c "! grep -Eq '^[^#]*ipv6\\.conf\\.all\\.forwarding[[:space:]]*=[[:space:]]*1' '$net'"
+  check "IPv4 forwarding is left to the container engines" bash -c "! grep -Eq '^[^#]*net\\.ipv4\\.ip_forward[[:space:]]*=' '$net'"
+  check "Loose reverse-path filtering (rp_filter = 2)" \
+    bash -c "grep -qx 'net.ipv4.conf.all.rp_filter = 2' '$net' && grep -qx 'net.ipv4.conf.default.rp_filter = 2' '$net'"
+  check "Stability sysctls live in wsl/sysctl.d (installed with the others)" \
+    bash -c "[[ -f '$ROOT_DIR/wsl/sysctl.d/99-zz-omarchy-wsl-stability.conf' && ! -e '$ROOT_DIR/wsl/99-zz-omarchy-wsl-stability.conf' ]]"
+  check "vm.vfs_cache_pressure stays 100" grep -qx 'vm.vfs_cache_pressure = 100' "$ROOT_DIR/wsl/sysctl.d/99-zz-omarchy-wsl-stability.conf"
+  for f in "$ROOT_DIR"/wsl/sysctl.d/*.conf; do
+    while IFS= read -r line; do
+      [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+      if ! [[ "$line" =~ ^([a-z0-9_.-]+)\ =\ [0-9-]+$ ]]; then bad=1; echo "      bad line in ${f##*/}: $line"; continue; fi
+      key="${BASH_REMATCH[1]}"
+      if [[ -d /proc/sys/net ]] && [[ ! -e "/proc/sys/${key//.//}" ]]; then missing=1; echo "      unknown key: $key"; fi
+    done <"$f"
+  done
+  check "Every sysctl line is 'key = integer'" test "$bad" -eq 0
+  if [[ -d /proc/sys/net ]]; then
+    check "Every sysctl key exists in the running kernel" test "$missing" -eq 0
   else
-    fail "Default .wslconfig failed to configure mirrored parameters!"
-  fi
-
-  # Test 1.2: Force NAT fallback
-  local out_nat
-  out_nat=$("$gen_script" -d --force-nat)
-  if echo "$out_nat" | grep -q "networkingMode=NAT" && \
-     echo "$out_nat" | grep -q "dnsTunneling=false"; then
-    pass "Forced NAT option safely generates resilient legacy fallback config."
-  else
-    fail "Forced NAT failed to configure NAT parameters!"
+    skip "/proc/sys not available: key existence not checked"
   fi
 }
 
 # -----------------------------------------------------------------------------
-# 2. Test: Kernel Sysctl Network Hardening Parameters
-# -----------------------------------------------------------------------------
-test_sysctl_hardening() {
-  header "2. Kernel Sysctl Network Configuration"
-
-  local sysctl_file="${ROOT_DIR}/wsl/sysctl.d/99-zz-omarchy-wsl-network.conf"
-  [[ -f "$sysctl_file" ]] || { fail "99-zz-omarchy-wsl-network.conf missing"; return; }
-
-  if grep -q "net.ipv4.ip_unprivileged_port_start = 0" "$sysctl_file"; then
-    pass "Unprivileged port binding enabled (port 80/443 development permitted)."
-  else
-    fail "ip_unprivileged_port_start = 0 missing!"
-  fi
-
-  if grep -q "net.ipv4.conf.all.rp_filter = 2" "$sysctl_file" && \
-     grep -q "net.ipv4.conf.default.rp_filter = 2" "$sysctl_file"; then
-    pass "Loose Reverse Path Filtering (rp_filter = 2) configured for VPN multi-homing."
-  else
-    fail "Loose rp_filter missing! Asymmetric VPN routing will cause packet drops."
-  fi
-
-  if grep -q "net.ipv4.ip_forward = 1" "$sysctl_file"; then
-    pass "IP packet forwarding enabled for Docker/Podman bridges."
-  else
-    fail "net.ipv4.ip_forward = 1 missing!"
-  fi
+test_resolver_model() {
+  header "3. Resolver model (resolved masked, WSL writes resolv.conf)"
+  local dropin="$ROOT_DIR/wsl/systemd/systemd-resolved.conf.d/10-omarchy-wsl.conf"
+  check "wsl.conf keeps generateResolvConf = true" grep -qx 'generateResolvConf = true' "$ROOT_DIR/wsl/wsl.conf"
+  check "Resolved drop-in is labelled dormant / opt-in" grep -q 'DORMANT, opt-in only' "$dropin"
+  check "Resolved drop-in: DNSSEC, LLMNR and mDNS off" \
+    bash -c "grep -qx 'DNSSEC=no' '$dropin' && grep -qx 'LLMNR=no' '$dropin' && grep -qx 'MulticastDNS=no' '$dropin'"
+  check "Resolved drop-in adds no public FallbackDNS" grep -qx 'FallbackDNS=' "$dropin"
+  check "No loopback stub resolver address in shipped network files" \
+    bash -c "! grep -rl '127\\.0\\.0\\.53' '$ROOT_DIR/wsl/docker' '$ROOT_DIR/wsl/podman' '$ROOT_DIR/bin/omarchy-dns-sync' '$ROOT_DIR/wsl/systemd'"
+  check "dns-sync never appends public resolvers by default" grep -q -- '--public-fallback' "$ROOT_DIR/bin/omarchy-dns-sync"
 }
 
 # -----------------------------------------------------------------------------
-# 3. Test: systemd-resolved Coexistence & Drop-in Hardening
-# -----------------------------------------------------------------------------
-test_systemd_resolved_dropin() {
-  header "3. systemd-resolved & DNS Tunneling Coexistence"
-
-  local resolved_dropin="${ROOT_DIR}/wsl/systemd/systemd-resolved.conf.d/10-omarchy-wsl.conf"
-  [[ -f "$resolved_dropin" ]] || { fail "resolved drop-in missing"; return; }
-
-  if grep -q "DNSSEC=no" "$resolved_dropin"; then
-    pass "DNSSEC=no configured (prevents corporate inspection proxy SERVFAIL)."
-  else
-    fail "DNSSEC=no missing in resolved drop-in!"
-  fi
-
-  if grep -q "LLMNR=no" "$resolved_dropin" && grep -q "MulticastDNS=no" "$resolved_dropin"; then
-    pass "LLMNR and mDNS disabled (prevents port 5353/5355 conflicts in mirrored mode)."
-  else
-    fail "LLMNR or mDNS not disabled; will clash with Windows host svchost."
-  fi
-
-  if grep -q "FallbackDNS=" "$resolved_dropin"; then
-    pass "FallbackDNS configured with resilient anycast addresses."
-  else
-    fail "FallbackDNS missing in resolved drop-in!"
-  fi
+test_pacman() {
+  header "4. pacman mirrors"
+  local ms="$ROOT_DIR/bin/omarchy-mirror-sync"
+  check "omarchy-mirror-sync is executable" test -x "$ms"
+  check "Mirror candidates are HTTPS only" bash -c "! sed -n '/^get_candidates/,/^}/p' '$ms' | grep -q 'http://'"
+  check "Omarchy stable mirrors are the first candidates" \
+    bash -c "grep -q 'https://stable-mirror.omarchy.org/\$repo/os/\$arch' '$ms' && grep -q 'https://arm-stable-mirror.omarchy.org/\$arch/\$repo' '$ms'"
 }
 
 # -----------------------------------------------------------------------------
-# 4. Test: Pacman Resilience & Ping-less Mirror Ranking
-# -----------------------------------------------------------------------------
-test_pacman_resilience() {
-  header "4. Pacman Configuration & Mirror Resilience"
-
-  local pacman_conf="${ROOT_DIR}/wsl/pacman/pacman.conf.omarchy"
-  [[ -f "$pacman_conf" ]] || { fail "pacman.conf.omarchy missing"; return; }
-
-  if grep -q "^DisableSandbox" "$pacman_conf"; then
-    pass "Pacman DisableSandbox active for WSL container isolation."
-  else
-    fail "DisableSandbox missing from pacman.conf!"
-  fi
-
-  if grep -q -- "--connect-timeout 5" "$pacman_conf"; then
-    pass "Pacman XferCommand enforces strict 5-second connection timeout."
-  else
-    fail "Pacman connection timeout missing! May hang indefinitely on dead mirrors."
-  fi
-
-  # Check mirrorlists
-  local ml_x86="${ROOT_DIR}/wsl/pacman/mirrorlist.x86_64"
-  local ml_arm="${ROOT_DIR}/wsl/pacman/mirrorlist.aarch64"
-
-  if [[ -s "$ml_x86" && $(grep -c "^Server" "$ml_x86") -ge 3 ]]; then
-    pass "x86_64 mirrorlist contains $(grep -c "^Server" "$ml_x86") resilient multi-tier servers."
-  else
-    fail "x86_64 mirrorlist invalid or empty!"
-  fi
-
-  if [[ -s "$ml_arm" && $(grep -c "^Server" "$ml_arm") -ge 3 ]]; then
-    pass "aarch64 mirrorlist contains $(grep -c "^Server" "$ml_arm") resilient multi-tier servers."
-  else
-    fail "aarch64 mirrorlist invalid or empty!"
-  fi
-
-  # Test mirror-sync restore-default logic
-  local sync_bin="${ROOT_DIR}/bin/omarchy-mirror-sync"
-  [[ -x "$sync_bin" ]] || { fail "omarchy-mirror-sync missing or not executable"; return; }
-  pass "omarchy-mirror-sync binary present and executable."
+test_containers() {
+  header "5. Container engines (subnets, MTU, DNS)"
+  local dj="$ROOT_DIR/wsl/docker/daemon.json" pc="$ROOT_DIR/wsl/podman/containers.conf"
+  check "daemon.json is valid JSON" python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$dj"
+  check "Docker pools in RFC 2544 space (198.18.0.0/16), MTU 1420" \
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["default-address-pools"][0]["base"]=="198.18.0.0/16" and d["mtu"]==1420' "$dj"
+  check "Docker gets no hard-coded DNS (inherits WSL's resolv.conf)" \
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert "dns" not in d' "$dj"
+  check "containers.conf is valid TOML" python3 -c 'import sys,tomllib; tomllib.load(open(sys.argv[1],"rb"))' "$pc"
+  check "Podman subnet 198.19.0.0/16 and pasta MTU 1420" \
+    python3 -c 'import sys,tomllib; d=tomllib.load(open(sys.argv[1],"rb"))["network"]; assert d["default_subnet"]=="198.19.0.0/16" and d["pasta_options"]==["-m","1420"]' "$pc"
+  check "No automatic publishing of every container port, no dns_bind_port=0" \
+    bash -c "! grep -Eq 'tcp-ports|udp-ports|dns_bind_port' '$pc'"
+  check "No literal from Docker's default bridge subnet in shipped files" \
+    bash -c "! grep -rEq '172\\.1[7]\\.' '$ROOT_DIR/wsl/docker' '$ROOT_DIR/wsl/podman' '$ROOT_DIR/bin/omarchy-netdoctor' '$ROOT_DIR/docs/WSL-NETWORKING-AND-DNS-ADVERSARIAL-REVIEW.md'"
 }
 
 # -----------------------------------------------------------------------------
-# 5. Test: Container Coexistence (Docker & Podman Subnets)
-# -----------------------------------------------------------------------------
-test_container_coexistence() {
-  header "5. Container Engine Subnet Isolation & MTU"
-
-  local docker_json="${ROOT_DIR}/wsl/docker/daemon.json"
-  [[ -f "$docker_json" ]] || { fail "daemon.json missing"; return; }
-
-  # Test that Docker doesn't use 172.17.0.0/16
-  if grep -q "198.18.0" "$docker_json"; then
-    pass "Docker bip/address-pools isolated in RFC 2544 space (198.18.0.0/16)."
-  else
-    fail "Docker default subnet not isolated! Risk of colliding with corporate VPNs."
-  fi
-
-  if grep -q '"mtu": 1420' "$docker_json"; then
-    pass "Docker MTU clamped to 1420 to prevent VPN encapsulation drops."
-  else
-    fail "Docker MTU not clamped!"
-  fi
-
-  local podman_conf="${ROOT_DIR}/wsl/podman/containers.conf"
-  [[ -f "$podman_conf" ]] || { fail "podman containers.conf missing"; return; }
-
-  if grep -q "198.19.0.0" "$podman_conf"; then
-    pass "Podman network pool isolated in 198.19.0.0/16."
-  else
-    fail "Podman subnet pool not isolated!"
-  fi
-
-  if grep -q "1420" "$podman_conf"; then
-    pass "Podman pasta MTU clamped to 1420."
-  else
-    fail "Podman MTU not clamped!"
-  fi
+test_shims_path() {
+  header "6. Windows shims & PATH"
+  local shims="$ROOT_DIR/wsl/bin/wsl-shims-setup.sh" profile="$ROOT_DIR/wsl/profile.d/10-omarchy-wsl-path.sh"
+  check "Shims script links powershell.exe and cmd.exe" bash -c "grep -q 'powershell.exe' '$shims' && grep -q 'cmd.exe' '$shims'"
+  check "Shims script never searches with -maxdepth 5 (wt.exe is at depth 6)" bash -c "! grep -q 'maxdepth 5' '$shims'"
+  check "profile.d appends the curated shim directory" grep -q '/usr/lib/omarchy-wsl/bin' "$profile"
 }
 
-# -----------------------------------------------------------------------------
-# 6. Test: Windows Interop Shims & Clean PATH
-# -----------------------------------------------------------------------------
-test_interop_shims() {
-  header "6. Windows Interop Shims & PATH Isolation"
-
-  local shims_script="${ROOT_DIR}/wsl/bin/wsl-shims-setup.sh"
-  local profile_sh="${ROOT_DIR}/wsl/profile.d/10-omarchy-wsl-path.sh"
-
-  [[ -x "$shims_script" ]] || { fail "wsl-shims-setup.sh missing or not executable"; return; }
-  [[ -f "$profile_sh" ]] || { fail "10-omarchy-wsl-path.sh missing"; return; }
-
-  if grep -q "powershell.exe" "$shims_script" && grep -q "cmd.exe" "$shims_script"; then
-    pass "Interop shims script provides essential Windows executables."
-  else
-    fail "Essential shims missing from setup script!"
-  fi
-
-  if grep -q "/usr/lib/omarchy-wsl/bin" "$profile_sh"; then
-    pass "Profile drop-in correctly prepends shims directory."
-  else
-    fail "Profile drop-in does not add shims directory to PATH!"
-  fi
-}
-
-# -----------------------------------------------------------------------------
-# 7. Test: Diagnostic NetDoctor Suite
 # -----------------------------------------------------------------------------
 test_netdoctor() {
-  header "7. Omarchy NetDoctor Diagnostic Utility"
-
-  local netdoctor="${ROOT_DIR}/bin/omarchy-netdoctor"
-  [[ -x "$netdoctor" ]] || { fail "omarchy-netdoctor missing or not executable"; return; }
-
-  local help_out
-  help_out=$("$netdoctor" --help)
-  if echo "$help_out" | grep -q "audit" && echo "$help_out" | grep -q "\-\-repair"; then
-    pass "omarchy-netdoctor exposes audit and automated self-healing modes."
-  else
-    fail "omarchy-netdoctor help missing required commands!"
-  fi
+  header "7. omarchy-netdoctor"
+  local nd="$ROOT_DIR/bin/omarchy-netdoctor" out rc
+  out=$("$nd" --help); rc=$?
+  check "--help exits 0 and documents audit + --repair" \
+    bash -c "[[ $rc -eq 0 ]] && grep -q audit <<<\"\$1\" && grep -q -- '--repair' <<<\"\$1\"" _ "$out"
+  check "netdoctor never recommends DisableSandbox" bash -c "! grep -q 'DisableSandbox missing' '$nd'"
 }
 
-# -----------------------------------------------------------------------------
-# Run All Tests & Report
-# -----------------------------------------------------------------------------
 test_wslconfig_generator
-test_sysctl_hardening
-test_systemd_resolved_dropin
-test_pacman_resilience
-test_container_coexistence
-test_interop_shims
+test_sysctl
+test_resolver_model
+test_pacman
+test_containers
+test_shims_path
 test_netdoctor
 
-echo -e "\n========================================================"
-echo -e " Adversarial Test Results: ${TESTS_PASSED}/${TESTS_RUN} Passed"
-echo -e "========================================================"
-
-if [[ $TESTS_FAILED -eq 0 ]]; then
-  echo -e "\e[32m\e[1mAll adversarial networking tests passed with 100% success!\e[0m\n"
-  exit 0
-else
-  echo -e "\e[31m\e[1mEncountered $TESTS_FAILED test failures.\e[0m\n"
-  exit 1
-fi
+echo
+echo "Networking Adversarial Suite: ${TESTS_PASSED}/${TESTS_RUN} passed, ${TESTS_FAILED} failed, ${TESTS_SKIPPED} skipped"
+(( TESTS_FAILED == 0 )) || exit 1
+if (( TESTS_SKIPPED > 0 )) && [[ "${OMW_STRICT:-0}" == 1 ]]; then exit 1; fi
+exit 0

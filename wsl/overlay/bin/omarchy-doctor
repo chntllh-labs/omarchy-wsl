@@ -1,0 +1,195 @@
+#!/bin/bash
+
+# omarchy:summary=Check the health of this Omarchy WSL install
+# omarchy:examples=omarchy doctor
+
+# Read-only diagnostics. Exits non-zero when any check fails; warnings are
+# informational (for example Windows Terminal not being installed).
+
+: "${OMARCHY_PATH:=/usr/share/omarchy}"
+
+OMARCHY_KEY_FPR=40DFB630FF42BCFFB047046CF0134EE680CAC571
+WSL_FILE_LIMIT=$((1024 * 1024)) # WslDistributionConfig.cpp reads these with a 1 MiB cap
+
+failures=0
+warnings=0
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  c_ok=$'\e[32m' c_warn=$'\e[33m' c_fail=$'\e[31m' c_bold=$'\e[1m' c_off=$'\e[0m'
+else
+  c_ok='' c_warn='' c_fail='' c_bold='' c_off=''
+fi
+
+pass() { printf '  %s✓%s %s\n' "$c_ok" "$c_off" "$*"; }
+warn() {
+  printf '  %s!%s %s\n' "$c_warn" "$c_off" "$*"
+  warnings=$((warnings + 1))
+}
+fail() {
+  printf '  %s✗%s %s\n' "$c_fail" "$c_off" "$*"
+  failures=$((failures + 1))
+}
+section() { printf '\n%s%s%s\n' "$c_bold" "$*" "$c_off"; }
+
+owner=$(getent passwd 1000 | cut -d: -f1)
+
+section "System"
+if [[ $(ps -p 1 -o comm= 2>/dev/null) == systemd ]]; then
+  pass "systemd is PID 1"
+  state=$(systemctl is-system-running 2>/dev/null)
+  case "$state" in
+    running) pass "systemd state: running" ;;
+    starting | initializing) warn "systemd state: $state (still booting)" ;;
+    *) fail "systemd state: $state; failed units: $(systemctl --failed --plain --no-legend 2>/dev/null | awk '{print $1}' | xargs)" ;;
+  esac
+else
+  fail "systemd is not PID 1 (is [boot] systemd=true set in /etc/wsl.conf?)"
+fi
+
+if [[ -n ${WSL_DISTRO_NAME:-} || -e /proc/sys/fs/binfmt_misc/WSLInterop || -e /proc/sys/fs/binfmt_misc/WSLInterop-late ]]; then
+  pass "running under WSL${WSL_DISTRO_NAME:+ as '$WSL_DISTRO_NAME'}"
+else
+  warn "not running under WSL (container or chroot?)"
+fi
+
+if [[ -e /proc/sys/fs/binfmt_misc/WSLInterop || -e /proc/sys/fs/binfmt_misc/WSLInterop-late ]]; then
+  pass "Windows interop enabled"
+else
+  warn "Windows interop disabled; Windows Terminal/VS Code theme sync and the bridges are unavailable"
+fi
+
+if mountpoint -q /mnt/c 2>/dev/null; then
+  pass "Windows drive mounted at /mnt/c"
+else
+  warn "/mnt/c is not mounted; Windows theme sync is unavailable"
+fi
+
+if getent hosts archlinux.org >/dev/null 2>&1; then
+  pass "DNS resolution works"
+else
+  fail "cannot resolve archlinux.org (check /etc/resolv.conf and [network] in /etc/wsl.conf)"
+fi
+
+expected_swappiness=$(sed -n 's/^vm.swappiness[[:space:]]*=[[:space:]]*//p' /etc/sysctl.d/99-zz-omarchy-wsl-stability.conf 2>/dev/null | tail -n 1)
+if [[ -n $expected_swappiness && $(sysctl -n vm.swappiness 2>/dev/null) == "$expected_swappiness" ]]; then
+  pass "WSL sysctl tuning applied"
+else
+  warn "WSL sysctl tuning not applied (did systemd-sysctl.service run?)"
+fi
+
+section "WSL integration"
+for file in /usr/lib/wsl/oobe.sh /usr/lib/wsl/omarchy.ico /usr/lib/wsl/terminal-profile.json; do
+  if [[ ! -f $file ]]; then
+    fail "$file missing"
+  elif (($(stat -c %s "$file") >= WSL_FILE_LIMIT)); then
+    fail "$file is $(stat -c %s "$file") bytes; WSL refuses files of 1 MiB or more"
+  else
+    pass "$file ($(stat -c %s "$file") bytes)"
+  fi
+done
+if grep -q '^command[[:space:]]*=[[:space:]]*/usr/lib/wsl/oobe.sh' /etc/wsl-distribution.conf 2>/dev/null; then
+  pass "/etc/wsl-distribution.conf points the OOBE at /usr/lib/wsl/oobe.sh"
+else
+  fail "/etc/wsl-distribution.conf does not point [oobe] command at /usr/lib/wsl/oobe.sh"
+fi
+if [[ -x /usr/lib/omarchy-wsl/install-manifest ]]; then
+  if drift=$(/usr/lib/omarchy-wsl/install-manifest --verify / 2>&1); then
+    pass "every file in the omarchy-wsl manifest is installed"
+  else
+    fail "omarchy-wsl manifest drift: $(printf '%s' "$drift" | head -n 3 | tr '\n' ' ')"
+  fi
+fi
+
+section "User"
+if [[ -n $owner ]]; then
+  pass "owner $owner (uid 1000, groups: $(id -nG "$owner" 2>/dev/null | tr ' ' ','))"
+  if [[ -f /var/lib/systemd/linger/$owner ]]; then
+    pass "lingering enabled (user services and tmux survive closed terminals)"
+  else
+    warn "lingering disabled for $owner"
+  fi
+  if [[ -f /etc/sudoers.d/10-$owner ]]; then
+    pass "sudo rule /etc/sudoers.d/10-$owner"
+  else
+    warn "no /etc/sudoers.d/10-$owner (sudo may be unavailable)"
+  fi
+  default_user=$(awk -F= '/^[[:space:]]*\[/{s=$0} s~/\[user\]/ && $1~/^[[:space:]]*default[[:space:]]*$/ {gsub(/[[:space:]]/,"",$2); print $2}' /etc/wsl.conf 2>/dev/null | tail -n 1)
+  if [[ $default_user == "$owner" ]]; then
+    pass "/etc/wsl.conf [user] default = $owner"
+  else
+    warn "/etc/wsl.conf [user] default is '${default_user:-unset}', expected $owner"
+  fi
+else
+  fail "no user with uid 1000 (run: sudo /usr/lib/wsl/oobe.sh)"
+fi
+
+section "Packages"
+if [[ -s /etc/pacman.d/gnupg/trustdb.gpg ]]; then
+  pass "pacman keyring initialized"
+  if pacman-key --list-keys "$OMARCHY_KEY_FPR" >/dev/null 2>&1; then
+    pass "Omarchy package key $OMARCHY_KEY_FPR trusted"
+  else
+    fail "Omarchy package key missing (sudo pacman-key --populate omarchy)"
+  fi
+else
+  fail "pacman keyring missing (systemctl status omarchy-pacman-init.service)"
+fi
+
+if grep -q '^\[omarchy\]' /etc/pacman.conf 2>/dev/null &&
+  grep -q '^Server[[:space:]]*=[[:space:]]*https://pkgs.omarchy.org/[a-z]*/\$arch' /etc/pacman.conf; then
+  pass "[omarchy] repository configured"
+else
+  fail "[omarchy] repository missing from /etc/pacman.conf"
+fi
+
+if [[ -e /var/lib/pacman/db.lck ]] && ! pgrep -x pacman >/dev/null; then
+  fail "stale pacman lock /var/lib/pacman/db.lck"
+else
+  pass "pacman database unlocked"
+fi
+
+for tool in nvim tmux git mise yay uv node; do
+  if command -v "$tool" >/dev/null; then
+    flag=--version
+    [[ $tool == tmux ]] && flag=-V
+    pass "$tool $("$tool" "$flag" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
+  else
+    fail "$tool not found"
+  fi
+done
+
+section "Omarchy"
+if [[ -d $OMARCHY_PATH/bin ]] && version=$(omarchy-version 2>/dev/null); then
+  pass "Omarchy $version at $OMARCHY_PATH"
+else
+  fail "Omarchy tree missing at $OMARCHY_PATH"
+fi
+
+if [[ -n $owner ]]; then
+  user_home=$(getent passwd "$owner" | cut -d: -f6)
+  theme_state="$user_home/.local/state/omarchy/current"
+  if [[ -r $theme_state/theme.name ]]; then
+    pass "theme for $owner: $(<"$theme_state/theme.name")"
+  elif [[ -d $user_home ]] && [[ ! -r $user_home ]]; then
+    pass "theme state for $owner not readable by $(id -un) (run as $owner to check)"
+  else
+    warn "no theme applied for $owner (run: omarchy theme set \"Tokyo Night\")"
+  fi
+fi
+
+if command -v omarchy-theme-bridge >/dev/null && ((EUID != 0)); then
+  while IFS= read -r line; do
+    case "$line" in
+      ok:*) pass "${line#ok: }" ;;
+      warn:*) warn "${line#warn: }" ;;
+      *) [[ -n $line ]] && fail "$line" ;;
+    esac
+  done < <(omarchy-theme-bridge --check 2>&1)
+fi
+
+printf '\n'
+if ((failures > 0)); then
+  printf '%s%d check(s) failed%s, %d warning(s)\n' "$c_fail" "$failures" "$c_off" "$warnings"
+  exit 1
+fi
+printf '%sAll checks passed%s (%d warning(s))\n' "$c_ok" "$c_off" "$warnings"

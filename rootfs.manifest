@@ -1,0 +1,117 @@
+# rootfs.manifest: the single source of truth for what this repository puts
+# into the Omarchy WSL root filesystem.
+#
+# Read by scripts/install-manifest.sh (make install-pkg / install-rootfs /
+# verify-rootfs), by the omarchy-wsl PKGBUILD (through make install-pkg) and by
+# tests/test_rootfs_manifest.py, which fails when a tracked runtime file is
+# neither installed below nor explicitly excluded (zero repo-vs-image drift).
+#
+# Columns (whitespace separated, no spaces inside fields):
+#   scope   pkg    = owned by the omarchy-wsl package (install-pkg, install-rootfs)
+#           rootfs = machine-level file another package owns (install-rootfs only)
+#   kind    file   = source glob; a destination ending in / keeps the basename,
+#                    otherwise the glob must match exactly one file
+#           config = like file, for admin-editable configuration: verify checks
+#                    presence and mode only, and the omarchy-wsl PKGBUILD must
+#                    list it in backup=() (tests/test_rootfs_manifest.py)
+#           tree   = recursive copy of a directory (regular files, no __pycache__)
+#           link   = symlink; source column is the link target
+#           gen    = generated file; source column names the generator
+#   mode    octal file mode (- for links)
+#   source  path relative to the repository root (globs allowed for kind=file)
+#   dest    absolute path inside the root filesystem
+#
+#   exclude <glob>   tracked files deliberately not installed (build-time
+#                    inputs, tests, development tools)
+#
+# Every glob must match at least one file, so a renamed source fails loudly.
+
+# --- User-facing commands -----------------------------------------------------
+pkg     file  0755  bin/omarchy-*                                   /usr/bin/
+# WSL replacements for upstream commands (installed over upstream's symlinks)
+pkg     file  0755  wsl/overlay/bin/omarchy-*                       /usr/bin/
+pkg     file  0755  tools/omarchy-theme-bridge.py                   /usr/lib/omarchy-wsl/omarchy-theme-bridge.py
+pkg     link  -     /usr/lib/omarchy-wsl/omarchy-theme-bridge.py    /usr/bin/omarchy-theme-bridge
+
+# --- Shared libraries and helpers ---------------------------------------------
+pkg     file  0644  lib/omarchy-wsl-interop.sh                      /usr/lib/omarchy-wsl/interop.sh
+pkg     file  0644  lib/omarchy-wsl-account.sh                      /usr/lib/omarchy-wsl/account.sh
+pkg     file  0644  lib/omarchy-wsl-common.sh                       /usr/lib/omarchy-wsl/common.sh
+pkg     file  0755  lib/omarchy-wsl-migration-gate                  /usr/lib/omarchy-wsl/migration-gate
+pkg     tree  0644  lib/omarchy_theme                               /usr/lib/omarchy-wsl/python/omarchy_theme
+pkg     file  0644  wsl/lib/drvfs-guard.sh                          /usr/lib/omarchy-wsl/drvfs-guard.sh
+pkg     file  0755  wsl/lib/apply-etc-overrides                     /usr/lib/omarchy-wsl/apply-etc-overrides
+pkg     file  0755  wsl/pacman-init.sh                              /usr/lib/omarchy-wsl/pacman-init.sh
+pkg     file  0755  scripts/install-manifest.sh                     /usr/lib/omarchy-wsl/install-manifest
+pkg     file  0644  upstream.lock                                   /usr/share/omarchy-wsl/upstream.lock
+pkg     file  0644  packages/*.packages                             /usr/share/omarchy-wsl/packages/
+# Windows bridges live on a curated PATH directory, never in Windows %PATH%.
+pkg     file  0755  wsl/bin/*                                       /usr/lib/omarchy-wsl/bin/
+
+# --- WSL distribution integration (WslDistributionConfig.cpp reads these) ------
+pkg     file  0755  wsl/oobe.sh                                     /usr/lib/wsl/oobe.sh
+pkg     link  -     /usr/lib/wsl/oobe.sh                            /usr/lib/omarchy-wsl/oobe.sh
+pkg     file  0644  wsl/omarchy.ico                                 /usr/lib/wsl/omarchy.ico
+pkg     file  0644  wsl/terminal-profile.json                       /usr/lib/wsl/terminal-profile.json
+# Template the OOBE copies to /etc/omarchy-user.conf when that file is missing.
+pkg     file  0644  wsl/omarchy-user.conf                           /usr/share/omarchy-wsl/omarchy-user.conf.default
+pkg     config 0644  wsl/wsl-distribution.conf                       /etc/wsl-distribution.conf
+pkg     config 0644  wsl/wsl.conf                                    /etc/wsl.conf
+
+# --- Login environment ----------------------------------------------------------
+pkg     config 0644  wsl/profile.d/*.sh                              /etc/profile.d/
+pkg     config 0644  wsl/cgroups/omarchy-cgroup-profile.sh           /etc/profile.d/60-omarchy-cgroup-governance.sh
+pkg     file  0644  wsl/environment.d/*.conf                        /usr/lib/environment.d/
+
+# --- Kernel, cgroup and systemd policy ------------------------------------------
+pkg     config 0644  wsl/sysctl.d/*.conf                             /etc/sysctl.d/
+pkg     config 0644  wsl/cgroups/build.slice                         /etc/systemd/system/build.slice
+pkg     file  0644  wsl/cgroups/build.slice                         /usr/lib/systemd/user/build.slice
+pkg     config 0644  wsl/cgroups/10-interactive-protection.conf      /etc/systemd/system/user-.slice.d/10-interactive-protection.conf
+pkg     config 0644  wsl/cgroups/10-omarchy-oomd.conf                /etc/systemd/oomd.conf.d/10-omarchy-oomd.conf
+pkg     file  0644  wsl/systemd/*.service                           /usr/lib/systemd/system/
+pkg     file  0644  wsl/systemd/user/*.service                      /usr/lib/systemd/user/
+pkg     config 0644  wsl/systemd/logind.conf.d/*.conf                /etc/systemd/logind.conf.d/
+# Dormant: systemd-resolved is masked in the image (WSL writes resolv.conf).
+pkg     config 0644  wsl/systemd/systemd-resolved.conf.d/*.conf      /etc/systemd/resolved.conf.d/
+pkg     config 0644  wsl/tmpfiles.d/*.conf                           /etc/tmpfiles.d/
+pkg     file  0644  wsl/tmpfiles.d/user/*.conf                      /usr/share/user-tmpfiles.d/
+
+# --- Application configuration --------------------------------------------------
+pkg     config 0644  wsl/docker/daemon.json                          /etc/docker/daemon.json
+pkg     config 0644  wsl/podman/containers.conf                      /etc/containers/containers.conf
+pkg     config 0644  wsl/etc/pulse/client.conf.d/*.conf              /etc/pulse/client.conf.d/
+pkg     config 0644  wsl/etc/alsa/conf.d/*.conf                      /etc/alsa/conf.d/
+pkg     file  0644  wsl/share/nvim/*.lua                            /usr/share/omarchy/nvim/
+pkg     file  0644  wsl/share/tmux/*.conf                           /usr/share/omarchy/tmux/
+pkg     file  0644  assets/notify/*.png                             /usr/share/omarchy/notify/
+pkg     file  0644  wsl/pacman/pacman.conf.*                        /usr/share/omarchy-wsl/pacman/
+pkg     file  0644  wsl/pacman/mirrorlist.*                         /usr/share/omarchy-wsl/pacman/
+pkg     file  0644  wsl/libalpm/hooks/*.hook                        /usr/share/libalpm/hooks/
+# Files omarchy-tenant renders into each guest (sshd, tailscaled, users).
+pkg     file  0644  wsl/tenant/*                                    /usr/share/omarchy-wsl/tenant/
+
+# --- New-user defaults (layered over upstream's config/ in /etc/skel) ------------
+pkg     file  0644  wsl/skel/.config/tmux/tmux.conf                 /etc/skel/.config/tmux/tmux.conf
+pkg     file  0644  wsl/skel/.config/nvim/plugin/*.lua              /etc/skel/.config/nvim/plugin/
+pkg     file  0644  wsl/skel/.config/omarchy/wsl.env                /etc/skel/.config/omarchy/wsl.env
+
+# --- Identity and provenance ---------------------------------------------------------
+pkg     gen   0644  os-release                                      /usr/share/omarchy-wsl/etc-overrides/os-release
+pkg     gen   0644  omarchy-wsl-release                             /etc/omarchy-wsl-release
+rootfs  gen   0644  os-release                                      /etc/os-release
+
+# --- Documentation and Windows-side helpers ---------------------------------------
+pkg     file  0644  LICENSE                                         /usr/share/licenses/omarchy-wsl/LICENSE
+pkg     file  0644  README.md                                       /usr/share/doc/omarchy-wsl/
+pkg     file  0644  docs/*.md                                       /usr/share/doc/omarchy-wsl/
+pkg     file  0644  wsl/wslconfig.example                           /usr/share/doc/omarchy-wsl/wslconfig.example
+pkg     file  0644  tools/*.ps1                                     /usr/share/omarchy-wsl/windows/
+pkg     file  0644  tools/*.reg                                     /usr/share/omarchy-wsl/windows/
+pkg     file  0644  bin/sync-theme.ps1                              /usr/share/omarchy-wsl/windows/sync-theme.ps1
+
+# --- Deliberately not installed ------------------------------------------------------
+exclude wsl/keys/*
+exclude tools/generate-notify-icons.py
+exclude assets/*.svg
+exclude wsl/etc-overrides/*

@@ -1,152 +1,93 @@
-# Omarchy-WSL Distribution Engine: Adversarial Rootfs & Supply-Chain Audit
+# Omarchy WSL: supply-chain, root filesystem and runtime audit
 
-**Target:** Turnkey, Reproducible, Public-Distributable `.wsl` Rootfs Package  
-**Target Footprint:** < 800 MB (Compressed Archive) with Full Omarchy Core Toolchains  
-**Scope:** Rootfs Sanitization, Attack Surface Analysis, Keyring Determinism, Multi-Stage Architecture, and Supply-Chain Hardening  
-**Status:** Verified & Remediated  
+**Scope:** the `.wsl` images built from this repository (Basecamp Omarchy
+v4.5.0, arm64 and x86_64), the build pipeline that produces them, and the
+Windows/Linux runtime tools they ship.
+**Method:** every claim below is enforced by a script or test in this
+repository and named next to the claim. Nothing here is a one-off manual
+finding. Run `make test` (or `make test-container`) and
+`scripts/build-reproducible-rootfs.sh <arch> --verify-determinism --self-test-leak`
+followed by `scripts/smoke-test-image.sh dist/<asset>` to reproduce it.
 
----
+## 1. Threat model
 
-## 1. Executive Summary & Adversarial Threat Model
+| Risk | Where it would come from | Control |
+|------|--------------------------|---------|
+| Tampered base system | Stage 0 rootfs download | HTTPS only, plus a detached signature checked with `gpgv` against a vendored key whose fingerprint is pinned in `upstream.lock` (`Containerfile`, stages `rootfs-arm64` and `rootfs-amd64`) |
+| Tampered Omarchy packages | `[omarchy]` (unsigned database) | `SigLevel = Required DatabaseOptional`, HTTPS-only server, the pinned key `40DFB630…C571` trusted before the first sync (`build/01-bootstrap.sh`); every Omarchy-published package must resolve to `[omarchy]` (`build/02-omarchy-repo.sh`) |
+| Tampered upstream source | GitHub fetch of Omarchy | exact commit `a948d8a6…`, re-checked with the sha256 makepkg uses for git sources (`build/03-omarchy-wsl.sh`, PKGBUILD `prepare()`) |
+| Builder secrets in the image | build context, build users | `.dockerignore`; build-only user removed; `scripts/strip-rootfs.sh` scrubs credentials in every home; `tests/audit-rootfs-leaks.sh` runs on the exact tree that is archived and fails closed |
+| Shared machine identity | baked `machine-id`, keyring, SSH host keys | empty `/etc/machine-id`; no `/etc/pacman.d/gnupg` (created per install on first boot); no SSH host keys, random seed, `resolv.conf` or `hostname` (audit) |
+| Lost permissions or capabilities | archiving on a non-Linux host | archives are normalised as root inside a Linux container (`scripts/normalize-rootfs.sh`); setuid `sudo`, sticky `/tmp`/`/var/tmp`, numeric owners and `security.capability` are asserted on synthetic and real images |
+| Silent drift between repository and image | hand-maintained COPY lists | `rootfs.manifest` is the only install list; `tests/test_rootfs_manifest.py` fails on any uninstalled runtime file; the image verifies itself against the recorded sha256/mode (`make verify-rootfs`, `omarchy-doctor`) |
 
-Distributing a public Linux rootfs or `.wsl` package introduces severe supply-chain and information-leakage risks that do not exist in traditional cloud container images. When a `.wsl` file or rootfs tarball is published to public mirrors, GitHub Releases, or corporate environments:
+## 2. Build-time gates (the image does not build if one fails)
 
-1. **Host De-Anonymization & Secret Harvesting:** Any credential, SSH private key, shell history file, cloud token, or builder identity baked into the filesystem becomes instantly accessible to every downstream consumer.
-2. **Cryptographic Entropy & Machine-ID Collisions:** Distributing an image with a non-empty `/etc/machine-id` or baked `/var/lib/systemd/random-seed` compromises D-Bus session isolation, DHCP network allocations, systemd journal clustering, and initial cryptographic randomness across all host machines running the distribution.
-3. **Offline Boot Denial of Service (Pacman Keyring Failure):** Arch Linux relies on GnuPG Web-of-Trust validation for package signatures. Uninitialized or improperly configured keyrings cause `pacman` and `pacman-key --populate` to fail or hang on clean systems without internet or on fresh boots, breaking the operating system on day 1.
-4. **Host Mount Bleed & Unbounded Image Bloat:** WSL2 injects host GPU drivers into `/usr/lib/wsl` (1.9 GB) and provides the guest Linux kernel outside the container rootfs. Packaging kernel binaries, firmware, host driver mounts, and unpruned fonts easily balloons rootfs archives past 5–10 GB uncompressed and >1.5 GB compressed.
+| Gate | Script |
+|------|--------|
+| Stage 0 signature + pinned key fingerprint | `Containerfile` |
+| Pinned Omarchy key imported and locally signed before any sync | `build/01-bootstrap.sh` |
+| Omarchy packages come from `[omarchy]`; `omarchy-keyring` carries the pinned key; `yay`/`mise` are native binaries | `build/02-omarchy-repo.sh` |
+| Upstream tree checksum; `make verify-rootfs` after `make install-rootfs`; `omarchy-version` equals the lock | `build/03-omarchy-wsl.sh` |
+| `/etc/os-release` branded and not a symlink | `build/04-configure-wsl.sh` |
+| `omarchy-theme-set` works against upstream's headless mode; bridge round-trip keeps comments; `terminal-profile.json` matches the bridge; WSL 1 MiB file limit; `systemd-analyze verify` reports no unknown key on any shipped unit; gcc links | `build/05-verify.sh` |
+| Shipped `pacman.conf` keeps the sandbox, `NoExtract` only under `[options]` | `build/99-cleanup.sh` |
+| Leak and integrity audit on the archived tree, fail closed | `scripts/normalize-rootfs.sh` → `tests/audit-rootfs-leaks.sh` |
+| Archive under 800 MiB; optional byte-identical second normalisation and seeded-leak self-test | `scripts/build-reproducible-rootfs.sh` |
 
-This audit establishes the **exact multi-stage container build and stripping methodology** to guarantee a **zero-leak, deterministically reproducible, strictly <800MB public distribution artifact**.
+## 3. Image gates (on the shipped `.wsl`, in CI and by hand)
 
----
+`scripts/smoke-test-image.sh` imports the archive itself and checks:
+- `pacman -Sy` with the shipped sandbox (Landlock + `DownloadUser = alpm`);
+- a C program compiles and links;
+- `sudo` is 4755, and `/tmp` and `/var/tmp` are 1777;
+- file capabilities survive (`newuidmap` keeps `cap_setuid`), and unprivileged ping works;
+- `/usr/lib/wsl/oobe.sh --headless --user devuser` creates uid 1000 with a valid sudo rule, linger and the default user, and a re-run is a no-op;
+- `omarchy-version`, the full manifest and `pacman -Qkk omarchy-wsl` all pass;
+- `systemd-analyze verify` of `build.slice` reports no unknown key;
+- `omarchy-wsl` is the only foreign package, and root is locked without a hash.
 
-## 2. Adversarial Vulnerability Matrix & Live-System Findings
+`release.yml` adds per-path archive checks (required files present; runtime,
+keyring, credential and home paths absent; `sudo`, `/tmp`, `/var/tmp` modes),
+`actions/attest@v4` SLSA build provenance per asset, and a keyless cosign
+bundle over `SHA256SUMS`.
 
-During the live adversarial inspection of active WSL and containerized Arch environments, seven distinct vulnerability classes and leak vectors were evaluated and audited:
+## 4. Remediation of the earlier audit
 
-| # | Vulnerability Class | Live Probe Finding | Threat & Blast Radius | Remediation Strategy |
-|---|---------------------|--------------------|-----------------------|----------------------|
-| **V1** | **Host Secret & History Leakage** | Active SSH keys in `/home/*/.ssh`, Claude tokens in `~/.claude`, bash history files | High. Direct compromise of builder infrastructure, API keys, and personal credentials. | Strict `.dockerignore`, isolated build context, and recursive `strip-rootfs.sh` scrubbing. |
-| **V2** | **Ephemeral Build-User Escalation** | `builder` / `makepkg` users left in `/etc/passwd`, `/etc/shadow`, and `/etc/sudoers.d` | High. Unprivileged build users with passwordless sudo remain active in public images. | Multi-stage isolation: AUR compilation in discarded stage; purge all temporary users. |
-| **V3** | **Shared Machine ID & Random Seed** | `/etc/machine-id` populated with static 32-hex ID (`b25a9346...`); random-seed present | Critical. DHCP collisions, D-Bus session hijacking, deterministic PRNG state at boot. | `truncate -s 0 /etc/machine-id` (0 bytes); purge `/var/lib/systemd/random-seed`. |
-| **V4** | **Keyring Offline Initialization Failure** | `S.gpg-agent*` sockets present in `/etc/pacman.d/gnupg`; clock-skew rejections | High. `pacman-key` fails offline or hangs on stale sockets; `pacman -S` bricks on first run. | Build-time offline pre-population; socket purge via `gpgconf --kill all`; fallback time clamping. |
-| **V5** | **WSL Host Driver Mount Bleed** | `/usr/lib/wsl/drivers` & `lib` mount 1.9 GB of Windows host DirectX binaries | Medium. Distro packages accidentally archive Windows host binaries; breaks non-Windows targets. | Containerfile isolated export (`FROM scratch`); avoid archiving live WSL mounts. |
-| **V6** | **Package Cache & Stale Locks** | 85 MB+ to 3 GB in `/var/cache/pacman/pkg`; potential `/var/lib/pacman/db.lck` | Medium. Massive image bloat; stale lock files block pacman operations upon import. | `rm -rf /var/cache/pacman/pkg/*` and enforce `NoExtract` in `/etc/pacman.conf`. |
-| **V7** | **Font & Doc Bloat** | `ttf-jetbrains-mono-nerd` (231.9 MB), docs/locales (450 MB+) | Low (Footprint). Pushes compressed image past 1 GB, violating the 800 MB distribution ceiling. | Prune font variants to regular weight; drop man/docs/locales via `NoExtract`. |
+The previous version of this file claimed "Verified & Remediated". Several of
+those claims were not true: no Omarchy was installed, the `[omarchy-wsl]`
+repository did not exist, static archives were deleted so gcc could not link,
+the export flattened setuid bits, the slice units used invalid keys, and the
+test counts were hard-coded. The table maps every finding of the 2026-11
+audits to its resolution.
 
----
+| Area | Findings | Resolution | Proof |
+|------|----------|------------|-------|
+| Image contents | Omarchy never installed; about 30 runtime files never copied; dead `[omarchy-wsl]` repository; `wsl-distribution.conf` pointing at missing files; no `.ico` | `omarchy-wsl` package (upstream v4.5.0 + WSL layer) owns every file through `rootfs.manifest`; `[omarchy]` replaces the dead repository; `/usr/lib/wsl/{oobe.sh,omarchy.ico,terminal-profile.json}` | `tests/test_rootfs_manifest.py`, `build/05-verify.sh`, smoke test |
+| Base and trust | plain-HTTP, unverified ALARM tarball; floating `archlinux:base-devel`; `alarm` user on uid 1000; root password `root`; AUR builds at floating HEAD; `NoExtract` appended into `[aur]` | signed Stage 0 rootfs over HTTPS; board packages, `/boot` and `alarm` removed; root locked with `!*`; prebuilt `yay`/`mise-bin`/`omarchy-nvim` from `[omarchy]`; upstream pacman templates | `tests/test_upstream_lock.py`, audit integrity checks |
+| Sanitiser and export | `libc_nonshared.a`/libgcc deleted; `.config/gh` never matched; docs of the image deleted; re-tar flattened setuid, sticky bits and ownership; `stat` fallback broke the size check; audit hard-coded one home | rewritten `strip-rootfs.sh`; normalisation as root in a Linux container with the deterministic GNU tar recipe; audit over every home with integrity checks and a seeded-leak self-test | `tests/test_build_pipeline.sh`, `--verify-determinism`, `--self-test-leak` |
+| CI | build script bypassed; OR-grep archive check; wrong asset names; no tests run; release job permissions too broad | `release.yml` runs the strict suites, the reproducible build, per-path checks, smoke gates, attestations and signing, with least-privilege jobs; `ci.yml` on pull requests | workflow files |
+| OOBE and accounts | interrupted OOBE exited 0; prompts captured by `$(...)`; renames uid 1000 back; `--user` renames the owner; `%wheel NOPASSWD`; `passwd -d`; locale-dependent transliteration; `--require-password` ignored; unbounded sync calls; no lock | prompts on `/dev/tty`; INT/TERM/HUP exit 128+n; the owner is uid 1000 (a re-run is a no-op, a different `--user` is refused with exit 3 and a pointer to `omarchy-rename-owner`); owner-only sudo rule, no `%wheel NOPASSWD`, every drop-in through `visudo`; `passwd -l`, never `-d`; NFKD + table transliteration identical on glibc and macOS; `--require-password` honoured; bounded sync calls; `flock`; shared `lib/omarchy-wsl-account.sh`; journaled, rollback-safe `omarchy-rename-owner` (see `docs/OOBE-SPECIFICATION.md`) | `tests/test_oobe_adversarial.sh`, `tests/unit/test_oobe_adversarial.py`, `tests/test_rename_owner.sh` |
+| Build governance | `systemd-run --property=MemoryOOMGroup=yes` made `omarchy-build` exit 1; `-j`/`PATH` never reached the unit; invalid `[Slice]` keys; virtiofs bypassed the DrvFs guard; power governor halved builds on battery-less mini-PCs | `systemd-run --user --scope` with valid properties (the scope inherits the computed `-j` and `PATH`), only valid `[Slice]` keys, the shared DrvFs check (virtiofs included), battery detection fixed, failed Windows queries negative-cached | `tests/test_build_governance.sh`, `systemd-analyze` gate |
+| Bridges and network tools | stale `$WSL_INTEROP` never healed; ssh-agent lock fd leaked into socat; proxy value written unquoted into `profile.d`; CA sync interpolated a Linux path into PowerShell and trusted broad name matches; DNS state `source`d as root; mirror ranking overwrote the list with blank servers; `netdoctor --repair` called an undefined function; migration gate aborted on the first pending migration; theme backups not locked | `omw_fix_interop` swaps a dead `$WSL_INTEROP` for the newest live socket; lock fd closed before socat; proxy values grammar-checked and single-quoted (hostile values exit 3); CA sync reads `LocalMachine\Root` by SHA-256, honours Disallowed and prunes; DNS sync validates IPs, parses state, never adds public resolvers unless asked; mirror ranking never writes an empty list; `netdoctor --repair` works; migration gate counts with `$((n + 1))`; theme writes are lock-protected (12×15 concurrent syncs lose nothing). Details: `docs/WINDOWS-INTEGRATION-QOL.md`, `docs/WSL-NETWORKING-AND-DNS-ADVERSARIAL-REVIEW.md`, `docs/THEME-ENGINE.md` | `tests/test_windows_integration.sh`, `tests/test_networking_adversarial.sh`, `tests/test_network_sync.sh`, `tests/test_migration_gate.sh`, pytest theme suites |
+| Windows side | `.wslconfig` generator overwrote the file, put `hostAddressLoopback`/`ignoredPorts` in `[wsl2]`, never set `instanceIdleTimeout`; `.sh` generator sized from guest RAM; `install.ps1` used `exit` under `irm \| iex`; winget manifest used a non-existent `InstallerType: wsl`; `sync-theme.ps1` replaced profiles named like schemes | Server profile with both idle timeouts and a merge-not-overwrite writer; `.sh` generator removed; autostart task script; `install.ps1` throws/returns and verifies `SHA256SUMS`; `distributions/DistributionInfo.fragment.json` replaces winget; structural theme upsert | `tests/test_windows_tools.ps1`, `tests/test_memory_governance.py`, PowerShell parse gate |
+| Isolation | interop and DrvFs are per distribution, not per Linux user, so "restrict interop to a group" is not implementable | `omarchy-tenant` gives guests a real boundary (user namespace, private network, cgroup egress filter, no WSL mounts) | `tests/test_tenant.sh`, `docs/MULTI-TENANT-ISOLATION.md` |
 
-## 3. Deep-Dive: Pacman Keyring Determinism & Offline Boot Mechanics
+## 5. Known limits
 
-### 3.1 Root Causes of Keyring Failures in Clean / Offline Environments
-In Arch Linux and Arch Linux ARM (ALARM), `pacman-key --populate` relies on a multi-step sequence:
-1. **Master Key Generation (`pacman-key --init`):** Invokes `gpg --homedir /etc/pacman.d/gnupg` to generate a local ED25519 signing key. On early boot or inside minimal containers, `/dev/random` entropy may be starved, causing GPG to block indefinitely.
-2. **Architecture Mismatch:** On ARM64 (`aarch64`), Arch Linux ARM maintainer keys reside in `archlinuxarm.gpg` (package `archlinuxarm-keyring`), whereas x86_64 uses `archlinux.gpg` (package `archlinux-keyring`). Invoking the wrong keyring exits with code 1 (`The keyring file does not exist`).
-3. **Dead Sockets (`S.gpg-agent*`):** When GPG operations execute during container builds, GnuPG spawns a background agent and creates domain sockets (`S.gpg-agent`, `S.gpg-agent.ssh`). If these sockets are archived into the rootfs, subsequent GPG invocations on the target machine attempt to connect to a dead socket descriptor, resulting in:
-   ```text
-   gpg: can't connect to the agent: Connection refused
-   gpg: error communicating with the agent: Broken pipe
-   ```
-4. **Clock-Skew Rejection:** WSL2 instances on fresh boot or systems with uninitialized hardware RTCs may initialize with an epoch timestamp (e.g. 1970-01-01 or early 2024). When GPG attempts to verify signatures from keyrings created in 2025/2026, it rejects them with `KEYEXPIRED` or `SIG_CREATED_IN_FUTURE`.
-
-### 3.2 The Zero-Failure Keyring Specification
-To guarantee 100% reliability both offline and online:
-- **Build-Time Pre-Population:** The multi-stage build pre-initializes and pre-populates the local master keyring using `/usr/share/pacman/keyrings/archlinux*.gpg` and `/usr/share/pacman/keyrings/omarchy.gpg`.
-- **Socket and Lock Purging:** After pre-population, all background agents are terminated via `gpgconf --kill all`, and all socket/lock files are forcibly purged:
-  ```bash
-  rm -f /etc/pacman.d/gnupg/S.* /etc/pacman.d/gnupg/*.lock
-  chmod 700 /etc/pacman.d/gnupg
-  find /etc/pacman.d/gnupg -type f -exec chmod 600 {} +
-  ```
-- **Offline GPG Configuration:** `/etc/pacman.d/gnupg/gpg.conf` is explicitly pinned with:
-  ```ini
-  no-greeting
-  no-permission-warning
-  keyserver-options timeout=5
-  no-auto-key-retrieve
-  ```
-- **Runtime Idempotency Guard (`pacman-init.sh`):** A systemd one-shot service (`omarchy-pacman-init.service`) and `oobe.sh` check `[[ -s /etc/pacman.d/gnupg/trustdb.gpg ]]`. If present, it exits 0 immediately in <2ms. If missing, it checks `date +%s`; if the clock is desynchronized, it clamps the timestamp to a sane baseline (`$SOURCE_DATE_EPOCH`) before invoking `pacman-key`.
-
----
-
-## 4. Image Footprint Engineering: Keeping Compressed Rootfs Under 800MB
-
-Standard desktop Omarchy installations consume **~13 GB uncompressed** and >3 GB compressed due to Wayland compositors (Hyprland), office suites (LibreOffice), video editors (Kdenlive), and desktop browsers (Chromium). In WSL, developers require fast CLI toolchains, Neovim, terminal customization, and compilers.
-
-### 4.1 Footprint Breakdown & Pruning Strategy
-| Layer / Component | Default Arch / Omarchy Size | Pruned / Sanitized Size | Savings | Implementation Method |
-|-------------------|----------------------------|-------------------------|---------|-----------------------|
-| **Linux Kernel & Firmware** | `linux` + `linux-firmware` (~950 MB) | **0 MB** (Excluded) | **950 MB** | Excluded from packages; WSL uses host Windows kernel. |
-| **Locales & Translations** | `/usr/share/locale` (260 MB) | **12 MB** (en_US only) | **248 MB** | `NoExtract` in `pacman.conf` + find/delete. |
-| **Manpages & Docs** | `/usr/share/doc`, `man`, `info` (215 MB) | **0 MB** | **215 MB** | `NoExtract` in `pacman.conf` + `tldr` CLI replacement. |
-| **Font Family Bloat** | `ttf-jetbrains-mono-nerd` (231.9 MB) | **18 MB** (Regular only) | **213.9 MB** | Retain only regular Nerd Font variants; Terminal uses host fonts. |
-| **Pacman Package Cache** | `/var/cache/pacman/pkg` (1–3 GB) | **0 MB** | **1–3 GB** | `rm -rf /var/cache/pacman/pkg/*` after build. |
-| **Build Artifacts & PyCache**| `__pycache__`, static `.a` libs (120 MB)| **0 MB** | **120 MB** | Recursive prune of `.pyc` and unneeded static libraries. |
-| **Total Uncompressed Size** | **~5.8 GB** | **~2.4 GB** | **~3.4 GB** | |
-| **Total Compressed (`.wsl`)**| **~1.45 GB** | **~620 MB** | **~830 MB** | **Strictly under 800 MB budget** (Passes gate). |
-
-### 4.2 Pacman `NoExtract` Configuration
-In `/etc/pacman.conf`, the following directive prevents documentation and non-English locales from ever hitting disk during installation or subsequent user upgrades:
-```ini
-NoExtract = usr/share/help/* usr/share/doc/* usr/share/gtk-doc/* usr/share/info/* usr/share/locale/* !usr/share/locale/en* !usr/share/locale/locale.alias
-```
-
----
-
-## 5. Multi-Stage Container Architecture
-
-The production pipeline utilizes a 5-stage architecture (`Containerfile`):
-
-```text
-[Stage 0: arm64-bootstrap]  --> Unpack official ArchLinuxARM-aarch64-latest.tar.gz via Alpine (sha256 checked)
-                                  │
-[Stage 1: builder-aur]      ──┼─> Unprivileged user (UID 1001), compiles yay-bin & mise-bin
-                                  │   Outputs strictly *.pkg.tar.zst to /packages; stage DISCARDED
-                                  │
-[Stage 2: rootfs-assembly]  ──┼─> Base Arch system + NoExtract rules + core packages + AUR packages
-                                  │   Injected WSL configurations, systemd masks, offline keyring init
-                                  │
-[Stage 3: sanitizer]        ──┼─> Executes /tmp/strip-rootfs.sh:
-                                  │   - Purge caches, build users, SSH keys, history
-                                  │   - Zero /etc/machine-id, purge random seeds
-                                  │   - Kill GPG agents, prune sockets, clamp timestamps to SOURCE_DATE_EPOCH
-                                  │
-[Stage 4: final]            ────> FROM scratch; COPY --from=sanitizer / /
-                                  Exports pristine, single-layer rootfs archive
-```
-
-### Key Security Properties:
-- **Build User Isolation:** The unprivileged `builder` user, sudo rules, Git source checkouts, Go build caches, and Rust target artifacts exist strictly in Stage 1 and are completely omitted from the final rootfs.
-- **Supply-Chain Digest Pinning:** All base images are pinned to immutable digests.
-- **Zero Host Bleed:** Exporting from a clean container image guarantees that runtime mounts from the build host (`/usr/lib/wsl`, `/mnt/c`, etc.) can never bleed into the archive.
-
----
-
-## 6. Reproducible Build & Sanitization Pipeline
-
-The complete build harness is implemented across four core scripts in the repository:
-
-1. **`Containerfile`:** Multi-stage dual-architecture build definition.
-2. **`scripts/strip-rootfs.sh`:** Deep adversarial sanitization engine.
-3. **`scripts/build-reproducible-rootfs.sh`:** Top-level build pipeline enforcing `SOURCE_DATE_EPOCH`, deterministic archive generation (`--sort=name`, `--numeric-owner`, `--mtime`), and automated leak assertions.
-4. **`tests/audit-rootfs-leaks.sh`:** Standalone validation harness to verify zero-leak compliance on any candidate rootfs.
-
-### 6.1 Execution Verification
-To build and audit the public distribution artifact:
-```bash
-# Execute reproducible build for ARM64 or AMD64
-./scripts/build-reproducible-rootfs.sh arm64
-
-# Audit extracted rootfs against all adversarial leak tests
-./tests/audit-rootfs-leaks.sh /path/to/extracted/rootfs
-```
-
----
-
-## 7. Audit Conclusion & Production Readiness Verdict
-
-The implementation resolves all identified supply-chain vulnerabilities, information leaks, and performance bottlenecks:
-- **Zero-Leak Compliance:** 100% verified. Zero host SSH keys, zero build-user accounts, zero shell histories, zero stale GPG sockets.
-- **Deterministic Identity:** `/etc/machine-id` is strictly 0 bytes (ready for systemd firstboot auto-generation); random-seed is completely excised.
-- **Keyring Resilience:** Fully populated offline local keyring; zero network dependency during fresh boot or OOBE provisioning.
-- **Footprint Budget:** Pruned rootfs achieves **~620 MB compressed** (`.wsl`), safely below the **800 MB** hard limit while delivering the complete Omarchy CLI developer experience (`neovim`, `gcc`, `python`, `nodejs`, `mise`, `yay`, `tmux`, `fastfetch`, `starship`).
+- A live `wsl --install --from-file` on Windows (registration, Start menu
+  entry, Windows Terminal profile, first-launch OOBE prompts) is not exercised
+  by CI. The container smoke test runs the same OOBE headless inside the built
+  Arch image (real `useradd`, `visudo`, linger); the suites' real-root tier
+  runs on the Ubuntu test image.
+- The x86_64 image is built and gated by `release.yml` on a native x86_64
+  runner. The arm64 image is additionally built and smoke-tested on native
+  arm64 hardware.
+- `omarchy-tenant`'s generated isolation profile is unit-tested (rendered
+  files, argv, refusal paths). A booted tenant with live egress tests is
+  future work (`docs/MULTI-TENANT-ISOLATION.md`).
+- Builds are deterministic for a given export, not across days: the Arch and
+  `[omarchy]` repositories roll forward.
+- WSL interop and DrvFs are per distribution. Every Linux account in the
+  distribution can call Windows programs as the Windows user and read the
+  Windows profile (files are 0744); use `omarchy-tenant` for untrusted users.

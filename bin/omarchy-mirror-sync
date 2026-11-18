@@ -1,175 +1,225 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Omarchy WSL: Ping-less Resilient Mirror Ranking & Sync Engine
+# Omarchy WSL: ICMP-free Mirror Ranking
 # /usr/bin/omarchy-mirror-sync
 # ==============================================================================
-# Safe for corporate networks and VPNs that block ICMP echo (ping) packets.
-# Probes HTTP/HTTPS headers directly with a strict 3-second connect timeout.
-# Guarantees /etc/pacman.d/mirrorlist is NEVER wiped or left empty.
+# Ranks pacman mirrors with HTTPS HEAD requests (3 s connect / 5 s total per
+# mirror) instead of ping, which corporate networks and VPNs often drop.
+#
+# Candidates (HTTPS only; plain-http mirrors and os.archlinuxarm.org, whose
+# certificate does not match, are not used):
+#   aarch64: https://arm-stable-mirror.omarchy.org/$arch/$repo first, then the
+#            Arch Linux ARM HTTPS mirrors.
+#   x86_64:  https://stable-mirror.omarchy.org/$repo/os/$arch first, then
+#            geo.mirror.pkgbuild.com and other HTTPS Arch mirrors.
+# The Omarchy mirror stays first whenever it answers (it serves the package
+# set Omarchy releases are tested against); the others follow by latency.
+#
+# Safety: a probe counts only when curl exits 0 and prints a numeric time. A
+# mirrorlist is written only if it contains at least one valid https Server
+# line; otherwise the existing file is kept untouched (exit 1). The previous
+# list is kept as mirrorlist.bak; the write is an atomic rename.
+#
+# Commands: rank|sync (default), status|check, restore-default.
+# Test seams: OMARCHY_MIRRORLIST, OMARCHY_MIRROR_ARCH, OMARCHY_MIRROR_TEMPLATES.
 # ==============================================================================
 
 set -euo pipefail
 
-MIRRORLIST="/etc/pacman.d/mirrorlist"
+MIRRORLIST="${OMARCHY_MIRRORLIST:-/etc/pacman.d/mirrorlist}"
 BACKUP_MIRRORLIST="${MIRRORLIST}.bak"
-DEFAULT_TEMPLATES="/usr/share/omarchy-wsl/pacman"
+DEFAULT_TEMPLATES="${OMARCHY_MIRROR_TEMPLATES:-/usr/share/omarchy-wsl/pacman}"
+MAX_ACTIVE="${OMARCHY_MIRROR_MAX:-6}"
 
-ARCH="$(uname -m)"
+ARCH="${OMARCHY_MIRROR_ARCH:-$(uname -m)}"
 case "$ARCH" in
-  aarch64) ARCH_DIR="aarch64" ;;
-  x86_64)  ARCH_DIR="x86_64" ;;
-  *)       ARCH_DIR="x86_64" ;;
+  aarch64|arm64) ARCH_DIR="aarch64" ;;
+  *) ARCH_DIR="x86_64" ;;
 esac
 
-log() { echo -e "\e[32m[omarchy-mirror-sync]\e[0m $*"; }
-warn() { echo -e "\e[33m[omarchy-mirror-sync:WARN]\e[0m $*"; }
-err() { echo -e "\e[31m[omarchy-mirror-sync:ERROR]\e[0m $*"; }
+if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+  log() { printf '\e[32m[omarchy-mirror-sync]\e[0m %s\n' "$*" >&2; }
+  warn() { printf '\e[33m[omarchy-mirror-sync:WARN]\e[0m %s\n' "$*" >&2; }
+  err() { printf '\e[31m[omarchy-mirror-sync:ERROR]\e[0m %s\n' "$*" >&2; }
+else
+  log() { printf '[omarchy-mirror-sync] %s\n' "$*" >&2; }
+  warn() { printf '[omarchy-mirror-sync:WARN] %s\n' "$*" >&2; }
+  err() { printf '[omarchy-mirror-sync:ERROR] %s\n' "$*" >&2; }
+fi
 
-# Candidate test endpoints for latency and reachability verification
 get_candidates() {
   if [[ "$ARCH_DIR" == "aarch64" ]]; then
-    cat << 'EOF'
-http://os.archlinuxarm.org/$arch/$repo
+    cat <<'EOF'
+https://arm-stable-mirror.omarchy.org/$arch/$repo
 https://fl.us.mirror.archlinuxarm.org/$arch/$repo
 https://de.mirror.archlinuxarm.org/$arch/$repo
-https://sg.mirror.archlinuxarm.org/$arch/$repo
 https://dk.mirror.archlinuxarm.org/$arch/$repo
-http://mirror.archlinuxarm.org/$arch/$repo
+https://sg.mirror.archlinuxarm.org/$arch/$repo
 EOF
   else
-    cat << 'EOF'
+    cat <<'EOF'
+https://stable-mirror.omarchy.org/$repo/os/$arch
 https://geo.mirror.pkgbuild.com/$repo/os/$arch
 https://mirrors.kernel.org/archlinux/$repo/os/$arch
 https://mirror.rackspace.com/archlinux/$repo/os/$arch
 https://america.mirror.pkgbuild.com/$repo/os/$arch
 https://europe.mirror.pkgbuild.com/$repo/os/$arch
 https://asia.mirror.pkgbuild.com/$repo/os/$arch
-https://archlinux.thaller.ws/$repo/os/$arch
-https://mirror.osbeck.com/archlinux/$repo/os/$arch
-http://geo.mirror.pkgbuild.com/$repo/os/$arch
 EOF
   fi
 }
 
+# A Server URL pacman can use: https, a host name, $repo and $arch templates.
+valid_server_url() {
+  local re='^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~$-]+)+$'
+  [[ "$1" =~ $re ]] && [[ "$1" == *'$repo'* && "$1" == *'$arch'* ]]
+}
+
+is_pinned() { [[ "$1" == https://*stable-mirror.omarchy.org/* ]]; }
+
+probe_url() {
+  local u="${1//\$arch/$ARCH_DIR}"
+  u="${u//\$repo/core}"
+  printf '%s/core.db\n' "$u"
+}
+
+# probe_mirror <template> -> prints latency in microseconds, or fails.
 probe_mirror() {
-  local template_url="$1"
-  # Substitute placeholders with core repo to test actual HTTP response
-  local test_url
-  if [[ "$ARCH_DIR" == "aarch64" ]]; then
-    test_url="${template_url//\$arch/aarch64}"
-    test_url="${test_url//\$repo/core}/core.db"
-  else
-    test_url="${template_url//\$repo/core}"
-    test_url="${test_url//\$arch/x86_64}/core.db"
+  local out rc=0 t sec frac
+  out=$(curl -s -f -I -L --proto '=https' --connect-timeout 3 --max-time 5 \
+          -w '%{time_total}\n' -o /dev/null "$(probe_url "$1")" 2>/dev/null) || rc=$?
+  (( rc == 0 )) || return 1
+  t="${out%%$'\n'*}"         # first line only
+  t="${t//,/.}"
+  [[ "$t" =~ ^([0-9]+)(\.([0-9]+))?$ ]] || return 1
+  sec="${BASH_REMATCH[1]}"
+  frac="${BASH_REMATCH[3]:-0}000000"
+  printf '%d\n' "$(( 10#$sec * 1000000 + 10#${frac:0:6} ))"
+}
+
+# render_list <header> <active-url>... : prints a mirrorlist.
+render_list() {
+  local header="$1" url
+  shift
+  echo "# =============================================================================="
+  echo "# Omarchy WSL mirrorlist ($ARCH_DIR) - $header"
+  echo "# Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ') by omarchy-mirror-sync"
+  echo "# =============================================================================="
+  for url in "$@"; do
+    echo "Server = $url"
+  done
+}
+
+# install_list <file>: refuse a list without a valid Server line; atomic swap.
+install_list() {
+  local tmp="$1" valid=0 line url
+  while IFS= read -r line; do
+    [[ "$line" =~ ^Server[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    url="${BASH_REMATCH[1]}"
+    if ! valid_server_url "$url"; then
+      err "Generated list contains an invalid Server line ('$url'); keeping $MIRRORLIST."
+      return 1
+    fi
+    valid=$((valid + 1))
+  done <"$tmp"
+  if (( valid == 0 )); then
+    err "Generated list has no valid Server line; keeping $MIRRORLIST."
+    return 1
   fi
-
-  # Probe with curl: HEAD request, follow redirects, 3s connect timeout, 5s total
-  local latency
-  latency=$(curl -s -f -I -L \
-    --connect-timeout 3 \
-    --max-time 5 \
-    -w "%{time_total}\n" \
-    -o /dev/null \
-    "$test_url" 2>/dev/null || echo "999")
-
-  echo "$latency"
+  mkdir -p -- "$(dirname "$MIRRORLIST")"
+  [[ -f "$MIRRORLIST" ]] && cp -f -- "$MIRRORLIST" "$BACKUP_MIRRORLIST"
+  chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$MIRRORLIST"
 }
 
 rank_mirrors() {
-  log "Probing candidate mirrors via ping-less HTTPS/HTTP handshakes (Architecture: $ARCH)..."
-
-  local results=()
-  local tmp_rank
+  local candidate latency pinned="" tmp_rank tmp_dest
+  local -a active=() ranked=()
+  log "Probing mirrors over HTTPS (architecture: $ARCH_DIR)..."
   tmp_rank=$(mktemp)
-
-  while read -r candidate; do
-    [[ -z "$candidate" ]] && continue
-    # Run test
-    local latency
-    latency=$(probe_mirror "$candidate")
-    if (( $(echo "$latency < 10.0" | bc -l 2>/dev/null || [ "$latency" != "999" ] && echo 1 || echo 0) )); then
-      echo "${latency} ${candidate}" >> "$tmp_rank"
+  while IFS= read -r candidate; do
+    [[ -n "$candidate" ]] || continue
+    valid_server_url "$candidate" || continue
+    if latency=$(probe_mirror "$candidate"); then
+      if is_pinned "$candidate"; then
+        pinned="$candidate"
+      else
+        printf '%s %s\n' "$latency" "$candidate" >>"$tmp_rank"
+      fi
+      log "  ok   $candidate ($(( latency / 1000 )) ms)"
+    else
+      log "  fail $candidate"
     fi
   done < <(get_candidates)
 
-  if [[ ! -s "$tmp_rank" ]]; then
-    warn "All live mirror probes failed or timed out (offline/restrictive captive portal)."
-    warn "Preserving existing mirrorlist to avoid bricking package management."
-    rm -f "$tmp_rank"
-    return 1
-  fi
-
-  # Sort by latency ascending
-  local sorted_mirrors
-  sorted_mirrors=$(sort -n "$tmp_rank" | head -n 5)
-  rm -f "$tmp_rank"
-
-  log "Top reachable mirrors discovered:"
-  echo "$sorted_mirrors" | while read -r time url; do
-    printf "  - %-60s [%.3fs]\n" "$url" "$time"
+  mapfile -t ranked < <(sort -n -k1,1 "$tmp_rank" | awk '{ print $2 }')
+  rm -f -- "$tmp_rank"
+  [[ -n "$pinned" ]] && active+=("$pinned")
+  for candidate in "${ranked[@]+"${ranked[@]}"}"; do
+    (( ${#active[@]} < MAX_ACTIVE )) || break
+    active+=("$candidate")
   done
 
-  # Atomically update /etc/pacman.d/mirrorlist
-  local tmp_dest="${MIRRORLIST}.tmp.$$"
-  {
-    echo "# =============================================================================="
-    echo "# Omarchy WSL Resilient Mirrorlist ($ARCH)"
-    echo "# Ranked: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-    echo "# =============================================================================="
-    echo ""
-    echo "# --- Fastest Probed Mirrors ---"
-    while read -r _ url; do
-      echo "Server = $url"
-    done <<< "$sorted_mirrors"
-    echo ""
-    echo "# --- Redundant Static Fallbacks ---"
-    get_candidates | while read -r url; do
-      # Avoid duplicating top mirrors
-      if ! echo "$sorted_mirrors" | grep -q "$url"; then
-        echo "# Server = $url"
-      fi
-    done
-  } > "$tmp_dest"
-
-  # Backup previous mirrorlist
-  [[ -f "$MIRRORLIST" ]] && cp -f "$MIRRORLIST" "$BACKUP_MIRRORLIST"
-  mv -f "$tmp_dest" "$MIRRORLIST"
-  log "Successfully updated $MIRRORLIST."
+  if (( ${#active[@]} == 0 )); then
+    warn "No mirror answered (offline, captive portal or blocked HTTPS)."
+    warn "Keeping the existing $MIRRORLIST."
+    return 1
+  fi
+  tmp_dest=$(mktemp "${MIRRORLIST}.tmp.XXXXXX" 2>/dev/null || mktemp)
+  render_list "ranked by HTTPS latency" "${active[@]}" >"$tmp_dest"
+  if ! install_list "$tmp_dest"; then
+    rm -f -- "$tmp_dest"
+    return 1
+  fi
+  log "Updated $MIRRORLIST with ${#active[@]} mirror(s)."
 }
 
-# -----------------------------------------------------------------------------
-# Main Dispatcher
-# -----------------------------------------------------------------------------
+restore_default() {
+  local tmp src="" url
+  local -a builtin=()
+  for src in "${DEFAULT_TEMPLATES}/mirrorlist.${ARCH_DIR}" \
+             "$(dirname "$(readlink -f "$0")")/../wsl/pacman/mirrorlist.${ARCH_DIR}"; do
+    [[ -f "$src" ]] || continue
+    # Keep only valid https Server lines from the template.
+    tmp=$(mktemp)
+    {
+      echo "# Restored from $src (https Server lines only)"
+      while IFS= read -r line; do
+        [[ "$line" =~ ^Server[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+        url="${BASH_REMATCH[1]}"
+        valid_server_url "$url" && echo "Server = $url"
+      done <"$src"
+    } >"$tmp"
+    if install_list "$tmp" 2>/dev/null; then
+      log "Restored $MIRRORLIST from $src."
+      return 0
+    fi
+    rm -f -- "$tmp"
+  done
+  mapfile -t builtin < <(get_candidates)
+  tmp=$(mktemp)
+  render_list "built-in defaults" "${builtin[@]}" >"$tmp"
+  install_list "$tmp" || { rm -f -- "$tmp"; return 1; }
+  log "Restored $MIRRORLIST from the built-in candidates."
+}
+
 case "${1:-rank}" in
-  rank|sync)
-    rank_mirrors || true
-    ;;
+  rank|sync) rank_mirrors ;;
   check|status)
-    echo "=== Current Mirrorlist ($MIRRORLIST) ==="
+    echo "=== $MIRRORLIST ==="
     if [[ -f "$MIRRORLIST" ]]; then
-      grep "^Server" "$MIRRORLIST" || echo "No active Server entries found!"
+      grep '^Server' "$MIRRORLIST" || { echo "No active Server entries."; exit 1; }
     else
-      echo "Mirrorlist does not exist!"
+      echo "Mirrorlist does not exist."
+      exit 1
     fi
     ;;
-  restore-default)
-    log "Restoring default resilient mirrorlist for $ARCH..."
-    if [[ -f "${DEFAULT_TEMPLATES}/mirrorlist.${ARCH_DIR}" ]]; then
-      cp -f "${DEFAULT_TEMPLATES}/mirrorlist.${ARCH_DIR}" "$MIRRORLIST"
-      log "Restored from package template."
-    elif [[ -f "$(dirname "$0")/../wsl/pacman/mirrorlist.${ARCH_DIR}" ]]; then
-      cp -f "$(dirname "$0")/../wsl/pacman/mirrorlist.${ARCH_DIR}" "$MIRRORLIST"
-      log "Restored from source template."
-    else
-      {
-        echo "# Omarchy Default Fallback Mirrorlist"
-        get_candidates | while read -r url; do echo "Server = $url"; done
-      } > "$MIRRORLIST"
-      log "Restored from built-in candidates."
-    fi
+  restore-default) restore_default ;;
+  -h|--help|help)
+    echo "Usage: $(basename "$0") [rank|status|restore-default]"
     ;;
   *)
-    echo "Usage: $(basename "$0") [rank|status|restore-default]"
-    exit 1
+    echo "Usage: $(basename "$0") [rank|status|restore-default]" >&2
+    exit 2
     ;;
 esac

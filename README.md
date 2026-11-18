@@ -1,190 +1,171 @@
-# Omarchy-WSL 🌌
+# Omarchy WSL
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Architecture](https://img.shields.io/badge/Architecture-ARM64%20%7C%20x86__64-orange.svg)](#dual-architecture-alpm-engine)
-[![WSL](https://img.shields.io/badge/WSL-2.4%2B%20%2F%203.0%2B-blueviolet.svg)](#wsl3--hypervisor-optimizations)
-[![Tests](https://img.shields.io/badge/Tests-273%2F273%20Passed-brightgreen.svg)](#adversarial-test-suites)
+[![CI](https://github.com/chntllh-labs/omarchy-wsl/actions/workflows/ci.yml/badge.svg)](https://github.com/chntllh-labs/omarchy-wsl/actions/workflows/ci.yml)
+[![Upstream](https://img.shields.io/badge/Omarchy-v4.5.0-9ece6a.svg)](upstream.lock)
+[![Architectures](https://img.shields.io/badge/arch-arm64%20%7C%20x86__64-orange.svg)](#building-from-source)
 
-The bleeding-edge, dual-architecture Arch Linux distribution engine purpose-built for the **Windows Subsystem for Linux (WSL2 & WSL 3.0+)**.
-
-Brings the authentic **[Omarchy](https://omarchy.org)** developer workstation experience—Tokyo Night theming, Neovim (LazyVim), dual-prefix tmux, Starship prompt, `btop`, `eza`, `bat`, `fzf`, `yay`, and `mise`—to Windows with zero desktop baggage and deep hypervisor tuning.
+[Omarchy](https://omarchy.org) (Basecamp's Arch Linux setup) as a Windows
+Subsystem for Linux distribution: upstream's command suite, themes and
+defaults, Neovim (LazyVim), tmux, starship, btop, mise and yay. The Hyprland
+desktop is left out; Windows supplies the desktop, and a set of Windows
+bridges connects the two. Built for arm64 (Snapdragon and other ARM64 PCs) and
+x86_64.
 
 <p align="center">
-  <img src="assets/omarchy-terminal-demo.svg" alt="Omarchy WSL Tokyo Night Terminal" width="100%">
+  <img src="assets/omarchy-terminal-demo.svg" alt="Omarchy WSL in Windows Terminal" width="100%">
 </p>
 
----
+## Install
 
-## ⚡ Quickstart (One-Line Install)
-
-Run in a standard **PowerShell** prompt (as your normal Windows user, *do not run as Administrator*):
+From PowerShell, as your normal (non-administrator) Windows user:
 
 ```powershell
 irm https://raw.githubusercontent.com/chntllh-labs/omarchy-wsl/main/install/install.ps1 | iex
 ```
 
-Once installed, launch it from Windows Terminal, your Start Menu shortcut, or by running:
+The installer picks `Omarchy-arm64.wsl` or `Omarchy-x86_64.wsl` from the latest
+release, checks it against the release's `SHA256SUMS` and runs
+`wsl --install --from-file`. To install by hand, download the file for your CPU
+from [Releases](https://github.com/chntllh-labs/omarchy-wsl/releases) and run:
+
 ```powershell
-wsl -d Omarchy
+wsl --install --from-file .\Omarchy-arm64.wsl
 ```
 
----
+Every release asset carries GitHub build provenance, and `SHA256SUMS` is signed
+with Sigstore:
 
-## 🚀 Key Architectural Pillars
-
-### 1. Dynamic First-Boot OOBE & Zero Hardcoding
-Unlike legacy community WSL packages that hardcode usernames (e.g. `omarchy` or `ubuntu`), Omarchy-WSL ships with an adversarial **Out-Of-Box Experience (OOBE) engine**:
-- **Automatic Host Detection:** Discovers your Windows `%USERNAME%` across Windows interop or DrvFs inspection.
-- **POSIX Sanitization:** Automatically transliterates Latin diacritics (`François` → `francois`, `Müller` → `m_uller`), converts spaces/symbols (`John Doe` → `john_doe`), prepends invalid leading characters (`123agent` → `u_123agent`), and clamps to 31 characters.
-- **UID 1000 Reconciler:** Seamlessly renames stock rootfs accounts (e.g. Arch Linux ARM's `alarm`) to your user with passwordless `sudo` and systemd user lingering (`loginctl enable-linger`).
-- **Headless-Safe:** Automated commands (`wsl -d Omarchy -- whoami` or CI runners) bypass prompts without hanging.
-
-### 2. Dual-Architecture ALPM Engine (Qualcomm Snapdragon ARM64 & AMD64)
-First-class support for ARM64 (Qualcomm Snapdragon X Elite / Plus dev kits and laptops) alongside standard x86_64:
-- **Algorithmic Compiler Governor (`scripts/makepkg-governor.sh`):** Prevents 12–18 core processors from triggering Linux OOM panics during heavy C++/Rust builds by scaling `-j` concurrency strictly to available RAM ($\min(\text{nproc}, \lfloor \text{RAM} / \text{weight} \rfloor)$).
-- **Binary ALPM Repository:** Upstream Omarchy packages (`omarchy-nvim`, `yay-bin`, `mise-bin`, `omarchy-wsl-keyring`) pre-indexed in an ALPM repository for atomic, fast updates.
-
-### 3. Lossless Cross-OS Theme Sync
-Omarchy's theme engine bridges the virtualization boundary to theme your host Windows environment:
-- **Windows Terminal Sync:** Custom lossless JSONC AST engine modifies `settings.json` schemes surgically with `fsync` and Windows sharing-lock exponential retries, preserving **100% of user comments, whitespace, and custom keybindings**.
-- **VS Code Integration:** Injects matching `terminal.ansi*` colors into `workbench.colorCustomizations`.
-- **Multi-Variant Detection:** Automatically discovers Windows Terminal Stable (MSIX), Preview, Canary, and Unpackaged installations.
-
-### 4. High-Core Virtualization & Storage Tuning
-- **Kernel Writeback Pacing:** Eliminates synchronous writeout freezes (`throttle_vm_writeout()`) during multi-threaded builds by tuning `vm.dirty_background_ratio = 5`, `vm.dirty_ratio = 10`, and `dirty_writeback_centisecs = 250`.
-- **Metadata Latency Elimination:** Enforces `case=off` and `metadata,uid=1000,gid=1000,umask=022,fmask=011` on DrvFs mounts, eliminating redundant NTFS per-directory attribute walks.
-- **Data Corruption Protection:** Disables experimental `sparseVhd=true` in host templates to prevent ext4 superblock/journal corruption from concurrent NTFS hole-punching races.
-
-### 5. Enterprise Network & Corporate Proxy Resiliency
-- **Mirrored Networking (`networkingMode=mirrored`):** Automatically enables low-latency mirrored networking on Windows 11 22H2+ while providing fallback to NAT on Windows 10.
-- **DNS Tunneling Coexistence:** Neutralizes the `systemd-resolved` tug-of-war via `omarchy-dns-sync` and disables DNSSEC downgrades that fail under corporate SSL inspection proxies.
-- **Corporate Root CA Sync (`omarchy-ca-sync`):** Automatically extracts Windows Enterprise Root CAs from the Windows Certificate Store into Arch Linux trust anchors (`/etc/ca-certificates/trust-source/anchors/`).
-- **Container Bridge Isolation:** Clamps Docker/Podman MTUs to 1420 for VPN compatibility and isolates default subnet pools to RFC 2544 benchmark space (`198.18.0.0/16`).
-
-### 6. Deep Windows 11 Integration & QoL
-Ten hardened bridges across the Windows/Linux boundary, all built on one interop layer (no Windows `%PATH%`, PowerShell only via `-EncodedCommand`, every call time-bounded). See [docs/WINDOWS-INTEGRATION-QOL.md](docs/WINDOWS-INTEGRATION-QOL.md).
-- **Explorer:** "Open in Omarchy Terminal" context menu, Quick Access pin, `omarchy-sync-dirs` Known-Folder links (OneDrive-aware), DrvFs build guard.
-- **Clipboard:** `omarchy-clip` routes text/PNG through win32yank, UTF-16 `clip.exe`, PowerShell, WSLg or OSC 52 (SSH/tmux); Neovim + tmux snippets.
-- **Credentials:** `omarchy-ssh-agent-bridge` (Windows OpenSSH / 1Password / Bitwarden / Pageant / Gpg4win, keys never leave Windows) and `omarchy-git-credential-bridge` (Windows GCM → `gh` fallback).
-- **Launch & notify:** `omarchy-open` (Follina-safe URL/file/editor launcher, `$BROWSER`) and `omarchy-notify` (Windows toasts, `omarchy-build --notify`).
-- **Runtime:** WSLg audio/mic for systemd services, `omarchy-docker-bridge` (Desktop / Podman / native engine router), `omarchy-watch-bridge` (Windows edits → inotify), `omarchy-power-governor` (battery/thermal-aware `-j`).
-
-### 7. Zero-Data-Loss In-Distro Updates
-Never wipe your `/home` partition to update. Running:
 ```bash
-omarchy-wsl-update
+gh attestation verify Omarchy-arm64.wsl --repo chntllh-labs/omarchy-wsl
+cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp 'https://github.com/chntllh-labs/omarchy-wsl/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
 ```
-performs an in-place rolling update:
-- Updates Arch packages via `pacman -Syu`.
-- Pulls upstream Omarchy CLI improvements.
-- Uses `.omarchynew` divergence handling (Arch `.pacnew` convention) so custom dotfiles are never overwritten.
-- Intercepts bare-metal system calls (SDDM, Limine, Plymouth) with transparent virtualization shims.
 
----
+## First launch
 
-## 🛠️ Building from Source
+WSL runs `/usr/lib/wsl/oobe.sh` as root. It suggests a Linux user name derived
+from your Windows user name, then creates that account with uid 1000 and
+passwordless `sudo` for that account only (`--require-password` makes sudo ask).
+It also enables lingering, so tmux and user services survive closed terminals,
+and sets the account as the default WSL user. Without a terminal (for example
+`wsl -d Omarchy -- cmd`) it runs unattended. A distribution imported with
+`wsl --import` skips WSL's OOBE; the same provisioning then runs on the first
+interactive root login (`/etc/profile.d/00-omarchy-firstboot.sh`).
+[docs/OOBE-SPECIFICATION.md](docs/OOBE-SPECIFICATION.md) has the details.
+`omarchy-rename-owner` renames the uid-1000 account later.
 
-Build the compressed, clean `.wsl` distribution package using modern multi-stage containers:
+The Start menu entry and the Windows Terminal profile (Omarchy Tokyo Night
+colours) come from `/etc/wsl-distribution.conf`.
 
-### Prerequisites
-- Windows 11 (Build 22621+ or 26100+)
-- WSL2 enabled with `wslc.exe` or Docker Desktop
+## What is inside
 
-### Build Commands
+| | |
+|---|---|
+| Omarchy | `bin/ default/ config/ install/ migrations/ themes/` of Basecamp Omarchy **v4.5.0** (commit pinned in [`upstream.lock`](upstream.lock)) in `/usr/share/omarchy`, every `omarchy-*` command on `PATH` |
+| From Omarchy's signed `[omarchy]` repository | `omarchy-keyring`, `omarchy-nvim` (LazyVim with plugins prefetched), `yay`, `mise-bin`, JetBrains Mono Nerd Font |
+| WSL overlay | `omarchy update`, `omarchy doctor`, `omarchy theme set` (themes the shell, tmux, btop and Neovim, plus Windows Terminal and VS Code through `omarchy-theme-bridge`), `omarchy version`; tmux with Ctrl-b and Ctrl-a prefixes |
+| Windows bridges | `omarchy-open`, `omarchy-clip` (text, PNG, OSC 52), `omarchy-notify` (toasts), `omarchy-sync-dirs`, SSH/GPG agent and Git credential bridges, `omarchy-docker-bridge`, `omarchy-watch-bridge`, `omarchy-power-governor`; see [docs/WINDOWS-INTEGRATION-QOL.md](docs/WINDOWS-INTEGRATION-QOL.md) |
+| Networking tools | `omarchy-netdoctor`, `omarchy-dns-sync`, `omarchy-ca-sync`, `omarchy-proxy-sync`, `omarchy-mirror-sync`; see [docs/WSL-NETWORKING-AND-DNS-ADVERSARIAL-REVIEW.md](docs/WSL-NETWORKING-AND-DNS-ADVERSARIAL-REVIEW.md) |
+| Builds | `omarchy-build` runs a command in a resource-weighted cgroup slice with a RAM- and power-aware `-j` |
+| Multi-tenant | `omarchy-tenant` runs isolated guests (systemd-nspawn, user namespaces, slirp4netns, cgroup egress filters, userspace Tailscale, key-only sshd); see [docs/MULTI-TENANT-ISOLATION.md](docs/MULTI-TENANT-ISOLATION.md) |
+| Toolchains | gcc, make, Node.js, Python, uv, Lua; Docker (socket-activated). Heavier toolchains and `claude-code` are one command away: `packages/omarchy-wsl-extras.packages` |
+
+`omarchy doctor` checks the install: systemd, interop, DNS, the owner account,
+the pacman keyring and the pinned Omarchy key, `[omarchy]` wiring, the WSL
+integration files and the integrity of every file this repository installed.
+
+## Updating
+
+```bash
+omarchy update                 # pacman -Syu, migrations, mise, Neovim plugins, hooks
+omarchy-wsl-update --check     # trust, repository wiring and pending updates; changes nothing
+omarchy-wsl-update --self      # rebuild the omarchy-wsl package from the newest release tag
+```
+
+`omarchy update` never edits `pacman.conf`. It refuses to run when the pinned
+Omarchy signing key is missing, and `--repair-pacman` restores the shipped
+configuration with backups.
+
+## Headless and always-on hosts
+
 ```powershell
-# Clone repository
-git clone https://github.com/chntllh-labs/omarchy-wsl.git
-cd omarchy-wsl
-
-# Build using multi-stage container pipeline
-docker build -t omarchy:dist -f Containerfile .
-
-# Export compressed, sanitized rootfs bundle (~620 MB)
-./scripts/build-reproducible-rootfs.sh
+# .wslconfig for a server: keep the VM and the distribution running with no session attached
+.\tools\generate-wslconfig.ps1 -Profile Server -DryRun     # review the merged result
+.\tools\generate-wslconfig.ps1 -Profile Server -Force
+# start the distribution at logon (or at boot, see the script's help)
+.\tools\register-wsl-autostart.ps1 -Distro Omarchy
 ```
 
----
+The Server profile sets both `[wsl2] vmIdleTimeout=-1` and
+`[general] instanceIdleTimeout=-1`; without the second key WSL stops the
+distribution about 15 seconds after the last session ends. The generator merges
+into an existing `.wslconfig` instead of replacing it. Inside the distribution
+these scripts are also available under `/usr/share/omarchy-wsl/windows/`.
 
-## 🧪 Adversarial Test Suites
+## Building from source
 
-Omarchy-WSL is validated through 5 automated test harnesses covering 273 gates:
+Builds run on Linux with Docker or Podman: natively on arm64 or x86_64, or in
+GitHub Actions. Never pack or unpack the root filesystem on macOS, because
+bsdtar drops setuid bits, system uids and file capabilities. The script handles
+the archive inside a Linux container either way.
 
-| Test Suite | Coverage | Command | Result |
-| :--- | :--- | :--- | :--- |
-| **OOBE Suite** | Sanitization, collision handling, INI updates, sudoers validation | `bash tests/test_oobe_adversarial.sh` | **34/34 Passed** |
-| **Networking Suite** | Mirrored mode, DNS tunneling, CA sync, MTU clamping, proxy rules | `bash tests/test_networking_adversarial.sh` | **20/20 Passed** |
-| **Theme Engine Suite** | JSONC AST tokenization, comment preservation, atomic `fsync` | `bash tests/test_theme_adversarial.sh` | **27/27 Passed** |
-| **Memory & Sysctl Suite** | Hardware scaling formulas, `build.slice` cgroup v2, writeback | `python3 tests/test_memory_governance.py` | **18/18 Passed** |
-| **Windows Integration Suite** | Interop safety, launcher/clipboard/toast injection, SSH agent & GCM bridges, Docker routing, inotify replay, power governor | `bash tests/test_windows_integration.sh` | **192/192 Passed** |
-
-Run all tests:
 ```bash
-PYTHONPATH=lib python3 -m unittest discover -s tests -p "test_*.py"
-bash tests/test_oobe_adversarial.sh
-bash tests/test_networking_adversarial.sh
-bash tests/test_theme_adversarial.sh
-bash tests/test_windows_integration.sh
+scripts/build-reproducible-rootfs.sh arm64 --verify-determinism --self-test-leak
+scripts/smoke-test-image.sh dist/Omarchy-arm64.wsl
 ```
 
----
+The Stage 0 root filesystem (Arch Linux ARM, or the Arch Linux bootstrap for
+x86_64) is fetched over HTTPS and its signature checked against a key vendored
+in `wsl/keys/`. The build then trusts the pinned Omarchy key before its first
+sync, installs from `[omarchy]` without AUR builds, builds the `omarchy-wsl`
+package from the pinned upstream commit, and verifies the result (theme
+overlay against upstream, units through `systemd-analyze`, a gcc link, WSL's
+1 MiB limits). Before writing the `.wsl`, it audits the exact tree for leaked
+credentials and machine identity, then archives it deterministically: two
+normalisations of one export are byte-identical. The archive must stay under
+800 MiB.
 
-## 📂 Project Architecture
+[docs/DUAL-ARCH-PACKAGE-ENGINE-SPEC.md](docs/DUAL-ARCH-PACKAGE-ENGINE-SPEC.md)
+describes every step. `make install-rootfs DESTDIR=/tmp/root` installs this
+repository's files into any directory; [`rootfs.manifest`](rootfs.manifest) is
+the single list.
 
-<p align="center">
-  <img src="assets/architecture-diagram.svg" alt="Omarchy WSL Platform Architecture" width="100%">
-</p>
+## Tests
 
-```
-omarchy-wsl/
-├── bin/
-│   ├── omarchy-build          # Memory-, power- & DrvFs-aware cgroup v2 compiler runner
-│   ├── omarchy-ca-sync        # Windows Enterprise Root CA extractor
-│   ├── omarchy-clip           # Cross-OS clipboard router (text, PNG, OSC 52)
-│   ├── omarchy-docker-bridge  # Docker Desktop / Podman / native engine router
-│   ├── omarchy-dns-sync       # DNS tunneling & systemd-resolved bridge
-│   ├── omarchy-mirror-sync    # Ping-less pacman mirror benchmark CLI
-│   ├── omarchy-netdoctor      # Full network audit and auto-repair utility
-│   ├── omarchy-notify         # Windows toast notification bridge
-│   ├── omarchy-open           # Hardened URL / file / editor launcher
-│   ├── omarchy-power-governor # Battery & thermal-aware build concurrency
-│   ├── omarchy-proxy-sync     # WinINet proxy environment synchronizer
-│   ├── omarchy-sync-dirs      # Windows Known-Folder symlinks (~/win)
-│   ├── omarchy-theme-sync     # Cross-OS theme propagation CLI
-│   ├── omarchy-watch-bridge   # Windows edits -> Linux inotify replay
-│   └── omarchy-wsl-update     # In-distro zero-data-loss rolling updater
-├── docs/                      # Comprehensive architectural specifications
-│   ├── DUAL-ARCH-PACKAGE-ENGINE-SPEC.md
-│   ├── OOBE-SPECIFICATION.md
-│   ├── THEME-ENGINE.md
-│   ├── WINDOWS-INTEGRATION-QOL.md
-│   ├── WSL-NETWORKING-AND-DNS-ADVERSARIAL-REVIEW.md
-│   └── storage-io-architecture.md
-├── install/
-│   └── install.ps1            # Production PowerShell one-command installer
-├── lib/
-│   ├── omarchy-wsl-interop.sh # Shared hardened Windows interop layer
-│   ├── omarchy_theme/         # Lossless JSONC AST engine & terminal adapters
-│   └── omarchy-wsl-migration-gate # Upstream migration virtualization shims
-├── scripts/
-│   ├── build-binary-repo.sh   # Dual-arch ALPM repository automation
-│   ├── makepkg-governor.sh    # Hardware-topology-aware compiler governor
-│   └── strip-rootfs.sh        # Zero-leak rootfs sanitization engine
-├── tools/
-│   ├── generate-wslconfig.ps1 # Adaptive host .wslconfig generator
-│   ├── generate-notify-icons.py # Reproducible Tokyo Night toast icons
-│   └── register-explorer-context-menu.{ps1,reg} # Explorer verb + Quick Access
-├── wsl/
-│   ├── bin/                   # SSH agent & Git credential bridges
-│   ├── etc/, environment.d/   # WSLg audio (PulseAudio, ALSA) integration
-│   ├── oobe.sh                # Dynamic first-boot provisioning engine
-│   ├── pacman-init.sh         # Offline pacman keyring initializer
-│   ├── wsl.conf               # Neutral base virtualization configuration
-│   └── wsl-distribution.conf  # Modern WSL registration metadata
-└── Containerfile              # 5-stage dual-arch reproducible container definition
+```bash
+make test             # tests/run-all.sh on this machine
+make test-container   # the same inside tests/ci/Containerfile (bash 5, GNU tools, pytest, pwsh)
 ```
 
----
+`tests/run-all.sh` runs shellcheck, a PowerShell parse of every script, pytest
+and every `tests/test_*.sh` suite. It is strict: a skipped check (a missing
+tool, an unreachable input) counts as a failure. CI runs it on arm64 and x86_64
+for every pull request. The release workflow also builds both images and gates
+them with the archive checks and `scripts/smoke-test-image.sh`.
 
-## 📜 License
+## Repository layout
 
-Distributed under the [MIT License](LICENSE). Upstream Omarchy components are copyright © [Basecamp](https://github.com/basecamp/omarchy).
+```
+bin/                 user commands (installed to /usr/bin)
+wsl/overlay/bin/     WSL replacements for upstream commands
+wsl/bin/             Windows bridges (/usr/lib/omarchy-wsl/bin)
+lib/                 shared shell libraries, migration gate, Python theme engine
+wsl/                 OOBE, wsl.conf, wsl-distribution.conf, profile.d, systemd units,
+                     cgroups, sysctl, pacman templates, skel, vendored keys
+tools/               theme bridge, Windows-side PowerShell (wslconfig, autostart, Explorer)
+packages/            package sets and the omarchy-wsl PKGBUILD
+build/               image build steps (Containerfile)
+scripts/             export/normalise/audit, manifest installer, smoke test, upstream bump
+tests/               suites, fixtures, the CI test environment
+install/install.ps1  Windows installer
+distributions/       Microsoft DistributionInfo.json entry
+upstream.lock        every pinned external input
+rootfs.manifest      every file this repository installs
+```
+
+## License
+
+MIT, see [LICENSE](LICENSE). Omarchy is copyright Basecamp and MIT-licensed;
+its license ships as `/usr/share/licenses/omarchy-wsl/LICENSE.omarchy`.

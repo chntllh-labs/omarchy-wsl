@@ -1,0 +1,14 @@
+# Re-apply the Omarchy WSL /etc/os-release after filesystem reinstalls its
+# symlink to /usr/lib/os-release (see /usr/lib/omarchy-wsl/apply-etc-overrides).
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Target = etc/os-release
+Target = usr/lib/os-release
+Target = usr/share/omarchy-wsl/etc-overrides/*
+
+[Action]
+Description = Applying Omarchy WSL /etc overrides...
+When = PostTransaction
+Exec = /usr/lib/omarchy-wsl/apply-etc-overrides

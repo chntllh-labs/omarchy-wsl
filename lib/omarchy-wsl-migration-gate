@@ -1,190 +1,266 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ==============================================================================
+# Omarchy WSL: Migration Safety Gate
 # /usr/lib/omarchy-wsl/migration-gate
+# ==============================================================================
+# Runs pending upstream Omarchy migrations inside WSL with:
+#   1. Virtualization shims: bootloader, udev/modprobe and display-manager
+#      operations become logged no-ops (they cannot work in WSL). The shims
+#      live in a private per-run directory, never under /usr.
+#   2. A snapshot of ~/.bashrc, ~/.config and ~/.XCompose before the first
+#      pending migration runs (no snapshot when nothing is pending).
+#   3. A stability lockdown afterwards: re-apply the Omarchy WSL sysctls and
+#      keep bare-metal units (systemd-resolved, networkd, timesyncd, firstboot,
+#      NetworkManager, tmp.mount) masked.
 #
-# Omarchy WSL Migration Safety Gate & Virtualization Interceptor
+# Layout (same as upstream Omarchy, installed system-wide in the image):
+#   migrations   ${OMARCHY_PATH:-/usr/share/omarchy}/migrations/*.sh
+#   state        ${OMARCHY_MIGRATIONS_STATE_PATH:-~/.local/state/omarchy/migrations}
+#                (a file per applied migration; skipped/<name> is honoured too)
 #
-# Intercepts upstream Basecamp Omarchy migrations, providing:
-# 1. Hardware/Service virtualization shims (mocks out SDDM, Limine, Plymouth, udev)
-# 2. Zero-loss user configuration defense (Arch-style .omarchynew preservation)
-# 3. Kernel stability & sysctl enforcement after migration steps
+# Migrations change a user's home, so they run as that user. Started as root
+# (e.g. by an updater running under sudo), the gate runs the migration phase
+# as --user NAME, else $SUDO_USER, else the UID 1000 account, and keeps only
+# the lockdown for root. It never runs migrations against /root.
+#
+# Options: --user NAME, --dry-run (list pending; change nothing),
+#          --no-lockdown, -h/--help.
+# Test seams: OMARCHY_GATE_ROOT (prefix for /etc and /usr/lib paths in the
+# lockdown), PATH (sudo, sysctl, systemctl, runuser).
+# ==============================================================================
 
 set -eEo pipefail
 
-WSL_SHIM_DIR="/usr/lib/omarchy-wsl/shims"
-MIGRATIONS_DIR="${OMARCHY_PATH:-$HOME/.local/share/omarchy}/migrations"
-STATE_DIR="${OMARCHY_MIGRATIONS_STATE_PATH:-$HOME/.local/state/omarchy/migrations}"
-BACKUP_DIR="$HOME/.local/state/omarchy/migration-backups/$(date +%Y%m%d_%H%M%S)"
-CONFLICT_LOG="$HOME/.local/state/omarchy/migration-conflicts.log"
+OMARCHY_PATH="${OMARCHY_PATH:-/usr/share/omarchy}"
+MIGRATIONS_DIR="${OMARCHY_PATH}/migrations"
+GATE_ROOT="${OMARCHY_GATE_ROOT:-}"
+STABILITY_NAME="99-zz-omarchy-wsl-stability.conf"
+MASKED_UNITS=(systemd-resolved.service systemd-networkd.service systemd-networkd.socket
+              systemd-timesyncd.service systemd-firstboot.service NetworkManager.service tmp.mount)
 
-log() { echo -e "\e[34m[omarchy-wsl-gate]\e[0m $*"; }
-warn() { echo -e "\e[33m[omarchy-wsl-gate:WARN]\e[0m $*"; }
-success() { echo -e "\e[32m[omarchy-wsl-gate]\e[0m $*"; }
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+TARGET_USER=""
+DRY_RUN=0
+LOCKDOWN=1
+PHASE="all"
 
-mkdir -p "$STATE_DIR" "$WSL_SHIM_DIR"
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  log() { printf '\e[34m[omarchy-wsl-gate]\e[0m %s\n' "$*"; }
+  warn() { printf '\e[33m[omarchy-wsl-gate:WARN]\e[0m %s\n' "$*" >&2; }
+  success() { printf '\e[32m[omarchy-wsl-gate]\e[0m %s\n' "$*"; }
+else
+  log() { printf '[omarchy-wsl-gate] %s\n' "$*"; }
+  warn() { printf '[omarchy-wsl-gate:WARN] %s\n' "$*" >&2; }
+  success() { printf '[omarchy-wsl-gate] %s\n' "$*"; }
+fi
+
+usage() { sed -n '2,30p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user) TARGET_USER="${2:?--user requires a name}"; shift 2 ;;
+    --dry-run|-n) DRY_RUN=1; shift ;;
+    --no-lockdown) LOCKDOWN=0; shift ;;
+    --user-phase) PHASE="user"; shift ;;   # internal: re-executed as the user
+    -h|--help) usage; exit 0 ;;
+    *) warn "Unknown option: $1"; exit 2 ;;
+  esac
+done
 
 # -----------------------------------------------------------------------------
-# 1. Install Bare-Metal Virtualization Shims
+# Privilege helpers
 # -----------------------------------------------------------------------------
+# as_root <cmd...>: run directly as root, through non-interactive sudo when
+# cached credentials allow it, otherwise skip with a warning (never prompts).
+as_root() {
+  if (( EUID == 0 )); then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    sudo -n "$@"
+  else
+    warn "Skipped (needs root): $*"
+    return 1
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# 1. Virtualization shims (private, per run)
+# -----------------------------------------------------------------------------
+SHIM_DIR=""
 install_shims() {
-  log "Configuring virtualization shims for WSL environment..."
+  SHIM_DIR=$(mktemp -d "${TMPDIR:-/tmp}/omarchy-wsl-shims.XXXXXX")
+  chmod 0700 "$SHIM_DIR"
+  trap 'rm -rf "$SHIM_DIR"' EXIT
 
-  # Shim systemctl to safely filter hardware/display services
-  cat <<'EOF' > "$WSL_SHIM_DIR/systemctl"
+  cat >"$SHIM_DIR/systemctl" <<'EOF'
 #!/bin/bash
-REAL_SYSTEMCTL="/usr/bin/systemctl"
-BLOCKED_UNITS="sddm|gdm|lightdm|plymouth|bluetooth|NetworkManager|iwd|systemd-resolved|tmp.mount"
-
+# Omarchy WSL migration shim: bare-metal display, network and boot units are
+# not managed inside WSL.
+BLOCKED_UNITS='sddm|gdm|lightdm|plymouth|bluetooth|NetworkManager|iwd|systemd-resolved|systemd-networkd|tmp\.mount'
 for arg in "$@"; do
-  if echo "$arg" | grep -Eq "($BLOCKED_UNITS)"; then
-    echo "[WSL-SHIM] Intercepted bare-metal service operation on '$arg' (skipped for WSL)."
+  if printf '%s' "$arg" | grep -Eq "^(${BLOCKED_UNITS})(\.service|\.socket|\.mount)?$"; then
+    echo "[WSL-SHIM] skipped systemctl $* (bare-metal unit, not used in WSL)"
     exit 0
   fi
 done
-
-exec "$REAL_SYSTEMCTL" "$@"
+exec /usr/bin/systemctl "$@"
 EOF
-  chmod +x "$WSL_SHIM_DIR/systemctl"
-
-  # Shim bootloaders and kernel hardware commands
-  for cmd in limine bootctl grub-install grub-mkconfig udevadm modprobe; do
-    cat <<EOF > "$WSL_SHIM_DIR/$cmd"
-#!/bin/bash
-echo "[WSL-SHIM] Intercepted bare-metal tool: $cmd \$* (no-op in WSL container)."
-exit 0
-EOF
-    chmod +x "$WSL_SHIM_DIR/$cmd"
+  local cmd
+  for cmd in limine limine-update limine-snapper-sync bootctl grub-install grub-mkconfig mkinitcpio udevadm modprobe; do
+    printf '#!/bin/bash\necho "[WSL-SHIM] skipped %s $* (no bootloader/initramfs/udev in WSL)"\nexit 0\n' "$cmd" >"$SHIM_DIR/$cmd"
   done
-
-  # Shim compositor-dependent tools (hyprctl, swaync-client, waybar)
   for cmd in hyprctl swaync-client waybar; do
-    cat <<EOF > "$WSL_SHIM_DIR/$cmd"
+    cat >"$SHIM_DIR/$cmd" <<EOF
 #!/bin/bash
 if [[ -z "\${WAYLAND_DISPLAY:-}" && -z "\${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
-  echo "[WSL-SHIM] Graphical compositor not active; '$cmd' skipped safely."
+  echo "[WSL-SHIM] skipped $cmd (no compositor running)"
   exit 0
 fi
 exec /usr/bin/$cmd "\$@"
 EOF
-    chmod +x "$WSL_SHIM_DIR/$cmd"
   done
+  chmod 0755 "$SHIM_DIR"/*
 }
 
 # -----------------------------------------------------------------------------
-# 2. User Configuration Protection & Pre-Backup
+# 2. Pending migrations & user state
 # -----------------------------------------------------------------------------
+pending_migrations() {
+  local state="$1" script name
+  [[ -d "$MIGRATIONS_DIR" ]] || return 0
+  for script in "$MIGRATIONS_DIR"/*.sh; do
+    [[ -e "$script" ]] || continue
+    name="${script##*/}"
+    [[ -f "$state/$name" || -f "$state/skipped/$name" ]] && continue
+    printf '%s\n' "$script"
+  done
+}
+
 protect_user_state() {
-  log "Creating safety snapshot of user configuration..."
-  mkdir -p "$BACKUP_DIR"
+  local backup="$1" target
+  log "Snapshotting user configuration to $backup ..."
+  mkdir -p "$backup"
   for target in "$HOME/.bashrc" "$HOME/.config" "$HOME/.XCompose"; do
     if [[ -e "$target" ]]; then
-      cp -a "$target" "$BACKUP_DIR/" 2>/dev/null || true
+      cp -a "$target" "$backup/" 2>/dev/null || warn "Could not snapshot $target"
     fi
   done
-
-  # Ensure user local shell extension exists so ~/.bashrc edits never break user customizations
+  # ~/.bashrc.local is never touched by upstream; make sure it is sourced.
   if [[ ! -f "$HOME/.bashrc.local" ]]; then
-    cat <<'EOF' > "$HOME/.bashrc.local"
-# ~/.bashrc.local — Custom user shell overrides for Omarchy-WSL
-# This file is NEVER modified or overwritten by upstream Omarchy updates or migrations.
-# Put your custom PATH additions, aliases, and environment variables here.
-
-EOF
+    printf '%s\n' "# ~/.bashrc.local - personal shell overrides." \
+      "# Omarchy and Omarchy WSL updates never modify this file." "" >"$HOME/.bashrc.local"
   fi
-
-  # Verify ~/.bashrc sources ~/.bashrc.local
   if [[ -f "$HOME/.bashrc" ]] && ! grep -q '\.bashrc\.local' "$HOME/.bashrc"; then
-    echo -e "\n# Load custom user overrides\n[[ -f ~/.bashrc.local ]] && source ~/.bashrc.local" >> "$HOME/.bashrc"
+    printf '\n# Load personal overrides\n[[ -f ~/.bashrc.local ]] && source ~/.bashrc.local\n' >>"$HOME/.bashrc"
   fi
 }
 
-# -----------------------------------------------------------------------------
-# 3. Safe Migration Execution Loop
-# -----------------------------------------------------------------------------
-run_migrations() {
+run_user_phase() {
+  local state="${OMARCHY_MIGRATIONS_STATE_PATH:-$HOME/.local/state/omarchy/migrations}"
+  local backup script name pending_count=0
+  local -a pending=()
+  [[ -n "${HOME:-}" && -d "$HOME" ]] || { warn "HOME is not set to an existing directory; not running migrations."; return 1; }
   if [[ ! -d "$MIGRATIONS_DIR" ]]; then
-    log "No migrations directory found at $MIGRATIONS_DIR. Nothing to do."
+    log "No migrations directory at $MIGRATIONS_DIR; nothing to do."
+    return 0
+  fi
+  mapfile -t pending < <(pending_migrations "$state")
+  if (( ${#pending[@]} == 0 )); then
+    log "All upstream migrations are up to date."
+    return 0
+  fi
+  if (( DRY_RUN )); then
+    for script in "${pending[@]}"; do echo "pending: ${script##*/}"; done
     return 0
   fi
 
-  # Put shims at the very front of PATH
-  export PATH="$WSL_SHIM_DIR:$PATH"
-  export OMARCHY_RUNNING_IN_WSL=1
-  export OMARCHY_THEME_HEADLESS=1
-
-  local pending_count=0
-  for script in "$MIGRATIONS_DIR"/*.sh; do
-    [[ -e "$script" ]] || continue
-    local migration_name
-    migration_name="$(basename "$script")"
-
-    if [[ -f "$STATE_DIR/$migration_name" ]]; then
-      continue # Already applied
-    fi
-
-    ((pending_count++))
-    log "Executing pending migration: $migration_name"
-
-    # Execute migration in a protected subshell
-    if ( source "$script" ); then
-      touch "$STATE_DIR/$migration_name"
-      success "Successfully applied: $migration_name"
+  mkdir -p "$state"
+  backup="$HOME/.local/state/omarchy/migration-backups/$(date +%Y%m%d_%H%M%S)"
+  protect_user_state "$backup"
+  install_shims
+  for script in "${pending[@]}"; do
+    name="${script##*/}"
+    pending_count=$((pending_count + 1))
+    log "Running migration ${pending_count}/${#pending[@]}: ${name}"
+    if PATH="$SHIM_DIR:$PATH" OMARCHY_PATH="$OMARCHY_PATH" OMARCHY_RUNNING_IN_WSL=1 \
+       OMARCHY_THEME_HEADLESS=1 bash -e "$script"; then
+      : >"$state/$name"
+      success "Applied: $name"
     else
-      warn "Migration $migration_name encountered an error!"
-      warn "State snapshot preserved at: $BACKUP_DIR"
+      warn "Migration $name failed; later migrations were not run."
+      warn "Configuration snapshot: $backup"
       return 1
     fi
   done
-
-  if [[ $pending_count -eq 0 ]]; then
-    log "All upstream migrations are up to date."
-  fi
+  success "Applied ${pending_count} migration(s)."
 }
 
 # -----------------------------------------------------------------------------
-# 4. Post-Migration Stability Lockdown & Cgroup Governance
+# 3. Stability lockdown (root)
 # -----------------------------------------------------------------------------
 lockdown_stability() {
-  log "Verifying WSL kernel memory parameters, sysctl ordering, and cgroup governance..."
-
-  # 1. Enforce hardened sysctl rules
-  local stability_file="/etc/sysctl.d/99-zz-omarchy-wsl-stability.conf"
-  if [[ -f "/usr/lib/omarchy-wsl/99-zz-omarchy-wsl-stability.conf" && ! -f "$stability_file" ]]; then
-    sudo cp "/usr/lib/omarchy-wsl/99-zz-omarchy-wsl-stability.conf" "$stability_file"
+  local conf="" d unit state
+  log "Re-asserting WSL sysctls and unit masks..."
+  for d in "$GATE_ROOT/etc/sysctl.d" "$GATE_ROOT/usr/lib/sysctl.d"; do
+    [[ -f "$d/$STABILITY_NAME" ]] && { conf="$d/$STABILITY_NAME"; break; }
+  done
+  if [[ -n "$conf" ]]; then
+    as_root sysctl -q -p "$conf" || warn "Could not apply $conf"
+  else
+    warn "$STABILITY_NAME is not installed in /etc/sysctl.d or /usr/lib/sysctl.d."
   fi
-  if [[ -f "$stability_file" ]]; then
-    sudo sysctl -q -p "$stability_file" 2>/dev/null || true
+  for d in "$GATE_ROOT/etc/systemd/system/build.slice" "$GATE_ROOT/usr/lib/systemd/user/build.slice"; do
+    [[ -f "$d" ]] || warn "$d is missing (omarchy-build falls back to nice/oom_score_adj)."
+  done
+  if command -v systemctl >/dev/null 2>&1; then
+    for unit in "${MASKED_UNITS[@]}"; do
+      state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
+      [[ "$state" == masked* ]] && continue
+      as_root systemctl mask "$unit" >/dev/null 2>&1 || warn "Could not mask $unit"
+    done
   fi
-
-  # 2. Enforce systemd cgroup v2 build slicing and interactive protection
-  if [[ -d "/usr/lib/omarchy-wsl/cgroups" ]]; then
-    sudo mkdir -p /etc/systemd/system/user-.slice.d /etc/systemd/oomd.conf.d
-    [[ -f "/usr/lib/omarchy-wsl/cgroups/build.slice" ]] && \
-      sudo cp "/usr/lib/omarchy-wsl/cgroups/build.slice" /etc/systemd/system/build.slice
-    [[ -f "/usr/lib/omarchy-wsl/cgroups/10-interactive-protection.conf" ]] && \
-      sudo cp "/usr/lib/omarchy-wsl/cgroups/10-interactive-protection.conf" /etc/systemd/system/user-.slice.d/
-    [[ -f "/usr/lib/omarchy-wsl/cgroups/10-omarchy-oomd.conf" ]] && \
-      sudo cp "/usr/lib/omarchy-wsl/cgroups/10-omarchy-oomd.conf" /etc/systemd/oomd.conf.d/
-    if [[ $(ps -p 1 -o comm= 2>/dev/null) == "systemd" ]]; then
-      sudo systemctl daemon-reload 2>/dev/null || true
-    fi
-  fi
-
-  # 3. Ensure critical bare-metal systemd units remain masked
-  sudo systemctl mask \
-    systemd-firstboot.service \
-    systemd-resolved.service \
-    systemd-networkd.service \
-    NetworkManager.service \
-    tmp.mount 2>/dev/null || true
-
-  success "WSL kernel, cgroup governance, and systemd stability state verified."
 }
 
 # -----------------------------------------------------------------------------
-# Main Entry Point
+# Main
 # -----------------------------------------------------------------------------
-install_shims
-protect_user_state
-run_migrations
-lockdown_stability
-success "Omarchy WSL migration gate execution completed safely."
+if [[ "$PHASE" == "user" ]]; then
+  run_user_phase
+  exit $?
+fi
+
+rc=0
+if (( EUID == 0 )); then
+  user="${TARGET_USER:-${SUDO_USER:-}}"
+  [[ "$user" == root ]] && user=""
+  [[ -n "$user" ]] || user=$(getent passwd 1000 | cut -d: -f1)
+  if [[ -n "$user" ]] && home=$(getent passwd "$user" | cut -d: -f6) && [[ -d "$home" ]]; then
+    log "Running migrations as $user (HOME=$home)."
+    extra=()
+    (( DRY_RUN )) && extra+=(--dry-run)
+    runuser_bin=$(command -v runuser 2>/dev/null || true)
+    for c in /usr/sbin/runuser /sbin/runuser /usr/bin/runuser; do
+      [[ -z "$runuser_bin" && -x "$c" ]] && runuser_bin="$c"
+    done
+    if [[ -n "$runuser_bin" ]]; then
+      "$runuser_bin" -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" PATH="$PATH" \
+        OMARCHY_PATH="$OMARCHY_PATH" bash "$SELF" --user-phase "${extra[@]}" || rc=$?
+    else
+      warn "runuser not found; migrations were not run (never as root)."
+      rc=1
+    fi
+  else
+    warn "No target user (use --user NAME); migrations were not run as root."
+  fi
+else
+  [[ -z "$TARGET_USER" || "$TARGET_USER" == "$(id -un)" ]] || { warn "--user needs root."; exit 2; }
+  run_user_phase || rc=$?
+fi
+
+if (( LOCKDOWN && ! DRY_RUN )); then
+  lockdown_stability
+fi
+if (( rc == 0 )); then
+  success "Migration gate completed."
+fi
+exit "$rc"

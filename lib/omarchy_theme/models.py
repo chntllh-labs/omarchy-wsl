@@ -11,6 +11,28 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 
+_NAME_MAX = 64
+
+
+def sanitize_theme_name(name: str) -> str:
+    """Make a theme name safe to embed in config files and comments.
+
+    Control characters (newlines included, plus U+2028/U+2029) are replaced
+    by spaces, whitespace is collapsed and the result is capped at 64
+    characters. A name that ends up empty is rejected.
+    """
+    if not isinstance(name, str):
+        raise ValueError(f"Theme name must be a string, got {type(name).__name__}")
+    cleaned = "".join(
+        " " if (ord(ch) < 0x20 or ord(ch) == 0x7F or 0x80 <= ord(ch) < 0xA0 or ch in "\u2028\u2029") else ch
+        for ch in name
+    )
+    cleaned = " ".join(cleaned.split())[:_NAME_MAX].strip()
+    if not cleaned:
+        raise ValueError("Theme name must not be empty.")
+    return cleaned
+
+
 def normalize_hex(color_str: str) -> str:
     """Normalize a hex color string to lowercase #rrggbb format.
 
@@ -76,8 +98,7 @@ class ColorScheme:
 
     def __post_init__(self) -> None:
         """Validate and normalize all color codes."""
-        if not self.name or not self.name.strip():
-            raise ValueError("Theme name must not be empty.")
+        self.name = sanitize_theme_name(self.name)
 
         self.background = normalize_hex(self.background)
         self.foreground = normalize_hex(self.foreground)

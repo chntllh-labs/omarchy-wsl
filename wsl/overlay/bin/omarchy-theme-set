@@ -1,0 +1,75 @@
+#!/bin/bash
+
+# omarchy:summary=Apply an Omarchy theme to the shell, tmux, TUIs, Neovim, Windows Terminal and VS Code
+# omarchy:args=<theme-name>
+# omarchy:examples=omarchy theme list | omarchy theme set "Tokyo Night"
+
+# WSL replacement for upstream omarchy-theme-set (installed over the upstream
+# /usr/bin entry; upstream's script stays at $OMARCHY_PATH/bin/omarchy-theme-set).
+# There is no compositor, shell bar or notification daemon here, so upstream
+# runs in its headless mode (stage the theme, render templates, swap the
+# current symlink, which in headless mode runs none of its hooks) and this
+# wrapper replays the post-theme hooks that make sense in a terminal-only
+# system. It then pushes the palette across the WSL boundary to Windows
+# Terminal and VS Code, and retints the calling terminal in place.
+#
+# Set OMARCHY_WSL_THEME_BRIDGE=0 (environment or ~/.config/omarchy/wsl.env) to
+# keep theme changes inside Linux.
+
+set -o pipefail
+
+: "${OMARCHY_PATH:=/usr/share/omarchy}"
+export OMARCHY_PATH
+
+UPSTREAM="$OMARCHY_PATH/bin/omarchy-theme-set"
+WSL_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/wsl.env"
+
+if [[ -z ${1:-} ]]; then
+  echo "Usage: omarchy-theme-set <theme-name>" >&2
+  exit 1
+fi
+
+# wsl.env is parsed, never sourced: only the bridge switch is honoured.
+if [[ -r $WSL_ENV && -z ${OMARCHY_WSL_THEME_BRIDGE:-} ]]; then
+  bridge=$(sed -n 's/^[[:space:]]*OMARCHY_WSL_THEME_BRIDGE[[:space:]]*=[[:space:]]*["'\'']\{0,1\}\([01]\)["'\'']\{0,1\}[[:space:]]*$/\1/p' "$WSL_ENV" | tail -n 1)
+  [[ -n $bridge ]] && OMARCHY_WSL_THEME_BRIDGE=$bridge
+fi
+
+OMARCHY_THEME_HEADLESS=1 OMARCHY_THEME_SKIP_BACKGROUND=1 "$UPSTREAM" "$@" || exit
+
+THEME_NAME=$(<"$HOME/.local/state/omarchy/current/theme.name")
+
+# Upstream's visible and deferred post-theme commands (v4.5.0), minus the ones
+# that need a Wayland session (Hyprland, GNOME/GTK, browser policy, keyboard
+# backlight, fcitx5, foot, Obsidian). Each is a no-op when its program is not
+# installed; failures never fail the theme change.
+post_theme_commands=(
+  omarchy-theme-set-tmux
+  omarchy-restart-btop
+  omarchy-restart-opencode
+  omarchy-restart-helix
+  omarchy-theme-set-hunk
+  omarchy-theme-set-claude
+  omarchy-theme-set-hermes
+  omarchy-theme-set-pi
+  omarchy-theme-set-t3code
+)
+for command in "${post_theme_commands[@]}"; do
+  command -v "$command" >/dev/null || continue
+  "$command" </dev/null >/dev/null 2>&1 || true
+done
+
+omarchy-hook theme-set "$THEME_NAME" >/dev/null 2>&1 || true
+
+if [[ ${OMARCHY_WSL_THEME_BRIDGE:-1} != 0 ]] && command -v omarchy-theme-bridge >/dev/null; then
+  omarchy-theme-bridge --quiet ||
+    echo "omarchy-theme-set: Windows theme sync failed (run 'omarchy-theme-bridge' for details)" >&2
+fi
+
+# Windows Terminal hot-reloads settings.json, but recolour this window right
+# away so the change is visible without opening a new tab.
+if [[ -t 1 && -z ${TMUX:-} ]] && command -v omarchy-theme-osc >/dev/null; then
+  omarchy-theme-osc >/dev/tty 2>/dev/null || true
+fi
+
+exit 0

@@ -3,7 +3,7 @@
 **Distribution Engine:** Omarchy-WSL (Arch Linux for WSL2, WSL 2.5 – 3.0.x)
 **Host:** Windows 11 22H2+ (x64 and ARM64 / Snapdragon X, X2)
 **Scope:** 10 adversarial research vectors covering Explorer, clipboard, SSH/GPG agents, Git credentials, launchers, toasts, audio, containers, file watching and power.
-**Verification:** `bash tests/test_windows_integration.sh` (192 gates, simulated Windows host + live end-to-end paths)
+**Verification:** `OMW_STRICT=1 bash tests/test_windows_integration.sh` (simulated Windows host + live end-to-end paths; see §11)
 
 ---
 
@@ -22,7 +22,7 @@
 | 9 | Windows edits → Linux hot-reload | `bin/omarchy-watch-bridge` | `/usr/bin` | On demand |
 | 10 | Battery / thermal governor | `bin/omarchy-power-governor`, wired into `omarchy-build` | `/usr/bin` | On (computed `-j` only) |
 
-All tools share one hardened interop layer, `lib/omarchy-wsl-interop.sh` → `/usr/lib/omarchy-wsl/interop.sh`.
+Every shell tool in this document, plus `omarchy-ca-sync`, `omarchy-dns-sync`, `omarchy-proxy-sync` and `wsl-shims-setup.sh`, sources one interop layer, `lib/omarchy-wsl-interop.sh` → `/usr/lib/omarchy-wsl/interop.sh`. (The Python theme engine and the Windows-side `.ps1` scripts do not run through it.)
 
 ### 0.1 Where the brief's assumptions did not survive research
 
@@ -36,6 +36,7 @@ All tools share one hardened interop layer, `lib/omarchy-wsl-interop.sh` → `/u
 | Tune WSLg audio latency in `client.conf` | `client.conf` has no latency keys; WSLg crackling is an **unfixed server-side RDPSink underrun** (microsoft/wslg#1429) | Pin the server for systemd services, restore hidden sockets, client buffer via `PULSE_LATENCY_MSEC`; documented honestly as mitigation, not a fix |
 | Ship a `binfmt.d/WSLInterop.conf` | WSL ≥ 2.5.7 regenerates/protects the entry (`[boot] protectBinfmt`, PR #41780); a shipped file makes `systemd-binfmt` fail on the read-only mount | Detect & diagnose instead (`omw_require_interop`, `doctor`); manual remedy documented below |
 | npiperelay must sit on `/mnt/c` | Not strictly required with modern interop (albertony fork), but much faster there; and there are **no ARM64 builds** (x64 runs under Prism) | Discovery prefers Windows-drive locations; `doctor` warns when it lives on ext4 |
+| `$WSL_INTEROP` is always valid once set | Each `wsl.exe` session has its own `/run/WSL/<pid>_interop` socket; when that session exits the file stays but nobody listens, so a tmux pane, a nohup'd job or a relay started from it fails every `.exe` launch, while binfmt still says "enabled". systemd services get no `$WSL_INTEROP` at all | `omw_fix_interop` validates the socket and switches to the newest live one before any Windows binary runs; relay wrappers do it per connection |
 
 ---
 
@@ -44,20 +45,24 @@ All tools share one hardened interop layer, `lib/omarchy-wsl-interop.sh` → `/u
 Every tool sources `interop.sh`. Its rules are the security model of this whole document.
 
 ```
- Linux tool ──► interop.sh ──┬─► absolute DrvFs path  (/mnt/c/Windows/System32/clip.exe)
+ Linux tool ──► interop.sh ──┬─► omw_fix_interop: live $WSL_INTEROP (else newest live /run/WSL/*_interop)
+                             ├─► absolute DrvFs path  (/mnt/c/Windows/System32/clip.exe)
                              ├─► powershell.exe -EncodedCommand <base64(UTF-16LE)>
                              │       user data: base64 literals or stdin, never script text
-                             ├─► cmd.exe /d /c "echo %VAR%"   (VAR ∈ ^[A-Za-z_][A-Za-z0-9_]*$, cached 24 h)
-                             └─► timeout --kill-after=2 $OMW_TIMEOUT  (every call)
+                             │       timeout --kill-after=2 $OMW_TIMEOUT (default 15 s)
+                             └─► cmd.exe /d /c "echo %VAR%"   (VAR ∈ ^[A-Za-z_][A-Za-z0-9_]*$, timeout 5 s,
+                                     cached 5 min per interop session; cached paths re-validated)
 ```
 
 1. **No Windows `%PATH%`.** `wsl.conf` keeps `appendWindowsPath = false`; binaries are resolved by absolute path, discovering the Windows directory on any drive and honouring a custom `[automount] root`. This removes the PATH-ordering hijack class (a `git.exe` shadowing Linux `git`) and the 100+ ms per-lookup cost of walking DrvFs directories.
 2. **No shell metacharacter surface.** `cmd.exe` is used for one fixed probe only. PowerShell runs with `-EncodedCommand`; its alphabet (`A–Z a–z 0–9 + / =`) cannot terminate a quoted argument. User strings enter as `[Convert]::FromBase64String('…')`. This also defeats a lesser-known PowerShell quirk: U+2018/U+2019 curly quotes are string delimiters (PowerShell language spec ch. 2), so naive `'` doubling is insufficient.
-3. **Bounded and isolated.** Every Windows call has a timeout. `powershell.exe` gets `</dev/null` unless the caller passes `--stdin`: an inherited terminal lets it swallow keystrokes; an inherited idle pipe hangs it (the test suite caught exactly this).
-4. **UTF-8 end to end.** A BOM-less UTF-8 preamble is set on both console directions; stray BOMs and CRs are stripped.
-5. **Private runtime state.** `$XDG_RUNTIME_DIR/omarchy` (fallback `/tmp/omarchy-runtime-$UID`) is created `0700` and rejected if owned by another user.
-6. **Shared relay helpers.** npiperelay discovery and the socat wrapper writer (socat's `EXEC:` splits on spaces and cannot quote `C:\Users\Jane Doe\…`) live here, used by Domains 3 and 8.
-7. **Test seams** (`OMW_FORCE_WSL`, `OMW_FORCE_INTEROP`, `OMW_MOUNT_ROOT`, `OMW_MOUNTINFO`, `OMW_POWERSHELL`, `OMW_PS_TRACE`) let the suite run the real code against a fake Windows host.
+3. **Bounded and isolated.** One-shot PowerShell and `cmd.exe` calls made through the library are bounded (`omw_ps_run`: `$OMW_TIMEOUT`, `omw_win_env`: 5 s). Tools that launch a Windows binary directly bound it themselves: `clip.exe`/`win32yank` 10 s, `rundll32`/`explorer` 15 s, `reg.exe` 5 s, `gpgconf.exe` 10 s, GCM `OMARCHY_GIT_CREDENTIAL_TIMEOUT` (300 s for browser OAuth), the power query 8 s. Not bounded, by design or by limitation: the long-lived relays (socat + npiperelay), the watcher's PowerShell (`OMW_TIMEOUT=0`), `wl-copy`, `tmux load-buffer` and the OSC 52 terminal write. `powershell.exe` gets `</dev/null` unless the caller passes `--stdin`: an inherited terminal lets it swallow keystrokes; an inherited idle pipe hangs it (the test suite caught exactly this).
+4. **Stale interop sessions are repaired.** `omw_fix_interop` checks that `$WSL_INTEROP` is a socket somebody listens on (a listening entry in `/proc/net/unix`, else a real `connect()`); if it is stale or unset it exports the newest live `/run/WSL/*_interop` socket. `omw_ps_run`, `omw_win_env` and every direct `.exe` launch go through it; a stale socket with no live replacement fails fast with a diagnosis instead of an obscure interop error. socat relay wrappers re-run it on every connection, so a relay outlives the session that started it.
+5. **UTF-8 end to end.** A BOM-less UTF-8 preamble is set on both console directions; stray BOMs and CRs are stripped.
+6. **Private runtime state.** `$XDG_RUNTIME_DIR/omarchy` when `$XDG_RUNTIME_DIR` is a real directory owned by the user and not writable by group/others; otherwise `${XDG_CACHE_HOME:-~/.cache}/omarchy/run`, every component created `0700` and refused when it is a symlink or owned by someone else. There is no predictable `/tmp` fallback another local user could pre-create.
+7. **Shared relay helpers.** npiperelay discovery and the socat wrapper writer (socat's `EXEC:` splits on spaces and cannot quote `C:\Users\Jane Doe\…`) live here, used by Domains 3 and 8.
+8. **Quiet, honest logging.** Messages go to stderr; colour only when stderr is a terminal and `NO_COLOR` is unset.
+9. **Test seams** (`OMW_FORCE_WSL`, `OMW_FORCE_INTEROP`, `OMW_MOUNT_ROOT`, `OMW_MOUNTINFO`, `OMW_POWERSHELL`, `OMW_PS_TRACE`, `OMW_WSL_RUN_DIR`, `OMW_PROC_NET_UNIX`) let the suites run the real code against a fake Windows host.
 
 **Interop health.** If executing `.exe` fails with `Exec format error`, the `WSLInterop` binfmt entry is gone. On current WSL run `wsl --update` (≥ 2.5.7 regenerates it). On older builds, as root: `echo ':WSLInterop:M::MZ::/init:FP' > /proc/sys/fs/binfmt_misc/register`.
 
@@ -117,7 +122,8 @@ Prefers `wt.exe -w 0 new-tab -p "Omarchy" -d "%V."` via the absolute App Executi
 | WSL + interop, win32yank installed | win32yank `-i` (~15 ms) | win32yank `-o --lf` |
 | WSL + interop | `clip.exe` ← UTF-16LE+BOM | PowerShell `Clipboard::GetText()` (CR stripped) |
 | WSL + interop, `-t image/png` | PowerShell `DataObject` with both bitmap **and lossless `"PNG"` format** (data via stdin) | `"PNG"` format → copied image file (Explorer) → `CF_DIB`, emitted as PNG |
-| SSH, no interop | OSC 52 (tmux: `load-buffer -w`, else DCS-wrapped) | refused with an explanation |
+| SSH, no interop | OSC 52 (tmux: `load-buffer -w`, else DCS-wrapped) to `$SSH_TTY` or `/dev/tty` | refused with an explanation |
+| no terminal at all (cron, editor job, pipe) | OSC 52 is refused: exit 3 with a message, nothing written to stdout | refused |
 | WSLg only | `wl-copy` | `wl-paste` under `timeout 3` |
 
 OSC 52 payloads above `OMARCHY_OSC52_MAX` (100 000 base64 bytes) are refused rather than silently truncated.
@@ -148,7 +154,8 @@ omarchy-clip backend copy                      # explain routing
 | Profile paths with spaces breaking socat `EXEC:` | Generated `%q`-quoted wrapper in the runtime dir |
 | Pipe-name injection into the wrapper | `^[A-Za-z0-9._@{}-]+$` |
 | Private keys copied into WSL | Never: all signing happens in the Windows vault (Windows Hello / 1Password approval still prompts) |
-| Local `gpg-agent` stealing the bridged socket | Kills it and warns unless `no-autostart` is set in `gpg.conf` |
+| Local `gpg-agent` stealing the bridged socket | Warns unless `no-autostart` is set in `gpg.conf`. A running Linux `gpg-agent` is never stopped silently: `gpg-start` refuses until you pass `--replace` (then it warns and stops it) |
+| Lock or relay left behind by `stop` | `start` takes an `flock`; the lock fd is closed for socat (`9>&-`), so per-connection children never hold it; `stop` signals socat's whole process group (relays of live connections included); a busy lock is exit 75, not a silent success |
 
 ### Engineering — `omarchy-ssh-agent-bridge`
 ```
@@ -156,11 +163,14 @@ ssh ─► $XDG_RUNTIME_DIR/ssh-agent.sock ─► socat (fork) ─► npiperelay
 ```
 ```bash
 omarchy-ssh-agent-bridge doctor          # npiperelay, socat, pipes, agent service, 1Password/Bitwarden/KeePassXC
-omarchy-ssh-agent-bridge start           # idempotent, flock-guarded
-omarchy-ssh-agent-bridge enable          # systemd --user unit, or profile.d autostart
+omarchy-ssh-agent-bridge start           # idempotent; exit 75 if another start holds the lock
+omarchy-ssh-agent-bridge enable          # systemd --user unit (or profile.d autostart) + environment.d SSH_AUTH_SOCK
 omarchy-ssh-agent-bridge start --pageant # pipe read from %USERPROFILE%\.ssh\pageant.conf
 omarchy-ssh-agent-bridge gpg-start       # Gpg4win agent → $(gpgconf --list-dirs agent-socket)
+omarchy-ssh-agent-bridge gpg-start --replace   # stop a running Linux gpg-agent first
+omarchy-ssh-agent-bridge gpg-stop
 ```
+The socket is `$XDG_RUNTIME_DIR/ssh-agent.sock`, or `~/.cache/omarchy/run/ssh-agent.sock` when there is no private runtime directory. Login shells get `SSH_AUTH_SOCK` from `/etc/profile.d/30-omarchy-ssh-agent.sh`; `enable` also writes `~/.config/environment.d/30-omarchy-ssh-agent.conf` for systemd user services (and anything they start). Plain non-login `ssh host cmd` sessions read neither.
 The test suite proves the chain end to end: a real `ssh-agent` stands in for the Windows vault, and `ssh-keygen -Y sign` succeeds through the bridge *after the private key file is deleted*.
 
 ---
@@ -174,7 +184,7 @@ The test suite proves the chain end to end: a real `ssh-agent` stands in for the
 - **gh:** `gh auth git-credential` answers only `get` for https; `store`/`erase` are no-ops. `gh auth login --with-token` enforces `repo` + `read:org`, so GCM's GitHub token (`repo gist workflow`) is rejected; `GH_TOKEN` is not scope-validated.
 
 ### Engineering — `omarchy-git-credential-bridge`
-A real git credential helper that resolves GCM per call (cached 24 h), then falls back to `gh`, then answers nothing so git continues to its next helper/prompt.
+A real git credential helper that resolves GCM per call (path cached 1 h per interop session and re-checked on use), then falls back to `gh`, then answers nothing so git continues to its next helper/prompt. A stale `$WSL_INTEROP` is repaired before GCM is launched.
 - `GIT_TERMINAL_PROMPT=0` → `GCM_INTERACTIVE=never` via `WSLENV`, so agents/CI never block on a Windows OAuth dialog.
 - Requests are validated as `key=value` lines (64 KiB cap) before reaching Windows; `store`/`erase` are forwarded so a revoked token is purged from the Windows vault; unknown actions are ignored per gitcredentials(7); 300 s timeout for browser OAuth.
 ```bash
@@ -288,7 +298,7 @@ omarchy-docker-bridge relay desktop     # no WSL integration? relay \\.\pipe\doc
 omarchy-docker-bridge install-system    # optional /run/docker.sock symlink via tmpfiles.d (sudo)
 omarchy-docker-bridge off
 ```
-Switching engines re-points one symlink, so already-open shells follow without re-exporting. A native `/run/docker.sock` that Docker Desktop materialised is reported as `managed-by-desktop`, not as a native daemon. `install-system` refuses to replace any live socket or foreign symlink. `profile.d` exports nothing until the user opts in.
+Switching engines re-points one symlink, so already-open shells follow without re-exporting. A native `/run/docker.sock` that Docker Desktop materialised is reported as `managed-by-desktop`, not as a native daemon. `install-system` refuses to replace any live socket or foreign symlink. `profile.d` exports nothing until the user opts in. `relay` stops an earlier unhealthy relay before starting a new one, its wrapper re-resolves the live interop socket per connection, and `off` stops background relays.
 
 ---
 
@@ -319,7 +329,7 @@ npm run dev
 ## Domain 10: Battery, AC Power & Thermal Governor
 
 ### Findings
-- WSL2 supports **battery/AC passthrough** (release notes, build 18980). On **arm64 kernels it is built in; on x86 6.6.y/6.18.y kernels `CONFIG_ACPI_BATTERY`/`CONFIG_ACPI_AC` are modules**, so x86 hosts frequently show an empty `/sys/class/power_supply`. Device names vary — detect by `type`.
+- WSL2 supports **battery/AC passthrough** (release notes, build 18980), but whether `/sys/class/power_supply` is populated depends on the WSL kernel build and host; it is frequently empty (we have seen this mostly on x86 hosts; we have not verified the kernel config per architecture). Device names vary — detect by `type`. A desktop or mini-PC without a battery can still expose USB-C / USB-PD (UCSI) supply nodes that report `online=0` whenever nothing is plugged into them: those must not be read as "on battery".
 - Host APIs without admin: `SystemInformation.PowerStatus` (`BatteryLifePercent` is a **0.0–1.0 float**; `NoSystemBattery` flag on desktops), `PowerManager.EnergySaverStatus` (Disabled/Off/On), power-mode overlay GUIDs (best efficiency `961cc777-…`, better performance `3af9b8d9-…`, best performance `ded574b5-…`, balanced = all zeros; registry location community-sourced, `powercfg /getactivescheme` does **not** reflect it).
 - Throttling: `Processor Information\% Performance Limit` and `Thermal Zone Information\% Passive Limit`. Counter *paths* are localised, so the governor reads the locale-independent WMI classes (`Win32_PerfFormattedData_Counters_ProcessorInformation.PercentPerformanceLimit`, `…ThermalZoneInformation.PercentPassiveLimit`). `MSAcpi_ThermalZoneTemperature` needs admin and often reports constants.
 - Snapdragon X Elite: 12 identical Oryon cores (3×4); X2 Elite: 12 Prime + 6 Performance. WSL vCPUs do not expose this split, so battery state, not core type, must drive parallelism.
@@ -327,14 +337,15 @@ npm run dev
 ### Engineering — `omarchy-power-governor`
 | Condition | Factor |
 |:--|:--|
-| AC | 100 % |
+| No battery present (sysfs), or Windows reports `NoSystemBattery` (overrides sysfs) | 100 % (AC) |
+| AC (any supply online, or battery Charging/Full) | 100 % |
 | Battery | 50 % (`OMARCHY_POWER_BATTERY_PCT`) |
 | Battery ≤ 20 % or Energy Saver on | 25 % (`OMARCHY_POWER_LOW_PCT`) |
 | Power mode "best power efficiency" | ≤ battery factor |
 | Performance/passive limit < 80 % | × limit / 100 |
 | Floor | never below 1 job |
 
-Signals: sysfs first, Windows query to fill gaps (one PowerShell process, cached 60 s in the runtime dir). PowerShell output and the config file (`~/.config/omarchy/power-governor.conf`) are **parsed against whitelists, never sourced or evaluated**.
+"On battery" needs a present `Battery` supply that is discharging, or a battery plus supply nodes that all report offline. Signals: sysfs first, Windows query to fill gaps (one PowerShell process, 8 s timeout; answers cached `OMARCHY_POWER_CACHE_TTL`=60 s, failures negative-cached `OMARCHY_POWER_FAIL_TTL`=120 s so back-to-back builds do not each pay the timeout; `OMARCHY_POWER_NO_WINDOWS=1` disables the query). PowerShell output and the config file (`~/.config/omarchy/power-governor.conf`) are **parsed against whitelists, never sourced or evaluated**.
 ```bash
 omarchy-power-governor status          # human
 omarchy-power-governor status --json   # machine
@@ -343,35 +354,42 @@ omarchy-build cargo build --release    # [omarchy-build] power governor: -j8 -> 
 omarchy-build -j 12 make               # explicit -j always wins
 omarchy-build --no-power …             # opt out per build; OMARCHY_POWER_GOVERNOR=off globally
 ```
-`omarchy-build` also gained `--notify`, `--dry-run`, and a DrvFs refusal (`--allow-drvfs` to override).
+`omarchy-build` runs the command as `systemd-run --user --scope --slice=build.slice -p CPUWeight=20 -p IOWeight=20 -p OOMPolicy=kill` (a scope keeps the caller's whole environment — PATH, `CC`, `RUSTFLAGS`, the `-j` variables — plus terminal, signals and exit status, and needs no user D-Bus), raises its own `oom_score_adj` to 500 first (that is an exec setting a scope cannot take), and falls back to `nice 10` + `oom_score_adj 500` without a user manager. It refuses to build on a Windows drive (9p, drvfs or virtiofs; `--allow-drvfs`, exit 3), has `--notify` and `--dry-run` (prints the exact command), `-h` exits 0 and unknown options exit 2.
 
 ---
 
 ## 11. Verification
 
 ```bash
-bash tests/test_windows_integration.sh
-SHELLCHECK=/path/to/shellcheck PWSH=/path/to/pwsh bash tests/test_windows_integration.sh   # full strength
-OMW_TEST_KEEP=1 bash tests/test_windows_integration.sh                                  # keep the sandbox
+OMW_STRICT=1 bash tests/test_windows_integration.sh     # this document's tools
+OMW_STRICT=1 bash tests/test_build_governance.sh        # omarchy-build + cgroup units
+OMW_STRICT=1 bash tests/test_network_sync.sh            # ca/dns/proxy/mirror sync, netdoctor
+OMW_TEST_KEEP=1 bash tests/test_windows_integration.sh  # keep the sandbox for inspection
+tests/run-all.sh                                        # every suite, strict
 ```
-The suite builds a fake Windows host (DrvFs tree with `C:`/`D:`, a `Jane Doe` profile with a space, and stub `powershell.exe` / `cmd.exe` / `clip.exe` / `rundll32.exe` / `explorer.exe` / `reg.exe` that record argv, stdin and the *decoded* `-EncodedCommand` scripts) and runs the real tools against it:
+`OMW_STRICT=1` makes any skipped check fail the run; `tests/ci/Containerfile` provides every optional tool (shellcheck, pwsh, socat, gnupg, inotify-tools, python3, systemd-analyze). Each suite ends with one line `<Suite>: passed/run passed, F failed, S skipped`; counts are not hard-coded anywhere.
+
+The Windows suite builds a fake Windows host (DrvFs tree with `C:`/`D:`, a `Jane Doe` profile with a space, and stub `powershell.exe` / `cmd.exe` / `clip.exe` / `rundll32.exe` / `explorer.exe` / `reg.exe` that record argv, stdin, the `$WSL_INTEROP` they were started with, and the *decoded* `-EncodedCommand` scripts) and runs the real tools against it:
 
 | Area | Highlights |
 |:--|:--|
-| Static | `bash -n`, `sh -n` for profile.d, strict mode, shellcheck `-S warning`, no `eval`, no `cmd.exe` with user data, PowerShell only via `-EncodedCommand`, **every generated PowerShell script parsed by pwsh** |
-| Interop lib | path translation incl. drive roots/UNC/foreign distros, custom automount root, mountinfo DrvFs detection incl. prefix confusion, 0700 runtime dir |
+| Static | `bash -n`, `sh -n` for profile.d, strict mode, shellcheck (all severities), no `eval`, no `cmd.exe` with user data, PowerShell only via `-EncodedCommand`, every generated PowerShell script parsed by pwsh |
+| Interop lib | path translation incl. drive roots/UNC/foreign distros, custom automount root, mountinfo DrvFs detection incl. prefix confusion; stale `$WSL_INTEROP` with a fake `/run/WSL` holding a live AF_UNIX listener and a newer dead socket; per-session `omw_win_env` cache, path re-validation and TTL; runtime-dir fallback (symlink, foreign owner, world-writable runtime dir); colour only on a tty and never with `NO_COLOR` |
 | Launcher | Follina/search-ms/javascript refusal, percent-encoding, executable guard incl. `file://` and `.LNK`, argv integrity |
-| Clipboard | UTF-16LE BOM, exact CRLF, byte-identical PNG round-trip, OSC 52 framing + tmux DCS, size refusal, stdin isolation |
+| Clipboard | UTF-16LE BOM, exact CRLF, byte-identical PNG round-trip, OSC 52 framing + tmux DCS, size refusal, stdin isolation, no stdout pollution without a tty |
 | Known Folders & guard | OneDrive/D: relocation, no clobbering, idempotence, dry-run; guard blocks/allows correctly, symlink resolution, user functions preserved |
-| SSH agent | live ssh-agent behind the bridge, `0600` socket, foreign-agent refusal, signing with the private key deleted, Pageant pipe discovery |
+| SSH / GPG agent | live ssh-agent behind the bridge, `0600` socket, foreign-agent refusal, signing with the private key deleted, Pageant pipe discovery; lock fd not inherited by socat; stop with a client still connected, then start again; busy lock exits 75; a live Linux gpg-agent survives `gpg-start` without `--replace` |
 | Git credentials | CR stripping, WSLENV/GCM_INTERACTIVE, gh fallback, malformed-input rejection, install/uninstall round-trip, ucrt64/clangarm64 discovery |
+| Shims | `wt.exe` resolved via `%LOCALAPPDATA%` at depth 6 (a FIFO stands in for the reparse point), nothing from `C:\Users\Public`, no guessing between two profiles without interop, GCM ucrt64/clangarm64 |
 | Toasts | hostile titles never reach script text, icons mirrored, sounds, OSC 777 sanitisation, exit-status preservation |
-| Containers | fake Docker API servers, auto preference, route switching, end-to-end `/_ping`, Ryuk hint, live-socket protection |
+| Containers | fake Docker API servers, auto preference, route switching, end-to-end `/_ping`, Ryuk hint, live-socket protection, relays stopped by `off` |
 | Watcher | ctime changes / mtime and content preserved, exclusions, coalescing, **real inotify IN_ATTRIB + IN_CLOSE_WRITE**, parent touch on delete |
-| Power | sysfs AC/battery/low, Windows fallback, Energy Saver, overlay, thermal limit, NoSystemBattery, cache, hostile output/config, `omarchy-build` integration |
-| Artefacts | audio/env/tmpfiles/ALSA, `.reg` HKCU-only + `%V.`, systemd unit, packages, Containerfile coverage |
+| Power | sysfs AC/battery/low, battery-less mini-PC with offline USB-C nodes, charging laptop with a lagging adapter node, Windows fallback, `NoSystemBattery` overriding sysfs, Energy Saver, overlay, thermal limit, success and failure caching, hostile output/config, `omarchy-build` integration |
+| Artefacts | audio/env/tmpfiles/ALSA, `.reg` HKCU-only + `%V.` (decoded from REG_EXPAND_SZ), systemd unit, packages, `rootfs.manifest` coverage |
 
-**What the suite cannot prove** (needs a real Windows 11 host): toast rendering and registry-AUMID acceptance, WSLg clipboard/audio behaviour, Quick Access pinning of `\\wsl.localhost` paths, Explorer verb placement, GCM OAuth UI, and real `npiperelay` named-pipe I/O.
+`tests/test_build_governance.sh` additionally runs a real `systemd-run --user --scope` when `OMW_REAL_SYSTEMD=1` is set inside a systemd container (checked: the build lands in `user@UID.service/build.slice`, keeps its environment and exit status, gets `OOMPolicy=kill`, `CPUWeight=20` and `oom_score_adj` 500).
+
+**What the suites cannot prove** (needs a real Windows 11 host): toast rendering and registry-AUMID acceptance, WSLg clipboard/audio behaviour, Quick Access pinning of `\\wsl.localhost` paths, Explorer verb placement, GCM OAuth UI, real `npiperelay` named-pipe I/O, and the behaviour of real `/run/WSL` interop sockets (the suite uses stand-in AF_UNIX listeners).
 
 ---
 

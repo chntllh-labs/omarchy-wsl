@@ -244,6 +244,18 @@ cmd_status() {
   echo "DOCKER_HOST=${DOCKER_HOST:-<unset>}"
 }
 
+# relay_stop <engine>: stop a background relay (socat is its own process-group
+# leader via setsid; per-connection children share the group).
+relay_stop() {
+  local pidfile="${RUN_DIR}/relay-${1}.pid" pid
+  [[ -r "$pidfile" ]] || return 0
+  pid=$(<"$pidfile")
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && grep -qa socat "/proc/$pid/cmdline" 2>/dev/null; then
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+  fi
+  rm -f -- "$pidfile"
+}
+
 cmd_relay() {
   local engine="${1:-}" relay pipe sock wrapper
   case "$engine" in
@@ -260,7 +272,10 @@ cmd_relay() {
     omw_log "Relay already healthy at $sock"
     return 0
   fi
+  # An unhealthy relay from an earlier run must not linger as an orphan.
+  relay_stop "$engine"
   rm -f -- "$sock"
+  # The wrapper re-resolves the live interop socket on every connection.
   omw_write_exec_wrapper "$wrapper" "$relay" -ep -s "//./pipe/${pipe}"
   setsid socat "UNIX-LISTEN:${sock},fork,umask=177" "EXEC:${wrapper},nofork" </dev/null >>"${RUN_DIR}/relay-${engine}.log" 2>&1 &
   echo $! >"${RUN_DIR}/relay-${engine}.pid"
@@ -289,6 +304,8 @@ cmd_install_system() {
 }
 
 cmd_off() {
+  relay_stop desktop
+  relay_stop podman-machine
   rm -f -- "$ROUTE" "$CONF_FILE"
   omw_log "Route removed. Open a new shell (or unset DOCKER_HOST)."
 }
